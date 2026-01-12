@@ -1,0 +1,51 @@
+# Example .eph file for a typical web application
+
+# =============================================================================
+# Services
+# =============================================================================
+
+[postgres]
+image=postgres:16-alpine
+port=5432
+env.POSTGRES_USER=dev
+env.POSTGRES_PASSWORD=dev
+env.POSTGRES_DB=myapp
+volume=pgdata:/var/lib/postgresql/data
+healthcheck=pg_isready -U dev
+post-start=cargo sqlx migrate run
+
+[redis]
+image=redis:7-alpine
+port=6379
+healthcheck=redis-cli ping
+
+[minio]
+image=minio/minio
+port.api=9000
+port.console=9001
+env.MINIO_ROOT_USER=minioadmin
+env.MINIO_ROOT_PASSWORD=minioadmin
+command=server /data --console-address ":9001"
+volume=miniodata:/data
+
+[mailhog]
+image=mailhog/mailhog
+port.smtp=1025
+port.web=8025
+
+# =============================================================================
+# Environment Variables
+# =============================================================================
+
+DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
+REDIS_URL=redis://localhost:${redis.port}
+
+S3_ENDPOINT=http://localhost:${minio.port.api}
+S3_ACCESS_KEY=minioadmin
+S3_SECRET_KEY=minioadmin
+
+SMTP_HOST=localhost
+SMTP_PORT=${mailhog.port.smtp}
+MAIL_WEB_UI=http://localhost:${mailhog.port.web}
+
+APP_ENV=development

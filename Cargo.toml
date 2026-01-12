@@ -1,0 +1,24 @@
+[package]
+name = "eph"
+version = "0.1.0"
+edition = "2024"
+description = "Ephemeral services per workspace - dotenv for services"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+bollard = "0.18"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+futures-util = "0.3"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+shell-words = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
