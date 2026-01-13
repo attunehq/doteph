@@ -168,7 +168,3 @@ make check            # Run clippy
 make format           # Format code
 make precommit        # Run all checks before committing
 ```
-
-## License
-
-MIT
