@@ -72,8 +72,9 @@ eph env -f fish      # fish format
 eph env -f json      # JSON format
 
 # Load into your shell
-eval "$(eph env)"              # bash/zsh
-eval (eph env -f fish)         # fish
+eval "$(eph env)"                            # bash/zsh
+eval (eph env -f fish | string collect)      # fish (preserves newlines)
+# or: source (eph env -f fish | psub)
 
 # Stop services
 eph down
