@@ -37,8 +37,8 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-use anyhow::{Context, Result, ensure};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use anyhow::{Context, Result, bail, ensure};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 mod common;
@@ -53,7 +53,10 @@ use common::{
 
 const POSTGRES_IMAGE: &str = "postgres:16-alpine";
 const REDIS_IMAGE: &str = "redis:7-alpine";
-const MINIO_IMAGE: &str = "minio/minio";
+// Pinned to an immutable RELEASE tag: `minio/minio` has no stable channel other
+// than the moving `latest`, and its `server` CLI / health endpoints have changed
+// across releases, so a float would let an unrelated MinIO release redden CI.
+const MINIO_IMAGE: &str = "minio/minio:RELEASE.2025-09-07T16-13-09Z";
 
 /// A full, realistic stack: a relational DB, a cache, and an object store, all
 /// wired together through interpolated connection URLs.
@@ -72,7 +75,7 @@ image=redis:7-alpine
 port=6379
 
 [minio]
-image=minio/minio
+image=minio/minio:RELEASE.2025-09-07T16-13-09Z
 command=server /data --console-address :9001
 port.api=9000
 port.console=9001
@@ -110,54 +113,85 @@ REDIS_URL=redis://localhost:${redis.port}
 // Connectivity: real wire-protocol clients over the mapped host ports
 // ============================================================================
 
-/// Send a single command to redis using the RESP protocol and return the raw
-/// reply. One command per connection keeps this dependency-free without needing
-/// a full streaming RESP parser.
-async fn redis_raw(port: u16, args: &[&str]) -> Result<String> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))
+/// A parsed RESP reply, covering the reply types the stress suite can receive
+/// (simple strings from PING/SET, bulk strings or nil from GET).
+#[derive(Debug)]
+enum RedisReply {
+    Simple(String),
+    Bulk(String),
+    Nil,
+}
+
+/// Send one command and read exactly one complete RESP reply.
+///
+/// RESP is stream-framed, so a single `read()` can split even a tiny reply.
+/// This reads the status line, then for a bulk string reads exactly the
+/// declared byte count plus the trailing CRLF — so a fragmented read can never
+/// silently truncate a value into a false test failure.
+async fn redis_command(port: u16, args: &[&str]) -> Result<RedisReply> {
+    let stream = TcpStream::connect(("127.0.0.1", port))
         .await
         .with_context(|| format!("connecting to redis on 127.0.0.1:{port}"))?;
+    let (rd, mut wr) = stream.into_split();
+    let mut reader = BufReader::new(rd);
 
     let mut cmd = format!("*{}\r\n", args.len());
     for arg in args {
         write!(cmd, "${}\r\n{}\r\n", arg.len(), arg).expect("writing to String never fails");
     }
-    stream.write_all(cmd.as_bytes()).await?;
+    wr.write_all(cmd.as_bytes()).await?;
 
-    let mut buf = [0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
+    let mut line = String::new();
+    let n = reader.read_line(&mut line).await?;
+    ensure!(n > 0, "redis closed the connection without replying");
+    let line = line.trim_end_matches(['\r', '\n']);
+    let (kind, rest) = line.split_at(1);
+    match kind {
+        "+" => Ok(RedisReply::Simple(rest.to_string())),
+        "-" => bail!("redis error reply: {rest}"),
+        "$" => {
+            let len: i64 = rest.parse().context("invalid bulk-string length")?;
+            if len < 0 {
+                return Ok(RedisReply::Nil);
+            }
+            let mut buf = vec![0u8; len as usize + 2]; // value bytes + trailing CRLF
+            reader
+                .read_exact(&mut buf)
+                .await
+                .context("short bulk-string read")?;
+            ensure!(buf.ends_with(b"\r\n"), "bulk string not CRLF-terminated");
+            buf.truncate(len as usize);
+            Ok(RedisReply::Bulk(
+                String::from_utf8(buf).context("non-utf8 bulk string")?,
+            ))
+        }
+        other => bail!("unexpected RESP reply type {other:?}: {line:?}"),
+    }
 }
 
 /// `PING` redis and assert it pongs.
 async fn redis_ping(port: u16) -> Result<()> {
-    let reply = redis_raw(port, &["PING"]).await?;
-    ensure!(reply.contains("PONG"), "unexpected PING reply: {reply:?}");
-    Ok(())
+    match redis_command(port, &["PING"]).await? {
+        RedisReply::Simple(s) if s == "PONG" => Ok(()),
+        other => bail!("unexpected PING reply: {other:?}"),
+    }
 }
 
 /// `SET key value` on redis.
 async fn redis_set(port: u16, key: &str, value: &str) -> Result<()> {
-    let reply = redis_raw(port, &["SET", key, value]).await?;
-    ensure!(reply.contains("OK"), "unexpected SET reply: {reply:?}");
-    Ok(())
+    match redis_command(port, &["SET", key, value]).await? {
+        RedisReply::Simple(s) if s == "OK" => Ok(()),
+        other => bail!("unexpected SET reply: {other:?}"),
+    }
 }
 
-/// `GET key` on redis, decoding the RESP bulk-string reply.
+/// `GET key` on redis, returning the value or `None` for a missing key.
 async fn redis_get(port: u16, key: &str) -> Result<Option<String>> {
-    let reply = redis_raw(port, &["GET", key]).await?;
-    // Reply is "$<len>\r\n<value>\r\n", or "$-1\r\n" for a missing key.
-    let mut parts = reply.split("\r\n");
-    let header = parts.next().context("empty GET reply")?;
-    ensure!(
-        header.starts_with('$'),
-        "unexpected GET reply: {reply:?} (not a bulk string)"
-    );
-    let len: i64 = header[1..].parse().context("invalid bulk-string length")?;
-    if len < 0 {
-        return Ok(None);
+    match redis_command(port, &["GET", key]).await? {
+        RedisReply::Bulk(v) => Ok(Some(v)),
+        RedisReply::Nil => Ok(None),
+        other => bail!("unexpected GET reply: {other:?}"),
     }
-    Ok(parts.next().map(ToString::to_string))
 }
 
 /// Issue a minimal HTTP/1.1 GET over a raw socket and return the status code.
@@ -324,6 +358,10 @@ async fn full_stack_environment_with_real_connectivity() {
 // Test 2: concurrent independent environments, isolation under stress
 // ============================================================================
 
+// A multi-thread runtime so the N workspaces are brought up with genuine
+// parallelism. This is orthogonal to libtest's `--test-threads=1`, which
+// serializes whole test functions (so this heavy test never overlaps the
+// full-stack one) but does not touch this test's own tokio worker threads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "stress: heavyweight, requires Docker; run via `make test-stress`"]
 async fn concurrent_workspaces_are_isolated() {
@@ -440,12 +478,25 @@ async fn concurrent_workspaces_are_isolated() {
 // Test 3: `run=` shell-command service
 // ============================================================================
 
+// run= services shell out to `sh` and are tracked/killed via `kill`, so the
+// feature is Unix-only (on Windows eph requires WSL). Gate the test to Unix
+// accordingly: on native Windows the spawned server's stdout pipe handle is
+// leaked into the grandchild via bInheritHandles, which would hang the harness.
+#[cfg(unix)]
 #[tokio::test]
 #[ignore = "stress: requires Docker host plus `python3`/`sh` on PATH"]
 async fn source_type_run_shell_command() {
     // A non-Docker service: eph spawns the process and tracks its PID. `run=`
-    // services bind their declared port directly on the host.
-    let port = 18080u16;
+    // services bind their declared port directly on the host (no Docker
+    // remapping), so reserve a currently-free port instead of hard-coding one
+    // that might already be taken on a CI runner.
+    let port = {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("could not reserve a local port");
+        let p = listener.local_addr().unwrap().port();
+        drop(listener);
+        p
+    };
     let eph = format!(
         "[web]\nrun=python3 -m http.server {port}\nport={port}\n\nWEB_URL=http://localhost:${{web.port}}\n"
     );
@@ -526,12 +577,16 @@ async fn source_type_compose() {
     prepull_images(&[REDIS_IMAGE]).await;
 
     let ws = TestWorkspace::new(
-        "[cache]\ncompose=docker-compose.yml\nexpose.redis=6379\n\nREDIS_URL=redis://localhost:${cache.port}\n",
+        // expose.redis names the port `redis`, so interpolate it explicitly as
+        // `${cache.port.redis}` rather than relying on it happening to be the
+        // sole (and thus default) port.
+        "[cache]\ncompose=docker-compose.yml\nexpose.redis=6379\n\nREDIS_URL=redis://localhost:${cache.port.redis}\n",
     );
     ws.write_file(
         "docker-compose.yml",
         "services:\n  redis:\n    image: redis:7-alpine\n    ports:\n      - \"6379\"\n",
     );
+    let prefix = container_prefix(&ws).await;
 
     ws.eph_ok(&["up"]).await;
 
@@ -544,6 +599,9 @@ async fn source_type_compose() {
         .await
         .expect("compose redis never answered PING");
 
-    // `eph clean` runs `docker compose down`, removing the project's containers.
+    // `eph clean` runs `docker compose down`; prove the project's containers are
+    // gone. docker compose names them `<project>-<service>-N`, which still
+    // starts with this workspace's prefix.
     ws.clean().await;
+    assert_no_containers(&prefix).await;
 }

@@ -194,17 +194,31 @@ pub async fn docker_container_names(name_filter: &str) -> Vec<String> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty())
+        // Docker's `name=` filter is a substring match, so re-check the prefix
+        // exactly. This avoids a sibling workspace whose id merely contains this
+        // one's prefix being counted as a leaked container (or padding a count).
+        .filter(|l| l.starts_with(name_filter))
         .map(ToString::to_string)
         .collect()
 }
 
-/// Best-effort `docker pull` of each image, ignoring failures. Pulling the
-/// heavyweight images once up front keeps concurrency tests focused on `eph`'s
-/// orchestration rather than racing several simultaneous first-time pulls.
+/// Pull each image up front so concurrency tests exercise `eph`'s orchestration
+/// rather than racing several simultaneous first-time pulls. Failures are not
+/// fatal (the image may already be present, or `eph up` will pull it lazily),
+/// but they are logged: a swallowed pull failure otherwise resurfaces as an
+/// opaque readiness timeout deep inside a test.
 pub async fn prepull_images(images: &[&str]) {
     for image in images {
-        let _ = Command::new("docker").args(["pull", image]).output().await;
+        match Command::new("docker").args(["pull", image]).output().await {
+            Ok(out) if !out.status.success() => {
+                eprintln!(
+                    "warning: `docker pull {image}` failed (continuing; eph will pull lazily):\n{}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Err(e) => eprintln!("warning: could not run `docker pull {image}`: {e}"),
+            Ok(_) => {}
+        }
     }
 }
 
