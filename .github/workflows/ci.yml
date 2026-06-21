@@ -5,8 +5,8 @@ on:
   pull_request:
 
 jobs:
-  build:
-    name: Build, lint, and test
+  lint:
+    name: Format and lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -26,11 +26,31 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+  test:
+    name: Build and test (with Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # ubuntu-latest runners ship a running Docker daemon, which the
+      # integration tests in tests/integration.rs talk to via bollard's
+      # local-defaults socket. Confirm it is reachable before testing.
+      - name: Verify Docker is available
+        run: docker version
+
       - name: Build
         run: cargo build --verbose
 
-      # Only the unit tests (--bins) run in CI. The integration tests
-      # (cargo test --test integration) are skipped because they require a
-      # running Docker daemon, which is not available in this CI environment.
+      # Runs everything: library unit tests, doctests, and the Docker-backed
+      # integration crate. Integration tests start real containers (postgres,
+      # redis, ...), so they are kept single-threaded to avoid host port and
+      # resource contention.
       - name: Test
-        run: cargo test --bins --verbose
+        run: cargo test --verbose -- --test-threads=1
