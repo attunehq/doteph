@@ -23,6 +23,22 @@ use std::process::Command;
 use std::str::FromStr;
 
 fn main() {
+    // Declare EPH_VERSION as a build-script input. CI injects the release tag
+    // here, and that value differs between a dry run (a `git describe` string)
+    // and the tag build (the bare tag) of the SAME commit. The release matrix
+    // shares a Rust cache keyed only on target, so without this directive Cargo
+    // could restore the dry run's cached build-script output for the tag build,
+    // never re-run this script, and bake the stale version into the released
+    // binary. Declaring the env var forces a re-run whenever its value changes.
+    println!("cargo:rerun-if-env-changed=EPH_VERSION");
+    // Keep the dirty-tree version fresh in local dev by re-running when tracked
+    // sources change. (Emitting any rerun-if line opts out of Cargo's implicit
+    // "re-run on any package change", so list the inputs that feed the version.)
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=Cargo.lock");
+    println!("cargo:rerun-if-changed=build.rs");
+
     let version = env_override()
         .or_else(|| compute_version().ok())
         .unwrap_or_else(fallback_version);

@@ -8,8 +8,9 @@
 # extraction, and the current latest release assets continue to agree.
 #
 # The versioned/upgrade scenarios need at least two published non-prerelease
-# releases; until a second release exists they fail by design. The help and
-# fresh-latest scenarios pass as soon as one release is published.
+# releases; until a second release exists they skip (a green no-op, not a
+# failure). The help scenario always runs, and fresh-latest runs as soon as one
+# release is published.
 #
 # Keep this separate from release CI because failures can be caused by published
 # release state, not by the pull request being tested.
@@ -55,8 +56,14 @@ jobs:
               uses: actions/github-script@v7
               with:
                   script: |
+                      // Resolve the available release versions WITHOUT failing the
+                      // job: scenarios that need a release (or a second release)
+                      // guard on these outputs and skip when they are empty, so the
+                      // `help` and `fresh-latest` scenarios still run on a repo with
+                      // zero or one published release.
                       const { owner, repo } = context.repo;
-                      const latest = await github.rest.repos.getLatestRelease({ owner, repo });
+                      const stripPrefix = (tag) => tag.replace(/^v/, "");
+
                       const releases = await github.paginate(github.rest.repos.listReleases, {
                         owner,
                         repo,
@@ -65,17 +72,20 @@ jobs:
                       const candidates = releases
                         .filter((release) => !release.draft && !release.prerelease)
                         .sort((left, right) => new Date(right.published_at) - new Date(left.published_at));
-                      const previous = candidates.find((release) => release.tag_name !== latest.data.tag_name);
 
-                      if (!previous) {
-                        core.setFailed("Need at least two published non-prerelease releases to test versioned installs and upgrades.");
-                        return;
+                      const latestTag = candidates[0]?.tag_name ?? "";
+                      const previous = candidates.find((release) => release.tag_name !== latestTag);
+
+                      core.setOutput("latest_version", latestTag ? stripPrefix(latestTag) : "");
+                      core.setOutput("previous_version", previous ? stripPrefix(previous.tag_name) : "");
+
+                      if (!latestTag) {
+                        core.notice("No published non-prerelease release yet; only the `help` scenario will run.");
+                      } else if (!previous) {
+                        core.notice(`One published release (${latestTag}); help and fresh-latest will run, versioned/upgrade scenarios will skip until a second release exists.`);
+                      } else {
+                        core.notice(`Selected installer versions: LATEST=${latestTag}, LATEST-1=${previous.tag_name}`);
                       }
-
-                      const stripPrefix = (tag) => tag.replace(/^v/, "");
-                      core.setOutput("latest_version", stripPrefix(latest.data.tag_name));
-                      core.setOutput("previous_version", stripPrefix(previous.tag_name));
-                      core.notice(`Selected installer versions: LATEST=${latest.data.tag_name}, LATEST-1=${previous.tag_name}`);
 
             - name: Run shell installer
               if: matrix.platform.installer == 'shell'
@@ -98,6 +108,10 @@ jobs:
                       # plus explicit --bin-dir and --tmp-dir. This is the release
                       # health case most likely to fail when the latest published
                       # release is missing assets or checksums.
+                      if [[ -z "${LATEST_VERSION:-}" ]]; then
+                        echo "::notice::No published release yet; skipping fresh-latest."
+                        exit 0
+                      fi
                       bin_dir="$RUNNER_TEMP/eph-bin-fresh-latest"
                       tmp_dir="$RUNNER_TEMP/eph-installer-fresh-latest"
                       mkdir -p "$bin_dir" "$tmp_dir"
@@ -109,6 +123,10 @@ jobs:
                       # Exercises a fresh install with --version, --bin-dir, and
                       # --tmp-dir against LATEST-1, selected by CI from published
                       # GitHub Releases.
+                      if [[ -z "${PREVIOUS_VERSION:-}" ]]; then
+                        echo "::notice::Need a second published release; skipping fresh-versioned."
+                        exit 0
+                      fi
                       bin_dir="$RUNNER_TEMP/eph-bin-fresh-versioned"
                       tmp_dir="$RUNNER_TEMP/eph-installer-fresh-versioned"
                       mkdir -p "$bin_dir" "$tmp_dir"
@@ -123,6 +141,10 @@ jobs:
                       # Exercises the upgrade path by installing LATEST-1, then
                       # installing LATEST into the same --bin-dir. CI owns the
                       # release selection; the installer remains generic.
+                      if [[ -z "${PREVIOUS_VERSION:-}" || -z "${LATEST_VERSION:-}" ]]; then
+                        echo "::notice::Need two published releases; skipping upgrade-versioned."
+                        exit 0
+                      fi
                       bin_dir="$RUNNER_TEMP/eph-bin-upgrade"
                       tmp_dir="$RUNNER_TEMP/eph-installer-upgrade"
                       mkdir -p "$bin_dir" "$tmp_dir"
@@ -166,6 +188,10 @@ jobs:
                           # plus explicit -BinDir. This is the release health case most
                           # likely to fail when the latest published release is missing
                           # assets or checksums.
+                          if ([string]::IsNullOrEmpty($env:LATEST_VERSION)) {
+                              Write-Host "::notice::No published release yet; skipping fresh-latest."
+                              exit 0
+                          }
                           $binDir = Join-Path $env:RUNNER_TEMP "eph-bin-fresh-latest"
 
                           ./scripts/install.ps1 -BinDir $binDir
@@ -174,6 +200,10 @@ jobs:
                       "fresh-versioned" {
                           # Exercises a fresh install with -Version and -BinDir against
                           # LATEST-1, selected by CI from published GitHub Releases.
+                          if ([string]::IsNullOrEmpty($env:PREVIOUS_VERSION)) {
+                              Write-Host "::notice::Need a second published release; skipping fresh-versioned."
+                              exit 0
+                          }
                           $binDir = Join-Path $env:RUNNER_TEMP "eph-bin-fresh-versioned"
 
                           ./scripts/install.ps1 -Version $env:PREVIOUS_VERSION -BinDir $binDir
@@ -186,6 +216,10 @@ jobs:
                           # Exercises the upgrade path by installing LATEST-1, then
                           # installing LATEST into the same -BinDir. CI owns the
                           # release selection; the installer remains generic.
+                          if ([string]::IsNullOrEmpty($env:PREVIOUS_VERSION) -or [string]::IsNullOrEmpty($env:LATEST_VERSION)) {
+                              Write-Host "::notice::Need two published releases; skipping upgrade-versioned."
+                              exit 0
+                          }
                           $binDir = Join-Path $env:RUNNER_TEMP "eph-bin-upgrade"
 
                           ./scripts/install.ps1 -Version $env:PREVIOUS_VERSION -BinDir $binDir
