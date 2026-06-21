@@ -3,7 +3,9 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "daily"
+      time: "03:00"
+      timezone: "America/Los_Angeles"
     open-pull-requests-limit: 10
     commit-message:
       prefix: "deps"
@@ -18,7 +20,9 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "daily"
+      time: "03:00"
+      timezone: "America/Los_Angeles"
     open-pull-requests-limit: 5
     commit-message:
       prefix: "ci"
