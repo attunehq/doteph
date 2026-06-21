@@ -1,0 +1,18 @@
+#!/usr/bin/env sh
+# Pre-commit checks for eph. Enable with:
+#   git config core.hooksPath .githooks
+set -eu
+
+root="$(git rev-parse --show-toplevel)"
+cd "$root"
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "cargo is required for eph pre-commit checks; install Rust from https://rustup.rs" >&2
+    exit 1
+fi
+
+echo "pre-commit: cargo fmt --all --check"
+cargo fmt --all --check
+
+echo "pre-commit: cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
