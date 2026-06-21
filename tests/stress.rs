@@ -129,44 +129,54 @@ enum RedisReply {
 /// declared byte count plus the trailing CRLF — so a fragmented read can never
 /// silently truncate a value into a false test failure.
 async fn redis_command(port: u16, args: &[&str]) -> Result<RedisReply> {
-    let stream = TcpStream::connect(("127.0.0.1", port))
-        .await
-        .with_context(|| format!("connecting to redis on 127.0.0.1:{port}"))?;
-    let (rd, mut wr) = stream.into_split();
-    let mut reader = BufReader::new(rd);
+    // Cap the whole exchange: a peer that accepts the connection but never sends
+    // a complete reply must not hang the test forever, because retry_until can
+    // only recover if the operation actually returns.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .with_context(|| format!("connecting to redis on 127.0.0.1:{port}"))?;
+        let (rd, mut wr) = stream.into_split();
+        let mut reader = BufReader::new(rd);
 
-    let mut cmd = format!("*{}\r\n", args.len());
-    for arg in args {
-        write!(cmd, "${}\r\n{}\r\n", arg.len(), arg).expect("writing to String never fails");
-    }
-    wr.write_all(cmd.as_bytes()).await?;
-
-    let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
-    ensure!(n > 0, "redis closed the connection without replying");
-    let line = line.trim_end_matches(['\r', '\n']);
-    let (kind, rest) = line.split_at(1);
-    match kind {
-        "+" => Ok(RedisReply::Simple(rest.to_string())),
-        "-" => bail!("redis error reply: {rest}"),
-        "$" => {
-            let len: i64 = rest.parse().context("invalid bulk-string length")?;
-            if len < 0 {
-                return Ok(RedisReply::Nil);
-            }
-            let mut buf = vec![0u8; len as usize + 2]; // value bytes + trailing CRLF
-            reader
-                .read_exact(&mut buf)
-                .await
-                .context("short bulk-string read")?;
-            ensure!(buf.ends_with(b"\r\n"), "bulk string not CRLF-terminated");
-            buf.truncate(len as usize);
-            Ok(RedisReply::Bulk(
-                String::from_utf8(buf).context("non-utf8 bulk string")?,
-            ))
+        let mut cmd = format!("*{}\r\n", args.len());
+        for arg in args {
+            write!(cmd, "${}\r\n{}\r\n", arg.len(), arg).expect("writing to String never fails");
         }
-        other => bail!("unexpected RESP reply type {other:?}: {line:?}"),
-    }
+        wr.write_all(cmd.as_bytes()).await?;
+
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await?;
+        ensure!(n > 0, "redis closed the connection without replying");
+        let line = line.trim_end_matches(['\r', '\n']);
+        ensure!(!line.is_empty(), "empty RESP reply line");
+        // The first byte of a RESP reply is an ASCII control char (+ - $ : *),
+        // so slicing at byte index 1 is a valid char boundary in the branches
+        // that take it; the catch-all branch never slices.
+        match line.as_bytes()[0] {
+            b'+' => Ok(RedisReply::Simple(line[1..].to_string())),
+            b'-' => bail!("redis error reply: {}", &line[1..]),
+            b'$' => {
+                let len: i64 = line[1..].parse().context("invalid bulk-string length")?;
+                if len < 0 {
+                    return Ok(RedisReply::Nil);
+                }
+                let mut buf = vec![0u8; len as usize + 2]; // value bytes + trailing CRLF
+                reader
+                    .read_exact(&mut buf)
+                    .await
+                    .context("short bulk-string read")?;
+                ensure!(buf.ends_with(b"\r\n"), "bulk string not CRLF-terminated");
+                buf.truncate(len as usize);
+                Ok(RedisReply::Bulk(
+                    String::from_utf8(buf).context("non-utf8 bulk string")?,
+                ))
+            }
+            other => bail!("unexpected RESP reply type {:?}: {line:?}", other as char),
+        }
+    })
+    .await
+    .context("redis command timed out")?
 }
 
 /// `PING` redis and assert it pongs.
@@ -196,23 +206,29 @@ async fn redis_get(port: u16, key: &str) -> Result<Option<String>> {
 
 /// Issue a minimal HTTP/1.1 GET over a raw socket and return the status code.
 async fn http_status(port: u16, path: &str) -> Result<u16> {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))
-        .await
-        .with_context(|| format!("connecting to http on 127.0.0.1:{port}"))?;
+    // Bounded so a server that accepts but never closes the connection (we send
+    // `Connection: close`, but be defensive) cannot hang the test.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .with_context(|| format!("connecting to http on 127.0.0.1:{port}"))?;
 
-    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).await?;
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await?;
 
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    let text = String::from_utf8_lossy(&buf);
-    let status_line = text.lines().next().context("empty HTTP response")?;
-    // e.g. "HTTP/1.1 200 OK"
-    let code = status_line
-        .split_whitespace()
-        .nth(1)
-        .context("malformed HTTP status line")?;
-    code.parse().context("non-numeric HTTP status code")
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await?;
+        let text = String::from_utf8_lossy(&buf);
+        let status_line = text.lines().next().context("empty HTTP response")?;
+        // e.g. "HTTP/1.1 200 OK"
+        let code = status_line
+            .split_whitespace()
+            .nth(1)
+            .context("malformed HTTP status line")?;
+        code.parse().context("non-numeric HTTP status code")
+    })
+    .await
+    .context("http request timed out")?
 }
 
 /// Probe MinIO's liveness endpoint and assert it reports healthy.
