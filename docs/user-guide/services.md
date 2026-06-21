@@ -75,33 +75,31 @@ expose.zookeeper=2181
 
 - `eph` runs `docker compose -f <file> -p eph-<short_id>-kafka up -d`, so the
   whole project is namespaced per workspace.
-- `expose.<name>=<container_port>` declares a port that would be referenced as
-  `${kafka.port.kafka}` (see the limitations below before relying on it).
+- `expose.<name>=<container_port>` makes a port available for interpolation as
+  `${kafka.port.kafka}` etc. `eph` asks `docker compose port` for the real mapped
+  host port and falls back to the declared port if Compose does not report one.
+- Compose services are tracked by `eph status` and `eph env`: `eph` records the
+  Compose project and detects whether it is running by its
+  `com.docker.compose.project` label (its containers are not named
+  `eph-<short_id>-...`, so they are found by label, not by name).
 - `ready-timeout` defaults to **60s** for compose services, and `post-start`
   hooks run on **every** `eph up` (not just the first).
-- On teardown, **both** `eph down` and `eph down --rm` run `docker compose ...
-  down`, which removes the compose containers either way.
 
 > Requires the `docker compose` CLI plugin.
 
-### Limitations of `compose=` services
+### How compose services differ
 
 Compose support is intentionally thin - `eph` shells out to `docker compose` and
-lets it own the lifecycle. Two consequences to know:
+lets it own the container lifecycle. Two differences from the other source types
+are worth knowing:
 
-- **They are not tracked by `eph status` or `eph env`.** After `eph up`, compose
-  services do not appear in `eph status`, and their `expose` ports do **not**
-  resolve through `eph env` (a `${kafka.port.kafka}` reference is left as the
-  literal placeholder). If you need those ports as environment variables, read
-  them from `docker compose port` yourself, or use a Docker `image=`/`run=`
-  service, which are fully tracked.
+- **Teardown is coarser.** Both `eph down` and `eph down --rm` run `docker
+  compose ... down`, which removes the compose containers either way (`--rm`
+  makes no difference for compose).
 - **`eph clean` does not remove Compose-internal volumes.** It removes only the
   named volumes you declare with `volume=` in the `.eph` file. Volumes defined
-  inside the Compose file are managed by `docker compose`.
-
-For a service whose ports you want to interpolate, prefer `image=` (or
-`dockerfile=`). Reach for `compose=` when you genuinely need a pre-existing
-multi-container Compose project and can live with managing its ports yourself.
+  inside the Compose file are managed by `docker compose` (use
+  `docker compose ... down -v` yourself if you need to drop them).
 
 ## `run=` - shell command (non-Docker) services
 

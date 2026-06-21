@@ -107,9 +107,9 @@ env`, with `${postgres.port}` filled in at runtime.
 | `${svc.port.name}` | Named port. |
 | `${svc.host}` | `localhost`. |
 
-Unresolved refs (stopped service / typo) are left verbatim. `compose` services
-are not tracked by `eph env`/`eph status`, so their `expose` ports never resolve;
-use `image=`/`run=` when you need a port as an env var.
+Unresolved refs (stopped service / typo) are left verbatim. All running services
+resolve, including `compose` (tracked by the `com.docker.compose.project` label);
+reference a compose service's `expose.<name>=` port as `${svc.port.<name>}`.
 
 ## Behaviors that matter
 
@@ -122,8 +122,9 @@ use `image=`/`run=` when you need a port as an env var.
 - **Image health checks have no shell** - one whitespace-split command, no
   pipes/`&&`/`$VAR`/quoted-spaces. The binary must exist in the image.
 - **Isolation by path**: two checkouts = different containers/volumes/ports.
-- **`compose` is thin**: not tracked by `status`/`env`; `down`/`down --rm` both
-  fully tear it down; `clean` removes only `.eph` `volume=` named volumes.
+- **`compose` is thin** but tracked (by project label): `down`/`down --rm` both
+  fully tear it down (`--rm` is a no-op for it); `clean` removes only `.eph`
+  `volume=` named volumes, not Compose-internal ones.
 - **No `eph logs`/`eph init`**: use `docker logs eph-<short_id>-<svc>`; author
   `.eph` by hand.
 - **Windows needs WSL** for `run=`, hooks, and shell health checks.
