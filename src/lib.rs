@@ -1,0 +1,24 @@
+//! `eph` - ephemeral services per workspace, like dotenv for services.
+//!
+//! This library holds the reusable logic behind the `eph` CLI: parsing `.eph`
+//! files ([`parser`]), resolving a workspace from the filesystem
+//! ([`workspace`]), managing Docker-backed services ([`service`]), and
+//! rendering resolved environment variables for shell `eval` ([`mod@env`]). The
+//! binary in `main.rs` is a thin clap front end over these APIs.
+
+#![warn(missing_docs)]
+#![deny(clippy::correctness)]
+#![warn(clippy::suspicious)]
+#![warn(clippy::style)]
+#![warn(clippy::complexity)]
+#![warn(clippy::perf)]
+
+pub mod env;
+pub mod parser;
+pub mod service;
+pub mod workspace;
+
+pub use env::{escape_bash, escape_fish, render, render_export, render_fish, render_json};
+pub use parser::{EphFile, Service, ServiceSource, parse, resolve_interpolations};
+pub use service::{RunningService, ServiceManager};
+pub use workspace::Workspace;

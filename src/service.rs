@@ -22,23 +22,32 @@ use tracing::{debug, info, warn};
 // Running Service Info
 // ============================================================================
 
-/// Runtime information about a running service
+/// Runtime information about a running service.
+///
+/// Returned by [`ServiceManager::start_service`] and friends, and queried for
+/// connection details via [`host`](Self::host), [`port`](Self::port), and
+/// [`named_port`](Self::named_port) when expanding interpolations.
 #[derive(Debug, Clone)]
 pub struct RunningService {
+    /// Service name (matches the `.eph` section header).
     #[allow(dead_code)]
     pub name: String,
+    /// Backend identifier: a Docker container id, `pid:<n>` for `run` services,
+    /// or `compose:<project>` for compose services.
     pub container_id: String,
-    /// Map of port name (or "default") to assigned host port
+    /// Map of port name (or `"default"`) to the assigned host port.
     pub ports: HashMap<String, u16>,
 }
 
 impl RunningService {
     /// Get the host for this service (always localhost for now)
+    #[must_use]
     pub fn host(&self) -> &str {
         "localhost"
     }
 
     /// Get the primary port (first port or named "default")
+    #[must_use]
     pub fn port(&self) -> Option<u16> {
         self.ports
             .get("default")
@@ -47,6 +56,7 @@ impl RunningService {
     }
 
     /// Get a named port
+    #[must_use]
     pub fn named_port(&self, name: &str) -> Option<u16> {
         self.ports.get(name).copied()
     }
@@ -69,24 +79,24 @@ pub struct CleanSummary {
 
 /// Persistent state for a workspace's services
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub struct ServiceState {
+pub(crate) struct ServiceState {
     /// Running services keyed by service name
-    pub services: HashMap<String, ServiceStateEntry>,
+    pub(crate) services: HashMap<String, ServiceStateEntry>,
     /// Process IDs for shell command services
     #[serde(default)]
-    pub processes: HashMap<String, u32>,
+    pub(crate) processes: HashMap<String, u32>,
 }
 
 /// State entry for a single service
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServiceStateEntry {
-    pub container_id: String,
-    pub ports: HashMap<String, u16>,
+pub(crate) struct ServiceStateEntry {
+    pub(crate) container_id: String,
+    pub(crate) ports: HashMap<String, u16>,
 }
 
 impl ServiceState {
     /// Load state from disk
-    pub async fn load(workspace: &Workspace) -> Result<Self> {
+    pub(crate) async fn load(workspace: &Workspace) -> Result<Self> {
         let path = state_file_path(workspace)?;
 
         if !path.exists() {
@@ -95,30 +105,30 @@ impl ServiceState {
 
         let contents = tokio::fs::read_to_string(&path)
             .await
-            .with_context(|| format!("Failed to read state file: {}", path.display()))?;
+            .with_context(|| format!("failed to read state file: {}", path.display()))?;
 
         let state: ServiceState = serde_json::from_str(&contents)
-            .with_context(|| format!("Failed to parse state file: {}", path.display()))?;
+            .with_context(|| format!("failed to parse state file: {}", path.display()))?;
 
         Ok(state)
     }
 
     /// Save state to disk
-    pub async fn save(&self, workspace: &Workspace) -> Result<()> {
+    pub(crate) async fn save(&self, workspace: &Workspace) -> Result<()> {
         let path = state_file_path(workspace)?;
 
         // Ensure directory exists
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.with_context(|| {
-                format!("Failed to create state directory: {}", parent.display())
+                format!("failed to create state directory: {}", parent.display())
             })?;
         }
 
-        let contents = serde_json::to_string_pretty(self).context("Failed to serialize state")?;
+        let contents = serde_json::to_string_pretty(self).context("failed to serialize state")?;
 
         tokio::fs::write(&path, contents)
             .await
-            .with_context(|| format!("Failed to write state file: {}", path.display()))?;
+            .with_context(|| format!("failed to write state file: {}", path.display()))?;
 
         Ok(())
     }
@@ -133,34 +143,34 @@ fn state_file_path(workspace: &Workspace) -> Result<PathBuf> {
 // ============================================================================
 
 /// Information about an existing container
-pub struct ContainerInfo {
-    pub id: String,
-    pub is_running: bool,
-    pub ports: HashMap<String, u16>,
+pub(crate) struct ContainerInfo {
+    pub(crate) id: String,
+    pub(crate) is_running: bool,
+    pub(crate) ports: HashMap<String, u16>,
 }
 
 /// Docker client wrapper
-pub struct DockerClient {
+pub(crate) struct DockerClient {
     client: Docker,
 }
 
 impl DockerClient {
     /// Connect to Docker daemon
-    pub async fn connect() -> Result<Self> {
+    pub(crate) async fn connect() -> Result<Self> {
         let client = Docker::connect_with_local_defaults()
-            .context("Failed to connect to Docker. Is Docker running?")?;
+            .context("failed to connect to docker (is docker running?)")?;
 
         // Verify connection
         client
             .ping()
             .await
-            .context("Failed to ping Docker daemon")?;
+            .context("failed to ping docker daemon")?;
 
         Ok(DockerClient { client })
     }
 
     /// Get information about a container by name
-    pub async fn get_container(&self, name: &str) -> Result<Option<ContainerInfo>> {
+    pub(crate) async fn get_container(&self, name: &str) -> Result<Option<ContainerInfo>> {
         let filters: HashMap<String, Vec<String>> =
             HashMap::from([("name".to_string(), vec![name.to_string()])]);
 
@@ -172,7 +182,7 @@ impl DockerClient {
                 ..Default::default()
             }))
             .await
-            .context("Failed to list containers")?;
+            .context("failed to list containers")?;
 
         // Find exact match (Docker's name filter is a prefix match)
         let container = containers.into_iter().find(|c| {
@@ -211,16 +221,16 @@ impl DockerClient {
     }
 
     /// Start an existing container
-    pub async fn start_container(&self, id: &str) -> Result<()> {
+    pub(crate) async fn start_container(&self, id: &str) -> Result<()> {
         self.client
             .start_container(id, None::<StartContainerOptions<String>>)
             .await
-            .context("Failed to start container")?;
+            .context("failed to start container")?;
         Ok(())
     }
 
     /// Stop a container
-    pub async fn stop_container(&self, name: &str) -> Result<()> {
+    pub(crate) async fn stop_container(&self, name: &str) -> Result<()> {
         if let Some(info) = self.get_container(name).await?
             && info.is_running
         {
@@ -228,13 +238,13 @@ impl DockerClient {
             self.client
                 .stop_container(&info.id, Some(StopContainerOptions { t: 10 }))
                 .await
-                .context("Failed to stop container")?;
+                .context("failed to stop container")?;
         }
         Ok(())
     }
 
     /// Remove a container
-    pub async fn remove_container(&self, name: &str) -> Result<()> {
+    pub(crate) async fn remove_container(&self, name: &str) -> Result<()> {
         if let Some(info) = self.get_container(name).await? {
             info!("Removing container {}", name);
             self.client
@@ -246,13 +256,13 @@ impl DockerClient {
                     }),
                 )
                 .await
-                .context("Failed to remove container")?;
+                .context("failed to remove container")?;
         }
         Ok(())
     }
 
     /// Remove a named volume, ignoring "not found" errors
-    pub async fn remove_volume(&self, name: &str) -> Result<()> {
+    pub(crate) async fn remove_volume(&self, name: &str) -> Result<()> {
         use bollard::errors::Error as BollardError;
         use bollard::volume::RemoveVolumeOptions;
 
@@ -267,12 +277,12 @@ impl DockerClient {
             Err(BollardError::DockerResponseServerError {
                 status_code: 404, ..
             }) => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("Failed to remove volume {}", name)),
+            Err(e) => Err(e).with_context(|| format!("failed to remove volume {}", name)),
         }
     }
 
     /// Execute a command inside a running container
-    pub async fn exec_in_container(&self, container_id: &str, cmd: &[&str]) -> Result<i64> {
+    pub(crate) async fn exec_in_container(&self, container_id: &str, cmd: &[&str]) -> Result<i64> {
         use bollard::exec::{CreateExecOptions, StartExecResults};
 
         let exec = self
@@ -287,13 +297,13 @@ impl DockerClient {
                 },
             )
             .await
-            .context("Failed to create exec")?;
+            .context("failed to create exec")?;
 
         let start_result = self
             .client
             .start_exec(&exec.id, None)
             .await
-            .context("Failed to start exec")?;
+            .context("failed to start exec")?;
 
         // Consume output
         if let StartExecResults::Attached { mut output, .. } = start_result {
@@ -309,13 +319,13 @@ impl DockerClient {
             .client
             .inspect_exec(&exec.id)
             .await
-            .context("Failed to inspect exec")?;
+            .context("failed to inspect exec")?;
 
         Ok(inspect.exit_code.unwrap_or(-1))
     }
 
     /// Pull an image and run it as a container
-    pub async fn run_image(
+    pub(crate) async fn run_image(
         &self,
         container_name: &str,
         image: &str,
@@ -417,19 +427,19 @@ impl DockerClient {
                 config,
             )
             .await
-            .context("Failed to create container")?;
+            .context("failed to create container")?;
 
         // Start container
         self.client
             .start_container(&response.id, None::<StartContainerOptions<String>>)
             .await
-            .context("Failed to start container")?;
+            .context("failed to start container")?;
 
         // Get assigned ports
         let info = self
             .get_container(container_name)
             .await?
-            .context("Container disappeared after creation")?;
+            .context("container disappeared after creation")?;
 
         // Map port names
         let mut named_ports = HashMap::new();
@@ -452,7 +462,7 @@ impl DockerClient {
     }
 
     /// Build from Dockerfile and run
-    pub async fn build_and_run(
+    pub(crate) async fn build_and_run(
         &self,
         container_name: &str,
         dockerfile_path: &std::path::Path,
@@ -489,11 +499,11 @@ impl DockerClient {
             ])
             .output()
             .await
-            .context("Failed to run docker build")?;
+            .context("failed to run docker build")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Docker build failed:\n{}", stderr);
+            bail!("docker build failed:\n{}", stderr);
         }
 
         // Now run like a normal image
@@ -520,7 +530,7 @@ impl DockerClient {
         );
 
         while let Some(result) = stream.next().await {
-            result.context("Failed to pull image")?;
+            result.context("failed to pull image")?;
         }
 
         Ok(())
@@ -531,7 +541,11 @@ impl DockerClient {
 // Service Manager
 // ============================================================================
 
-/// Manager for all services in a workspace
+/// Manager for all services in a workspace.
+///
+/// Owns the [`Workspace`], a Docker connection, and the persisted service
+/// state, and drives the service lifecycle (start, stop, status, clean).
+/// Construct one with [`ServiceManager::new`].
 pub struct ServiceManager {
     workspace: Workspace,
     docker: DockerClient,
@@ -539,7 +553,15 @@ pub struct ServiceManager {
 }
 
 impl ServiceManager {
-    /// Create a new service manager for a workspace
+    /// Create a new service manager for a workspace.
+    ///
+    /// Connects to the local Docker daemon and loads any persisted state for
+    /// the workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Docker daemon cannot be reached, or if the
+    /// persisted state file exists but cannot be read or parsed.
     pub async fn new(workspace: Workspace) -> Result<Self> {
         let docker = DockerClient::connect().await?;
         let state = ServiceState::load(&workspace).await?;
@@ -550,7 +572,12 @@ impl ServiceManager {
         })
     }
 
-    /// Start all services defined in the .eph file
+    /// Start every service defined in the [`EphFile`] and persist state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any service fails to start (see
+    /// [`start_service`](Self::start_service)) or if state cannot be saved.
     pub async fn start_all(&mut self, eph: &EphFile) -> Result<HashMap<String, RunningService>> {
         let mut running = HashMap::new();
 
@@ -565,7 +592,18 @@ impl ServiceManager {
         Ok(running)
     }
 
-    /// Start a single service
+    /// Start a single service, reusing an already-running instance if present.
+    ///
+    /// Docker-backed services (`image`/`dockerfile`) are created or restarted and
+    /// waited on until healthy; `run` services spawn a process and `compose`
+    /// services shell out to `docker compose`. Idempotent: a service that is
+    /// already running is detected and returned without starting a duplicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the image cannot be pulled or built, the container or
+    /// process cannot be started, the service fails its healthcheck within the
+    /// configured timeout, or a `post-start` hook fails.
     pub async fn start_service(&mut self, name: &str, service: &Service) -> Result<RunningService> {
         let container_name = self.workspace.container_name(name);
 
@@ -626,7 +664,7 @@ impl ServiceManager {
                     .docker
                     .get_container(&container_name)
                     .await?
-                    .context("Container disappeared after start")?;
+                    .context("container disappeared after start")?;
 
                 // Wait for health check
                 self.wait_for_healthy(name, service, &refreshed.id).await?;
@@ -678,9 +716,6 @@ impl ServiceManager {
             }
             ServiceSource::Command(cmd) => self.start_shell_command(name, cmd, service).await?,
             ServiceSource::Compose(path) => self.start_compose(name, path, service).await?,
-            ServiceSource::None => {
-                bail!("Service {} has no source defined", name);
-            }
         };
 
         // Record in state
@@ -751,7 +786,7 @@ impl ServiceManager {
         match result {
             Ok(inner) => inner,
             Err(_) => bail!(
-                "Service {} failed to become healthy within {}s",
+                "service {} failed to become healthy within {}s",
                 name,
                 timeout_secs
             ),
@@ -780,7 +815,7 @@ impl ServiceManager {
             .current_dir(&self.workspace.path)
             .envs(&env_vars)
             .spawn()
-            .with_context(|| format!("Failed to start command: {}", cmd))?;
+            .with_context(|| format!("failed to start command: {}", cmd))?;
 
         let pid = child.id().unwrap_or(0);
         info!("Started {} with PID {}", name, pid);
@@ -878,11 +913,11 @@ impl ServiceManager {
             .current_dir(&self.workspace.path)
             .output()
             .await
-            .context("Failed to run docker compose")?;
+            .context("failed to run docker compose")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Docker compose failed:\n{}", stderr);
+            bail!("docker compose failed:\n{}", stderr);
         }
 
         // Get port mappings from compose
@@ -970,8 +1005,15 @@ impl ServiceManager {
         })
     }
 
-    /// Stop all services. When `remove` is true, also remove containers
-    /// (and compose resources) so they do not accumulate.
+    /// Stop all services, clear in-memory state, and persist the result.
+    ///
+    /// When `remove` is true, also remove containers (and compose resources) so
+    /// they do not accumulate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if stopping a service fails (see
+    /// [`stop_service`](Self::stop_service)) or if state cannot be saved.
     pub async fn stop_all(&mut self, eph: &EphFile, remove: bool) -> Result<()> {
         for (name, service) in &eph.services {
             self.stop_service(name, service, remove).await?;
@@ -982,9 +1024,18 @@ impl ServiceManager {
         Ok(())
     }
 
-    /// Stop a single service. When `remove` is true, also remove the underlying
-    /// container after stopping it (compose uses `down`, which already removes
-    /// containers; killing a shell command process already removes it).
+    /// Stop a single service after running its `pre-stop` hooks.
+    ///
+    /// When `remove` is true, also remove the underlying container after
+    /// stopping it (compose uses `down`, which already removes containers;
+    /// killing a `run` process already removes it). Pre-stop hook failures and
+    /// the best-effort process/compose teardown are logged rather than
+    /// propagated, so a stale or already-stopped service does not error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a Docker stop or remove call fails for an
+    /// `image`/`dockerfile` service.
     pub async fn stop_service(
         &mut self,
         name: &str,
@@ -1006,12 +1057,16 @@ impl ServiceManager {
                 // Kill the process
                 if let Some(&pid) = self.state.processes.get(name) {
                     info!("Stopping process {} (PID {})", name, pid);
-                    // Send SIGTERM
+                    // Send SIGTERM. Best-effort: the process may already have
+                    // exited (stale PID), in which case `kill` fails and there is
+                    // nothing left to stop, so the error is intentionally ignored.
                     let _ = TokioCommand::new("kill")
                         .arg(pid.to_string())
                         .output()
                         .await;
-                    // Wait a bit then SIGKILL if needed
+                    // Wait a bit then SIGKILL if it ignored SIGTERM. Same
+                    // best-effort rationale: a failure means the process is
+                    // already gone, so the result is intentionally ignored.
                     sleep(Duration::from_secs(2)).await;
                     let _ = TokioCommand::new("kill")
                         .args(["-9", &pid.to_string()])
@@ -1025,6 +1080,9 @@ impl ServiceManager {
                 let project_name = format!("eph-{}-{}", self.workspace.short_id, name);
 
                 info!("Stopping docker-compose service {}", name);
+                // Best-effort teardown: if the compose project is already down
+                // (or was never brought up) `docker compose down` reports an
+                // error we cannot act on here, so it is intentionally ignored.
                 let _ = TokioCommand::new("docker")
                     .args([
                         "compose",
@@ -1053,6 +1111,13 @@ impl ServiceManager {
     /// Fully reset the workspace: stop and remove every service's container
     /// (or compose resources / process), remove every per-workspace named
     /// volume, clear in-memory state, and delete the persisted state file.
+    ///
+    /// Returns a [`CleanSummary`] describing what was removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if stopping a service, removing a named volume, or
+    /// deleting the state directory fails.
     pub async fn clean(&mut self, eph: &EphFile) -> Result<CleanSummary> {
         let mut summary = CleanSummary::default();
 
@@ -1086,7 +1151,7 @@ impl ServiceManager {
             tokio::fs::remove_dir_all(&state_dir)
                 .await
                 .with_context(|| {
-                    format!("Failed to remove state directory: {}", state_dir.display())
+                    format!("failed to remove state directory: {}", state_dir.display())
                 })?;
             summary.state_removed = true;
         }
@@ -1094,12 +1159,25 @@ impl ServiceManager {
         Ok(summary)
     }
 
-    /// Save the current state to disk
+    /// Save the current in-memory service state to disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state directory cannot be created or the state
+    /// file cannot be serialized or written.
     pub async fn save_state(&self) -> Result<()> {
         self.state.save(&self.workspace).await
     }
 
-    /// Get currently running services
+    /// Return the services that are currently running.
+    ///
+    /// Reconciles persisted state against the live Docker daemon (and tracked
+    /// PIDs for `run` services), so only services that are actually up are
+    /// included.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying the Docker daemon for a container fails.
     pub async fn status(&self) -> Result<HashMap<String, RunningService>> {
         let mut result = HashMap::new();
 
@@ -1154,11 +1232,11 @@ impl ServiceManager {
             .current_dir(&self.workspace.path)
             .output()
             .await
-            .with_context(|| format!("Failed to execute hook: {}", cmd))?;
+            .with_context(|| format!("failed to execute hook: {}", cmd))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Hook failed: {}\n{}", cmd, stderr);
+            bail!("hook failed: {}\n{}", cmd, stderr);
         }
 
         Ok(())

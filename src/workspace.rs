@@ -8,23 +8,50 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-/// A workspace represents a directory with a .eph file
+/// A workspace: a directory containing a `.eph` file.
+///
+/// Each workspace gets a stable [`id`](Self::id) derived from the SHA-256 of its
+/// canonical path, so multiple checkouts of the same project at different paths
+/// never collide on container or volume names. Construct one with
+/// [`Workspace::from_path`] (an exact directory) or [`Workspace::find_from_path`]
+/// / [`Workspace::find_from_cwd`] (search upwards for a `.eph` file).
 #[derive(Debug, Clone)]
 pub struct Workspace {
-    /// Absolute path to the workspace directory
+    /// Absolute, canonicalized path to the workspace directory.
     pub path: PathBuf,
-    /// Unique identifier for this workspace (hash of path)
+    /// Unique identifier for this workspace (hex SHA-256 of [`path`](Self::path)).
     pub id: String,
-    /// Short ID for display and container naming
+    /// First 8 hex characters of [`id`](Self::id), used for display and naming.
     pub short_id: String,
 }
 
 impl Workspace {
-    /// Create a workspace from a directory path
+    /// Create a workspace from a directory path.
+    ///
+    /// The path is canonicalized, so the resulting [`id`](Self::id) is stable
+    /// regardless of how the directory was addressed (relative path, symlink,
+    /// etc.).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `path` cannot be canonicalized, for example because
+    /// the directory does not exist or is not accessible.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn main() -> anyhow::Result<()> {
+    /// use eph::Workspace;
+    ///
+    /// let ws = Workspace::from_path(".")?;
+    /// println!("workspace id: {}", ws.short_id);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().canonicalize().with_context(|| {
             format!(
-                "Failed to resolve workspace path: {}",
+                "failed to resolve workspace path: {}",
                 path.as_ref().display()
             )
         })?;
@@ -35,13 +62,45 @@ impl Workspace {
         Ok(Workspace { path, id, short_id })
     }
 
-    /// Find workspace by walking up from current directory
+    /// Find the workspace by walking up from the current directory.
+    ///
+    /// Convenience wrapper over [`find_from_path`](Self::find_from_path) that
+    /// starts at the process's current working directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the current directory cannot be determined, or if no
+    /// `.eph` file is found in it or any parent directory (see
+    /// [`find_from_path`](Self::find_from_path)).
     pub fn find_from_cwd() -> Result<Self> {
-        let cwd = std::env::current_dir().context("Failed to get current directory")?;
+        let cwd = std::env::current_dir().context("failed to get current directory")?;
         Self::find_from_path(&cwd)
     }
 
-    /// Find workspace by walking up from a given directory
+    /// Find the workspace by walking up from a given directory.
+    ///
+    /// Starts at `start` and ascends through parent directories, returning the
+    /// first one that contains a `.eph` file (via
+    /// [`from_path`](Self::from_path)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no `.eph` file is found in `start` or any of its
+    /// ancestors, or if the directory that does contain one cannot be
+    /// canonicalized (see [`from_path`](Self::from_path)).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn main() -> anyhow::Result<()> {
+    /// use eph::Workspace;
+    /// use std::path::Path;
+    ///
+    /// let ws = Workspace::find_from_path(Path::new("."))?;
+    /// println!("found .eph at {}", ws.eph_file_path().display());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn find_from_path(start: &Path) -> Result<Self> {
         let mut current = start.to_path_buf();
 
@@ -53,7 +112,7 @@ impl Workspace {
 
             if !current.pop() {
                 anyhow::bail!(
-                    "No .eph file found in {} or any parent directory",
+                    "no .eph file found in {} or any parent directory",
                     start.display()
                 );
             }
@@ -61,29 +120,41 @@ impl Workspace {
     }
 
     /// Get the path to the .eph file
+    #[must_use]
     pub fn eph_file_path(&self) -> PathBuf {
         self.path.join(".eph")
     }
 
     /// Get a container name prefix for this workspace
+    #[must_use]
     pub fn container_prefix(&self) -> String {
         format!("eph-{}", self.short_id)
     }
 
     /// Get a full container name for a service
+    #[must_use]
     pub fn container_name(&self, service: &str) -> String {
         format!("{}-{}", self.container_prefix(), service)
     }
 
     /// Get a volume name for a service
+    #[must_use]
     pub fn volume_name(&self, service: &str, volume_name: &str) -> String {
         format!("{}-{}-{}", self.container_prefix(), service, volume_name)
     }
 
-    /// Get the state directory for this workspace
+    /// Get the state directory for this workspace.
+    ///
+    /// This is `<local data dir>/eph/<short_id>`, where the per-workspace
+    /// [`short_id`](Self::short_id) keeps state for different checkouts apart.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the platform's local data directory cannot be
+    /// determined.
     pub fn state_dir(&self) -> Result<PathBuf> {
         let state_dir = dirs::data_local_dir()
-            .context("Failed to determine local data directory")?
+            .context("failed to determine local data directory")?
             .join("eph")
             .join(&self.short_id);
         Ok(state_dir)

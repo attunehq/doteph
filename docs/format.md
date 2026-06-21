@@ -54,6 +54,10 @@ environment variable rather than a service property.
 
 ## Service Types
 
+Every service must declare exactly one source: `image`, `dockerfile`, `compose`,
+or `run`. A section that declares no source is rejected when the file is parsed
+(for example by `eph check`), before any service is started.
+
 ### Docker Image
 
 The most common case - pull and run a Docker image:

@@ -43,7 +43,7 @@ test:
 	cargo test
 
 test-unit:
-	cargo test --bins
+	cargo test --lib
 
 test-integration:
 	cargo test --test integration

@@ -30,24 +30,37 @@ use tracing::warn;
 // AST Types
 // ============================================================================
 
-/// A parsed .eph file
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// A parsed `.eph` file.
+///
+/// Produced by [`parse`]. Holds the top-level [`EnvVar`]s and the named
+/// [`Service`] definitions extracted from the file.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EphFile {
-    /// Top-level environment variables
+    /// Top-level environment variables, in declaration order.
     pub env_vars: Vec<EnvVar>,
-    /// Service definitions (keyed by service name)
+    /// Service definitions, keyed by service name (the section header).
     pub services: HashMap<String, Service>,
 }
 
-/// An environment variable definition
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// An environment variable definition.
+///
+/// The [`value`](Self::value) is stored verbatim, including any
+/// `${service.property}` interpolation placeholders; those are only resolved
+/// later by [`resolve_interpolations`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EnvVar {
+    /// Variable name (the part before `=`).
     pub name: String,
+    /// Variable value, with interpolation placeholders left intact.
     pub value: String,
 }
 
-/// A service definition
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// A service definition.
+///
+/// Every `Service` is guaranteed to have a concrete [`ServiceSource`]: the
+/// parser rejects any section that declares no source, so by the time a
+/// `Service` exists this invariant holds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Service {
     /// Service name (matches section header)
     pub name: String,
@@ -73,12 +86,13 @@ pub struct Service {
     pub command_override: Option<String>,
 }
 
-/// How a service is started
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// How a service is started.
+///
+/// Exactly one source per service. There is intentionally no "unset" variant:
+/// a section that declares no source is rejected at parse time, so a value of
+/// this type always names a real way to start the service.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServiceSource {
-    /// No source specified yet
-    #[default]
-    None,
     /// Docker image to pull and run
     Image(String),
     /// Dockerfile to build
@@ -90,7 +104,7 @@ pub enum ServiceSource {
 }
 
 /// A port mapping
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PortMapping {
     /// Optional name for this port (e.g., "api", "admin")
     pub name: Option<String>,
@@ -102,11 +116,93 @@ pub struct PortMapping {
 // Parser
 // ============================================================================
 
-/// Parse an .eph file from a string
+/// A service section while it is still being parsed.
+///
+/// The source is optional here because a section accumulates properties line by
+/// line and the source may appear on any line (or, erroneously, not at all).
+/// [`ServiceBuilder::finish`] turns this into a [`Service`], rejecting sections
+/// that never declared a source so the resulting `Service` always has one.
+#[derive(Default)]
+struct ServiceBuilder {
+    name: String,
+    source: Option<ServiceSource>,
+    ports: Vec<PortMapping>,
+    env: HashMap<String, String>,
+    volumes: Vec<String>,
+    post_start: Vec<String>,
+    pre_stop: Vec<String>,
+    healthcheck: Option<String>,
+    ready_timeout_secs: Option<u64>,
+    build_context: Option<String>,
+    command_override: Option<String>,
+}
+
+impl ServiceBuilder {
+    /// Finalize the section into a [`Service`], requiring a concrete source.
+    fn finish(self) -> Result<Service> {
+        let source = self.source.ok_or_else(|| {
+            anyhow::anyhow!(
+                "service '{}' has no source defined (set one of image/dockerfile/compose/run)",
+                self.name
+            )
+        })?;
+        Ok(Service {
+            name: self.name,
+            source,
+            ports: self.ports,
+            env: self.env,
+            volumes: self.volumes,
+            post_start: self.post_start,
+            pre_stop: self.pre_stop,
+            healthcheck: self.healthcheck,
+            ready_timeout_secs: self.ready_timeout_secs,
+            build_context: self.build_context,
+            command_override: self.command_override,
+        })
+    }
+}
+
+/// Parse an `.eph` file from a string into an [`EphFile`].
+///
+/// Top-level `KEY=VALUE` lines become [`EnvVar`]s and `[name]` sections become
+/// [`Service`]s. Each returned [`Service`] is guaranteed to carry a concrete
+/// [`ServiceSource`], because a section that declares no source is rejected
+/// here rather than at runtime.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - a line is neither a comment, a section header, nor `KEY=VALUE`
+/// - a section header is empty (`[]`)
+/// - a service property has an invalid value (e.g. a non-numeric `port`)
+/// - an unknown, non-`SCREAMING_SNAKE_CASE` property appears inside a section
+///   (a likely typo). An unknown but `SCREAMING_SNAKE_CASE` key is instead
+///   reclassified as a trailing top-level variable, with a warning.
+/// - a section declares no source (no `image`/`dockerfile`/`compose`/`run`)
+///
+/// # Examples
+///
+/// ```
+/// # fn main() -> anyhow::Result<()> {
+/// let eph = eph::parser::parse("APP_NAME=myapp\n\n[redis]\nimage=redis:7\n")?;
+/// assert_eq!(eph.env_vars[0].name, "APP_NAME");
+/// assert!(eph.services.contains_key("redis"));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// A section without a source is rejected:
+///
+/// ```
+/// assert!(eph::parser::parse("[redis]\nport=6379\n").is_err());
+/// ```
 pub fn parse(input: &str) -> Result<EphFile> {
     let mut env_vars: Vec<EnvVar> = Vec::new();
-    let mut services: HashMap<String, Service> = HashMap::new();
-    let mut current_service: Option<String> = None;
+    // Preserve insertion order of service sections so that finalization (and
+    // any error it reports) is deterministic.
+    let mut builders: Vec<ServiceBuilder> = Vec::new();
+    let mut index_by_name: HashMap<String, usize> = HashMap::new();
+    let mut current_service: Option<usize> = None;
 
     for (line_num, line) in input.lines().enumerate() {
         let line_num = line_num + 1; // 1-indexed
@@ -121,19 +217,22 @@ pub fn parse(input: &str) -> Result<EphFile> {
         if line.starts_with('[') && line.ends_with(']') {
             let name = &line[1..line.len() - 1];
             if name.is_empty() {
-                bail!("Empty section name at line {}", line_num);
+                bail!("empty section name at line {}", line_num);
             }
-            current_service = Some(name.to_string());
-            services.entry(name.to_string()).or_insert_with(|| Service {
-                name: name.to_string(),
-                ..Default::default()
+            let index = *index_by_name.entry(name.to_string()).or_insert_with(|| {
+                builders.push(ServiceBuilder {
+                    name: name.to_string(),
+                    ..Default::default()
+                });
+                builders.len() - 1
             });
+            current_service = Some(index);
             continue;
         }
 
         // Parse key=value
         let Some((key, value)) = line.split_once('=') else {
-            bail!("Invalid syntax at line {}: expected KEY=VALUE", line_num);
+            bail!("invalid syntax at line {}: expected KEY=VALUE", line_num);
         };
 
         let key = key.trim();
@@ -142,9 +241,9 @@ pub fn parse(input: &str) -> Result<EphFile> {
         // Remove optional quotes from value
         let value = strip_quotes(value);
 
-        if let Some(ref service_name) = current_service {
+        if let Some(index) = current_service {
             // We're inside a service section - try to parse as service property
-            let service = services.get_mut(service_name).unwrap();
+            let service = &mut builders[index];
             match parse_service_property(service, key, value, line_num) {
                 Ok(()) => continue,
                 Err(_) if is_env_var_name(key) => {
@@ -160,7 +259,7 @@ pub fn parse(input: &str) -> Result<EphFile> {
                          property; it looks like an environment variable, so the section \
                          was ended and the key was treated as a top-level variable. If you \
                          meant a service property, check for a typo.",
-                        key, service_name, line_num
+                        key, service.name, line_num
                     );
                     current_service = None;
                     env_vars.push(EnvVar {
@@ -179,10 +278,25 @@ pub fn parse(input: &str) -> Result<EphFile> {
         }
     }
 
+    // Finalize each section into a concrete Service, rejecting any that never
+    // declared a source. This keeps the illegal "service with no source" state
+    // out of the returned EphFile entirely.
+    let mut services: HashMap<String, Service> = HashMap::with_capacity(builders.len());
+    for builder in builders {
+        let service = builder.finish()?;
+        services.insert(service.name.clone(), service);
+    }
+
     Ok(EphFile { env_vars, services })
 }
 
-/// Check if a key looks like an environment variable name (SCREAMING_SNAKE_CASE)
+/// Returns `true` if `key` looks like an environment variable name, i.e. a
+/// non-empty `SCREAMING_SNAKE_CASE` identifier: only ASCII uppercase letters,
+/// digits, and `_`, starting with an uppercase letter.
+///
+/// Used by [`parse`] to decide whether an unknown key inside a section is a
+/// trailing top-level env var (reclassified, with a warning) or a typo'd
+/// service property (a hard error).
 fn is_env_var_name(key: &str) -> bool {
     !key.is_empty()
         && key
@@ -191,6 +305,9 @@ fn is_env_var_name(key: &str) -> bool {
         && key.chars().next().is_some_and(|c| c.is_ascii_uppercase())
 }
 
+/// Strips a single matching pair of surrounding single or double quotes from
+/// `s`, returning the inner slice. A string without matching surrounding quotes
+/// (or one too short to be quoted) is returned unchanged.
 fn strip_quotes(s: &str) -> &str {
     if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
         &s[1..s.len() - 1]
@@ -200,23 +317,23 @@ fn strip_quotes(s: &str) -> &str {
 }
 
 fn parse_service_property(
-    service: &mut Service,
+    service: &mut ServiceBuilder,
     key: &str,
     value: &str,
     line_num: usize,
 ) -> Result<()> {
     match key {
-        "image" => service.source = ServiceSource::Image(value.to_string()),
-        "dockerfile" => service.source = ServiceSource::Dockerfile(value.to_string()),
-        "compose" => service.source = ServiceSource::Compose(value.to_string()),
+        "image" => service.source = Some(ServiceSource::Image(value.to_string())),
+        "dockerfile" => service.source = Some(ServiceSource::Dockerfile(value.to_string())),
+        "compose" => service.source = Some(ServiceSource::Compose(value.to_string())),
         // Shell command to run (non-Docker)
-        "run" => service.source = ServiceSource::Command(value.to_string()),
+        "run" => service.source = Some(ServiceSource::Command(value.to_string())),
         // Container command override (for use with image/dockerfile)
         "command" => service.command_override = Some(value.to_string()),
         "port" => {
             let port: u16 = value
                 .parse()
-                .with_context(|| format!("Invalid port number at line {}", line_num))?;
+                .with_context(|| format!("invalid port number at line {}", line_num))?;
             service.ports.push(PortMapping {
                 name: None,
                 container_port: port,
@@ -237,14 +354,14 @@ fn parse_service_property(
         "ready-timeout" => {
             let secs: u64 = value
                 .parse()
-                .with_context(|| format!("Invalid timeout at line {}", line_num))?;
+                .with_context(|| format!("invalid timeout at line {}", line_num))?;
             service.ready_timeout_secs = Some(secs);
         }
         key if key.starts_with("port.") => {
             let port_name = &key[5..];
             let port: u16 = value
                 .parse()
-                .with_context(|| format!("Invalid port number at line {}", line_num))?;
+                .with_context(|| format!("invalid port number at line {}", line_num))?;
             service.ports.push(PortMapping {
                 name: Some(port_name.to_string()),
                 container_port: port,
@@ -259,7 +376,7 @@ fn parse_service_property(
             let port_name = &key[7..];
             let port: u16 = value
                 .parse()
-                .with_context(|| format!("Invalid port number at line {}", line_num))?;
+                .with_context(|| format!("invalid port number at line {}", line_num))?;
             service.ports.push(PortMapping {
                 name: Some(port_name.to_string()),
                 container_port: port,
@@ -270,7 +387,7 @@ fn parse_service_property(
             service.build_context = Some(value.to_string());
         }
         _ => {
-            bail!("Unknown service property '{}' at line {}", key, line_num);
+            bail!("unknown service property '{}' at line {}", key, line_num);
         }
     }
     Ok(())
@@ -280,7 +397,37 @@ fn parse_service_property(
 // Interpolation
 // ============================================================================
 
-/// Replace interpolations in a string using a resolver function
+/// Replaces `${service.property}` interpolations in `input` using `resolver`.
+///
+/// For each placeholder, `resolver` is called with the `service` and `property`
+/// parts. If it returns `Some(value)`, the placeholder is replaced; if it
+/// returns `None`, or the placeholder has no `.` separator, the original
+/// `${...}` text is left untouched so it can be surfaced unresolved. Text
+/// outside placeholders is copied verbatim. This is the resolver used to expand
+/// [`EnvVar`] values once services are running.
+///
+/// # Examples
+///
+/// A resolved reference is substituted:
+///
+/// ```
+/// use eph::parser::resolve_interpolations;
+///
+/// let out = resolve_interpolations("redis://localhost:${redis.port}", |svc, prop| {
+///     (svc == "redis" && prop == "port").then(|| "6379".to_string())
+/// });
+/// assert_eq!(out, "redis://localhost:6379");
+/// ```
+///
+/// An unresolved reference is left intact:
+///
+/// ```
+/// use eph::parser::resolve_interpolations;
+///
+/// let out = resolve_interpolations("${db.port}", |_, _| None);
+/// assert_eq!(out, "${db.port}");
+/// ```
+#[must_use]
 pub fn resolve_interpolations<F>(input: &str, resolver: F) -> String
 where
     F: Fn(&str, &str) -> Option<String>,
@@ -414,6 +561,31 @@ LOG_LEVEL=debug
     }
 
     #[test]
+    fn test_section_without_source_is_rejected_at_parse_time() {
+        // A section that declares properties but no source (image/dockerfile/
+        // compose/run) is an illegal state that used to parse and only fail at
+        // runtime. It must now be rejected by parse() itself.
+        let input = r#"
+[postgres]
+port=5432
+env.POSTGRES_USER=dev
+"#;
+        let err = parse(input).expect_err("section with no source must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("postgres") && msg.contains("no source"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_empty_section_is_rejected_at_parse_time() {
+        // A bare section header with nothing under it likewise has no source.
+        let input = "[redis]\n";
+        assert!(parse(input).is_err());
+    }
+
+    #[test]
     fn test_unknown_non_env_key_in_section_errors() {
         // A non-env-looking unknown property is still a hard error (not silently
         // reclassified), so genuine typos in lowercase keys are caught.
@@ -436,5 +608,67 @@ prot=5432
             }
         });
         assert_eq!(result, "postgres://localhost:5432/db");
+    }
+
+    #[test]
+    fn resolve_interpolations_passes_through_unresolved_reference() {
+        // Arrange: a well-formed `${service.property}` reference whose resolver
+        // always declines to resolve it.
+        let input = "redis://localhost:${redis.port}/0";
+
+        // Act
+        let result = resolve_interpolations(input, |_service, _property| None);
+
+        // Assert: the original placeholder is preserved verbatim, surrounding
+        // text included, so the unresolved reference stays visible downstream.
+        assert_eq!(result, "redis://localhost:${redis.port}/0");
+    }
+
+    #[test]
+    fn strip_quotes_removes_matching_double_quotes() {
+        // Arrange
+        let input = "\"hello\"";
+
+        // Act
+        let result = strip_quotes(input);
+
+        // Assert
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn strip_quotes_removes_matching_single_quotes() {
+        assert_eq!(strip_quotes("'hello'"), "hello");
+    }
+
+    #[test]
+    fn strip_quotes_leaves_unquoted_value_unchanged() {
+        assert_eq!(strip_quotes("hello"), "hello");
+    }
+
+    #[test]
+    fn strip_quotes_leaves_mismatched_quotes_unchanged() {
+        // A leading quote without a matching trailing quote is not stripped.
+        assert_eq!(strip_quotes("\"hello"), "\"hello");
+        assert_eq!(strip_quotes("'hello\""), "'hello\"");
+    }
+
+    #[test]
+    fn is_env_var_name_accepts_screaming_snake_case() {
+        // Arrange / Act / Assert
+        assert!(is_env_var_name("DATABASE_URL"));
+        assert!(is_env_var_name("LOG_LEVEL_2"));
+        assert!(is_env_var_name("A"));
+    }
+
+    #[test]
+    fn is_env_var_name_rejects_non_env_keys() {
+        // Empty, lowercase, leading digit, and dotted property keys are not
+        // env-var names, so unknown such keys stay hard parse errors.
+        assert!(!is_env_var_name(""));
+        assert!(!is_env_var_name("port"));
+        assert!(!is_env_var_name("post-start"));
+        assert!(!is_env_var_name("2FOO"));
+        assert!(!is_env_var_name("env.FOO"));
     }
 }

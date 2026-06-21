@@ -1,14 +1,23 @@
-mod parser;
-mod service;
-mod workspace;
+//! Command-line front end for `eph`.
+//!
+//! This binary is a thin [`clap`] layer over the [`eph`] library: it defines the
+//! CLI ([`Cli`] / [`Commands`]), initializes logging, and dispatches each
+//! subcommand to a small `cmd_*` glue function that calls into
+//! [`eph::ServiceManager`], [`eph::Workspace`], and the parser/env APIs. All the
+//! reusable logic lives in the library; nothing here is part of the public API.
+
+#![deny(clippy::correctness)]
+#![warn(clippy::suspicious)]
+#![warn(clippy::style)]
+#![warn(clippy::complexity)]
+#![warn(clippy::perf)]
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use parser::EphFile;
-use service::ServiceManager;
+use eph::parser::{self, EphFile, ServiceSource};
+use eph::{ServiceManager, Workspace};
 use std::collections::HashMap;
 use tracing_subscriber::EnvFilter;
-use workspace::Workspace;
 
 #[derive(Parser)]
 #[command(name = "eph")]
@@ -74,9 +83,14 @@ async fn main() -> Result<()> {
     } else {
         EnvFilter::new("info")
     };
+    // Log to stderr, never stdout. stdout carries the command's real output
+    // (e.g. `eph env` emits shell/JSON meant for `eval "$(eph env)"` or piping
+    // into a parser); mixing log lines into it corrupts that machine-readable
+    // output.
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .init();
 
     match cli.command {
@@ -94,7 +108,7 @@ async fn cmd_up(service_filter: Vec<String>) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
 
-    let mut manager = ServiceManager::new(workspace.clone()).await?;
+    let mut manager = ServiceManager::new(workspace).await?;
 
     let running = if service_filter.is_empty() {
         manager.start_all(&eph).await?
@@ -104,7 +118,7 @@ async fn cmd_up(service_filter: Vec<String>) -> Result<()> {
             let service = eph
                 .services
                 .get(name)
-                .with_context(|| format!("Unknown service: {}", name))?;
+                .with_context(|| format!("unknown service: {}", name))?;
             let result = manager.start_service(name, service).await?;
             running.insert(name.clone(), result);
         }
@@ -147,7 +161,7 @@ async fn cmd_down(service_filter: Vec<String>, rm: bool) -> Result<()> {
             let service = eph
                 .services
                 .get(name)
-                .with_context(|| format!("Unknown service: {}", name))?;
+                .with_context(|| format!("unknown service: {}", name))?;
             manager.stop_service(name, service, rm).await?;
             println!("{} {}", if rm { "Removed" } else { "Stopped" }, name);
         }
@@ -185,12 +199,13 @@ async fn cmd_status() -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
 
-    let manager = ServiceManager::new(workspace.clone()).await?;
-    let running = manager.status().await?;
-
+    // Print workspace header before moving `workspace` into the manager.
     println!("Workspace: {}", workspace.path.display());
     println!("ID: {}", workspace.short_id);
     println!();
+
+    let manager = ServiceManager::new(workspace).await?;
+    let running = manager.status().await?;
 
     if running.is_empty() {
         println!("No services running");
@@ -230,7 +245,7 @@ async fn cmd_env(format: &str) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
 
-    let manager = ServiceManager::new(workspace.clone()).await?;
+    let manager = ServiceManager::new(workspace).await?;
     let running = manager.status().await?;
 
     // Build resolver for interpolation
@@ -255,26 +270,8 @@ async fn cmd_env(format: &str) -> Result<()> {
         env_vars.push((var.name.clone(), resolved));
     }
 
-    // Output in requested format
-    match format {
-        "export" => {
-            for (name, value) in &env_vars {
-                println!("export {}=\"{}\"", name, escape_bash(value));
-            }
-        }
-        "fish" => {
-            for (name, value) in &env_vars {
-                println!("set -gx {} \"{}\"", name, escape_fish(value));
-            }
-        }
-        "json" => {
-            let map: HashMap<_, _> = env_vars.into_iter().collect();
-            println!("{}", serde_json::to_string_pretty(&map)?);
-        }
-        _ => {
-            anyhow::bail!("Unknown format: {}. Use: export, fish, json", format);
-        }
-    }
+    // Render in the requested format
+    print!("{}", eph::render(&env_vars, format)?);
 
     Ok(())
 }
@@ -293,11 +290,10 @@ async fn cmd_check() -> Result<()> {
     println!("Services: {}", eph.services.len());
     for (name, svc) in &eph.services {
         let source = match &svc.source {
-            parser::ServiceSource::Image(img) => format!("image: {}", img),
-            parser::ServiceSource::Dockerfile(path) => format!("dockerfile: {}", path),
-            parser::ServiceSource::Compose(path) => format!("compose: {}", path),
-            parser::ServiceSource::Command(cmd) => format!("command: {}", cmd),
-            parser::ServiceSource::None => "none".to_string(),
+            ServiceSource::Image(img) => format!("image: {}", img),
+            ServiceSource::Dockerfile(path) => format!("dockerfile: {}", path),
+            ServiceSource::Compose(path) => format!("compose: {}", path),
+            ServiceSource::Command(cmd) => format!("command: {}", cmd),
         };
         println!("  {} ({})", name, source);
     }
@@ -321,83 +317,6 @@ async fn cmd_info() -> Result<()> {
 fn load_eph_file(workspace: &Workspace) -> Result<EphFile> {
     let path = workspace.eph_file_path();
     let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    parser::parse(&contents).with_context(|| format!("Failed to parse {}", path.display()))
-}
-
-fn escape_bash(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('$', "\\$")
-        .replace('`', "\\`")
-}
-
-fn escape_fish(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('$', "\\$")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // These tests lock in the escaping behavior for the double-quoted output
-    // context used by `eph env` (`export NAME="<escaped>"` / `set -gx NAME
-    // "<escaped>"`). Inside double quotes, the shell only treats \ " $ ` (and
-    // for fish, \ " $) specially, so those are the only characters escaped.
-    // Literal newlines are preserved as-is: they are valid inside double quotes
-    // for `eval`. The tests are deliberately shell-free; they assert the exact
-    // produced strings rather than invoking a shell.
-    //
-    // Backslash must be escaped first so that backslashes introduced while
-    // escaping the other characters are not themselves doubled.
-
-    #[test]
-    fn test_escape_bash_special_chars() {
-        // Double quote -> \"
-        assert_eq!(escape_bash("\""), "\\\"");
-        // Dollar sign -> \$
-        assert_eq!(escape_bash("$"), "\\$");
-        // Backtick -> \`
-        assert_eq!(escape_bash("`"), "\\`");
-        // Backslash -> \\
-        assert_eq!(escape_bash("\\"), "\\\\");
-        // Newline is preserved unchanged
-        assert_eq!(escape_bash("\n"), "\n");
-    }
-
-    #[test]
-    fn test_escape_bash_combined() {
-        // a"b$c`d\e<newline>f
-        let input = "a\"b$c`d\\e\nf";
-        // a \" b \$ c \` d \\ e <newline> f
-        assert_eq!(escape_bash(input), "a\\\"b\\$c\\`d\\\\e\nf");
-        // A literal backslash followed by a dollar must produce \\ then \$,
-        // not a single escaped sequence.
-        assert_eq!(escape_bash("\\$"), "\\\\\\$");
-    }
-
-    #[test]
-    fn test_escape_fish_special_chars() {
-        // Double quote -> \"
-        assert_eq!(escape_fish("\""), "\\\"");
-        // Dollar sign -> \$
-        assert_eq!(escape_fish("$"), "\\$");
-        // Backslash -> \\
-        assert_eq!(escape_fish("\\"), "\\\\");
-        // Newline is preserved unchanged
-        assert_eq!(escape_fish("\n"), "\n");
-        // fish does not treat backticks specially inside double quotes, so a
-        // backtick is passed through untouched.
-        assert_eq!(escape_fish("`"), "`");
-    }
-
-    #[test]
-    fn test_escape_fish_combined() {
-        let input = "a\"b$c`d\\e\nf";
-        // Backtick stays literal for fish.
-        assert_eq!(escape_fish(input), "a\\\"b\\$c`d\\\\e\nf");
-        assert_eq!(escape_fish("\\$"), "\\\\\\$");
-    }
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    parser::parse(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }

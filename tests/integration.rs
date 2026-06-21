@@ -31,15 +31,6 @@ impl TestWorkspace {
         TestWorkspace { dir }
     }
 
-    /// Create a file in the workspace
-    fn write_file(&self, path: &str, content: &str) {
-        let full_path = self.dir.path().join(path);
-        if let Some(parent) = full_path.parent() {
-            std::fs::create_dir_all(parent).expect("Failed to create parent dirs");
-        }
-        std::fs::write(full_path, content).expect("Failed to write file");
-    }
-
     /// Get the workspace path
     fn path(&self) -> PathBuf {
         self.dir.path().to_path_buf()
@@ -454,39 +445,21 @@ DEBUG=true
 
 #[tokio::test]
 async fn post_start_hook_runs() {
+    // The hook writes its marker with a path relative to the workspace. eph
+    // runs hooks with the working directory set to the workspace, so the marker
+    // lands in `ws.path()`. Using a relative path keeps the `sh -c` command free
+    // of host-absolute paths, which on Windows would contain backslashes that
+    // the POSIX shell would interpret as escapes.
     let ws = TestWorkspace::new(
         r#"
 [redis]
 image=redis:7-alpine
 port=6379
-post-start=touch /tmp/eph-test-marker
+post-start=touch post-start-ran
 
 REDIS_URL=redis://localhost:${redis.port}
 "#,
     );
-
-    // Create the marker script that creates a file in the workspace
-    ws.write_file(
-        "marker.sh",
-        &format!("#!/bin/sh\ntouch {}/post-start-ran", ws.path().display()),
-    );
-
-    // Update .eph to use our script
-    std::fs::write(
-        ws.path().join(".eph"),
-        format!(
-            r#"
-[redis]
-image=redis:7-alpine
-port=6379
-post-start=touch {}/post-start-ran
-
-REDIS_URL=redis://localhost:${{redis.port}}
-"#,
-            ws.path().display()
-        ),
-    )
-    .unwrap();
 
     // Start service
     ws.eph_ok(&["up", "redis"]).await;
