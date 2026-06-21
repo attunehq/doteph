@@ -13,6 +13,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command as TokioCommand;
 use tokio::time::{sleep, timeout};
@@ -219,6 +220,35 @@ impl DockerClient {
             is_running,
             ports,
         }))
+    }
+
+    /// Return whether any container in a `docker compose` project is running.
+    ///
+    /// Compose-backed services are not named `eph-<id>-<service>` like the
+    /// containers eph creates directly; `docker compose` names them
+    /// `<project>-<service>-N`. They are therefore looked up by the
+    /// `com.docker.compose.project` label rather than by container name, so that
+    /// [`ServiceManager::status`] can recognize a running compose service and
+    /// expose its ports for interpolation.
+    pub(crate) async fn compose_project_running(&self, project: &str) -> Result<bool> {
+        let filters: HashMap<String, Vec<String>> = HashMap::from([(
+            "label".to_string(),
+            vec![format!("com.docker.compose.project={project}")],
+        )]);
+
+        let containers = self
+            .client
+            .list_containers(Some(
+                // all(false): only currently-running containers are reported.
+                ListContainersOptionsBuilder::new()
+                    .all(false)
+                    .filters(&filters)
+                    .build(),
+            ))
+            .await
+            .context("failed to list compose project containers")?;
+
+        Ok(!containers.is_empty())
     }
 
     /// Start an existing container
@@ -811,12 +841,21 @@ impl ServiceManager {
             env_vars.insert(k.clone(), v.clone());
         }
 
-        // Start the process
+        // Start the process with detached stdio. A run= service is long-lived;
+        // if it inherited eph's stdout/stderr it would keep those pipe
+        // write-ends open after `eph up` returns, so any caller that captures
+        // eph's output (a test harness, `eph up | tee`, a CI step) would block
+        // forever waiting for EOF. Discard the child's output instead. (Logs are
+        // not captured today; a future enhancement could redirect to a
+        // per-service log file under the workspace state dir.)
         let child = TokioCommand::new("sh")
             .arg("-c")
             .arg(cmd)
             .current_dir(&self.workspace.path)
             .envs(&env_vars)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .with_context(|| format!("failed to start command: {}", cmd))?;
 
@@ -1185,6 +1224,33 @@ impl ServiceManager {
         let mut result = HashMap::new();
 
         for (name, entry) in &self.state.services {
+            // Compose services are not named `eph-<id>-<name>`; detect them by
+            // their recorded `compose:<project>` id and check the compose
+            // project's liveness by label instead of by container name. Without
+            // this they would never appear in `status` and their ports could not
+            // be interpolated into `eph env`.
+            if let Some(project) = entry.container_id.strip_prefix("compose:") {
+                if self.docker.compose_project_running(project).await? {
+                    result.insert(
+                        name.clone(),
+                        RunningService {
+                            name: name.clone(),
+                            container_id: entry.container_id.clone(),
+                            ports: entry.ports.clone(),
+                        },
+                    );
+                }
+                continue;
+            }
+
+            // run= services are tracked in state.processes and reported by the
+            // process loop below; their id is `pid:<n>`, which never names a
+            // real eph container, so skip the Docker lookup for them rather than
+            // making a wasted call that could also match an unrelated container.
+            if entry.container_id.starts_with("pid:") {
+                continue;
+            }
+
             let container_name = self.workspace.container_name(name);
             if let Some(info) = self.docker.get_container(&container_name).await?
                 && info.is_running

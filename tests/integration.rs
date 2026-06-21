@@ -4,79 +4,17 @@
 //! interpolating environment variables, and running lifecycle hooks.
 //!
 //! Tests assume Docker is running and available.
+//!
+//! The shared harness ([`TestWorkspace`] and friends) lives in
+//! [`mod@common`]; heavyweight multi-service and concurrency stress tests live
+//! in the separate `tests/stress.rs` binary.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::Output;
 use std::time::Duration;
 
-use tempfile::TempDir;
-use tokio::process::Command;
 use tokio::time::sleep;
 
-// ============================================================================
-// Test Harness
-// ============================================================================
-
-/// A test workspace - a temporary directory with a .eph file
-struct TestWorkspace {
-    dir: TempDir,
-}
-
-impl TestWorkspace {
-    /// Create a new test workspace with the given .eph content
-    fn new(eph_content: &str) -> Self {
-        let dir = TempDir::new().expect("Failed to create temp dir");
-        std::fs::write(dir.path().join(".eph"), eph_content).expect("Failed to write .eph");
-        TestWorkspace { dir }
-    }
-
-    /// Get the workspace path
-    fn path(&self) -> PathBuf {
-        self.dir.path().to_path_buf()
-    }
-
-    /// Run eph command in this workspace
-    async fn eph(&self, args: &[&str]) -> Output {
-        let eph_binary = env!("CARGO_BIN_EXE_eph");
-        Command::new(eph_binary)
-            .args(args)
-            .current_dir(self.dir.path())
-            .output()
-            .await
-            .expect("Failed to run eph")
-    }
-
-    /// Run eph and assert success
-    async fn eph_ok(&self, args: &[&str]) -> String {
-        let output = self.eph(args).await;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            panic!(
-                "eph {:?} failed:\nstdout: {}\nstderr: {}",
-                args, stdout, stderr
-            );
-        }
-        String::from_utf8_lossy(&output.stdout).to_string()
-    }
-}
-
-impl Drop for TestWorkspace {
-    fn drop(&mut self) {
-        // Best effort cleanup: stop any services that might be running
-        let eph_binary = env!("CARGO_BIN_EXE_eph");
-        let _ = std::process::Command::new(eph_binary)
-            .args(["down"])
-            .current_dir(self.dir.path())
-            .output();
-    }
-}
-
-/// Parse JSON output from `eph env -f json`
-fn parse_env_json(output: &str) -> HashMap<String, String> {
-    serde_json::from_str(output).expect("Failed to parse env JSON")
-}
+mod common;
+use common::{TestWorkspace, extract_port, parse_env_json};
 
 // ============================================================================
 // Check Functions
@@ -107,36 +45,6 @@ fn check_parse(eph_content: &str, expected_services: &[&str], expected_env_count
             output
         );
     });
-}
-
-/// Extract port number from a string (URL or direct port)
-fn extract_port(s: &str) -> Option<u16> {
-    // Try direct parse
-    if let Ok(p) = s.parse::<u16>() {
-        return Some(p);
-    }
-
-    // Try extracting from URL like "postgres://...localhost:12345/..."
-    if let Some(idx) = s.rfind("localhost:") {
-        let after = &s[idx + 10..];
-        let port_str: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if let Ok(p) = port_str.parse::<u16>() {
-            return Some(p);
-        }
-    }
-
-    // Try extracting from "host:port" format
-    if let Some(idx) = s.rfind(':') {
-        let port_str: String = s[idx + 1..]
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
-        if let Ok(p) = port_str.parse::<u16>() {
-            return Some(p);
-        }
-    }
-
-    None
 }
 
 // ============================================================================
