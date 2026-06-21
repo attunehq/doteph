@@ -110,8 +110,9 @@ The `ID:` shown here is the short ID (`eph info` distinguishes the short ID from
 the full SHA-256 workspace ID). If nothing is running, it lists the defined
 services as stopped instead.
 
-> `status` reports `image`, `dockerfile`, and `run` services. `compose` services
-> are not tracked and will not appear here even when running.
+> All four service types are reconciled: `image`/`dockerfile` by container name,
+> `run` by process ID, and `compose` by the Compose project's
+> `com.docker.compose.project` label.
 
 ## `eph env [-f FORMAT]`
 
@@ -131,8 +132,8 @@ eph env -f json | jq -r .DATABASE_URL
 
 - Only top-level variables are printed; service `env.*` values are not.
 - Placeholders for stopped services are left unresolved. Run `eph up` first.
-- Interpolation resolves against `image`/`dockerfile`/`run` services only;
-  `compose` services are not tracked, so their `expose` ports stay unresolved.
+- Interpolation resolves against all running services, including `compose`
+  services (their `expose.<name>` ports resolve as `${service.port.<name>}`).
 - An unknown format is an error (`unknown format: ..., use: export, fish, json`).
 
 See [Shell Integration](shell-integration.md) for details and escaping rules.

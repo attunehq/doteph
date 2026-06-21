@@ -104,11 +104,9 @@ If `eph env` leaves a literal `${service.port}` in its output:
   against running services. Check with `eph status`.
 - The **name is wrong.** `${db.port}` only resolves if the section is `[db]`.
 - It is a **multi-port service.** `${minio.port}` is not well-defined when a
-  service declares several ports; use the named form `${minio.port.api}`.
-- It is a **`compose` service.** Compose services are not tracked by `eph env`,
-  so their `expose` ports never resolve. Read the port from `docker compose port`
-  instead, or use an `image=`/`run=` service. See
-  [Defining Services](services.md#limitations-of-compose-services).
+  service declares several ports; use the named form `${minio.port.api}`. The
+  same applies to a `compose` service: reference each `expose.<name>=` port as
+  `${service.port.<name>}`, not `${service.port}`.
 
 ## A `run=` service is on the wrong port
 

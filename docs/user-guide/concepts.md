@@ -96,10 +96,11 @@ unresolved reference stays visible rather than silently becoming empty. So run
 `eph up` before `eph env`. Full details in
 [Shell Integration](shell-integration.md).
 
-> Interpolation and `eph status` currently track `image`, `dockerfile`, and
-> `run` services. `compose` services are **not** tracked after `up`, so their
-> `expose` ports do not resolve through `eph env`. See
-> [Defining Services](services.md#compose---delegate-to-docker-compose).
+> All four service types are tracked once running, so their ports resolve: `eph`
+> finds `image`/`dockerfile` services by container name, `run` services by their
+> process ID, and `compose` services by the Compose project's
+> `com.docker.compose.project` label. For a compose service, the ports you
+> declared with `expose.<name>=` resolve as `${service.port.<name>}`.
 
 ## Persisted state
 

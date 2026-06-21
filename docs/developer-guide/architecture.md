@@ -108,17 +108,18 @@ The image and Dockerfile paths use the `bollard` Docker API directly; the
 Compose and Dockerfile-build paths shell out to the `docker` CLI because those
 operations are awkward to reproduce over the API.
 
-> **Known limitation: Compose tracking.** `ServiceManager::status` reconciles
-> state by looking up a single container named `eph-<short_id>-<service>`, which
-> exists for image/dockerfile services and is approximated by a tracked PID for
-> `run` services. Compose services have no such container (Compose names its own
-> containers), so they are recorded in `state.json` but never reappear in
-> `status` - and therefore never in `eph env` interpolation. As a result, a
-> compose service's `expose` ports do not resolve after `up`. Teardown is also
-> coarser: `stop_service` always runs `docker compose down` regardless of the
-> `--rm` flag. Closing this gap (resolving `compose:<project>` entries and saved
-> ports in `status`) is a worthwhile future change; until then the user docs
-> describe compose support as deliberately thin.
+> **Reconciling compose services.** `ServiceManager::status` reconciles state by
+> looking up a container named `eph-<short_id>-<service>`, which exists for
+> image/dockerfile services (and is approximated by a tracked PID for `run`
+> services). Compose names its own containers (`<project>-<service>-N`), so a
+> compose service has no such container. It is instead recorded with a
+> `compose:<project>` id and detected by `DockerClient::compose_project_running`,
+> which lists containers carrying the `com.docker.compose.project=<project>`
+> label. This is what lets compose services appear in `status` and resolve their
+> `expose` ports in `eph env`. Teardown remains coarser than for direct
+> containers: `stop_service` always runs `docker compose down` regardless of the
+> `--rm` flag, and `clean` removes only the named volumes declared in the `.eph`
+> file (Compose-internal volumes are left to `docker compose`).
 
 ## Health checks
 
