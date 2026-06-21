@@ -29,6 +29,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Heavyweight stress tests (tests/stress.rs) open a real SQL connection to the
+# postgres they start, over its mapped host port. redis (RESP) and minio (HTTP)
+# are spoken over raw sockets and need no client crate; postgres's wire protocol
+# does, so use the canonical async client. Dev-only: not linked into `eph`.
+tokio-postgres = "0.7"
 
 # Optimized release profile for the shipped `eph` binary. fat LTO plus a single
 # codegen unit let the optimizer work across the whole crate graph, and strip

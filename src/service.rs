@@ -221,6 +221,35 @@ impl DockerClient {
         }))
     }
 
+    /// Return whether any container in a `docker compose` project is running.
+    ///
+    /// Compose-backed services are not named `eph-<id>-<service>` like the
+    /// containers eph creates directly; `docker compose` names them
+    /// `<project>-<service>-N`. They are therefore looked up by the
+    /// `com.docker.compose.project` label rather than by container name, so that
+    /// [`ServiceManager::status`] can recognize a running compose service and
+    /// expose its ports for interpolation.
+    pub(crate) async fn compose_project_running(&self, project: &str) -> Result<bool> {
+        let filters: HashMap<String, Vec<String>> = HashMap::from([(
+            "label".to_string(),
+            vec![format!("com.docker.compose.project={project}")],
+        )]);
+
+        let containers = self
+            .client
+            .list_containers(Some(
+                // all(false): only currently-running containers are reported.
+                ListContainersOptionsBuilder::new()
+                    .all(false)
+                    .filters(&filters)
+                    .build(),
+            ))
+            .await
+            .context("failed to list compose project containers")?;
+
+        Ok(!containers.is_empty())
+    }
+
     /// Start an existing container
     pub(crate) async fn start_container(&self, id: &str) -> Result<()> {
         self.client
@@ -1185,6 +1214,25 @@ impl ServiceManager {
         let mut result = HashMap::new();
 
         for (name, entry) in &self.state.services {
+            // Compose services are not named `eph-<id>-<name>`; detect them by
+            // their recorded `compose:<project>` id and check the compose
+            // project's liveness by label instead of by container name. Without
+            // this they would never appear in `status` and their ports could not
+            // be interpolated into `eph env`.
+            if let Some(project) = entry.container_id.strip_prefix("compose:") {
+                if self.docker.compose_project_running(project).await? {
+                    result.insert(
+                        name.clone(),
+                        RunningService {
+                            name: name.clone(),
+                            container_id: entry.container_id.clone(),
+                            ports: entry.ports.clone(),
+                        },
+                    );
+                }
+                continue;
+            }
+
             let container_name = self.workspace.container_name(name);
             if let Some(info) = self.docker.get_container(&container_name).await?
                 && info.is_running

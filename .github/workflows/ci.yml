@@ -51,6 +51,16 @@ jobs:
       # Runs everything: library unit tests, doctests, and the Docker-backed
       # integration crate. Integration tests start real containers (postgres,
       # redis, ...), so they are kept single-threaded to avoid host port and
-      # resource contention.
+      # resource contention. The heavyweight stress tests are #[ignore]'d and so
+      # are skipped here; they run in the dedicated step below.
       - name: Test
         run: cargo test --verbose -- --test-threads=1
+
+      # Heavyweight stress tests: full multi-service environments, N concurrent
+      # isolated workspaces, every service source type (image/dockerfile/run/
+      # compose), and real wire-protocol connectivity (SQL/RESP/HTTP) over the
+      # mapped host ports. They are #[ignore]'d for local `cargo test`, so run
+      # them explicitly with --ignored. Single-threaded for the same
+      # port/resource-contention reason as above.
+      - name: Stress tests (heavyweight, Docker)
+        run: cargo test --test stress -- --ignored --test-threads=1
