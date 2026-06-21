@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"
-bollard = "0.18"
+bollard = "0.21"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 futures-util = "0.3"
