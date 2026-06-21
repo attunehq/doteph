@@ -45,6 +45,13 @@ Services are defined in `[bracketed]` sections:
 property=value
 ```
 
+Inside a `[service]` section, a key that is not a recognized service property
+but looks like a `SCREAMING_SNAKE_CASE` environment variable name is treated as
+a top-level environment variable and ends the section. `eph` prints a warning
+when this happens. This is why a mistyped property name (for example
+`HEALTHCHECK=` instead of `healthcheck=`) may silently become a global
+environment variable rather than a service property.
+
 ## Service Types
 
 ### Docker Image
@@ -154,6 +161,10 @@ DATABASE_URL=postgres://app:pass@localhost:${postgres.port}/mydb
 | `${service.port}` | Auto-assigned host port |
 | `${service.port.name}` | Named port |
 | `${service.host}` | Hostname (always `localhost`) |
+
+Service ports are published on `127.0.0.1` only, so `${service.host}` resolves
+to `localhost`. Ports are reachable from your machine but are not exposed to the
+local network.
 
 ## Lifecycle Hooks
 

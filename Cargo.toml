@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2024"
 description = "Ephemeral services per workspace - dotenv for services"
 license = "MIT"
+authors = ["Jessica Black <me@jessica.black>"]
+repository = "https://github.com/attunehq/doteph"
+homepage = "https://github.com/attunehq/doteph"
+readme = "README.md"
+rust-version = "1.88"
+keywords = ["docker", "services", "dotenv", "workspace", "devtools"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1"

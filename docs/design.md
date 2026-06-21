@@ -22,6 +22,8 @@ This ensures that:
 
 Container ports are mapped to randomly-assigned host ports by Docker. This eliminates port conflicts entirely - you never need to manually pick ports or worry about collisions.
 
+Host ports are published on `127.0.0.1` only. Services are reachable from your machine but are not exposed to the local network.
+
 The assigned ports are tracked in state and exposed via interpolation:
 
 ```eph
@@ -34,7 +36,13 @@ DATABASE_URL=postgres://localhost:${postgres.port}/db
 
 ### Service State
 
-Running service information is persisted to `~/.local/share/eph/{workspace_id}/state.json`. This allows:
+Running service information is persisted to the platform local-data directory under `eph/{workspace_id}/state.json`:
+
+- Linux: `~/.local/share/eph/{workspace_id}/state.json`
+- macOS: `~/Library/Application Support/eph/{workspace_id}/state.json`
+- Windows: `%LOCALAPPDATA%\eph\{workspace_id}\state.json`
+
+This allows:
 - `eph status` to show running services without querying Docker
 - `eph env` to resolve interpolations using saved port mappings
 - Services to survive terminal restarts
@@ -156,7 +164,7 @@ DATABASE_URL=postgres://localhost:${postgres.port}/db
 Supported references:
 - `${service.port}` - Primary port
 - `${service.port.name}` - Named port
-- `${service.host}` - Always `localhost`
+- `${service.host}` - Always `localhost` (ports are published on `127.0.0.1` only and are not exposed to the local network)
 
 Interpolation is resolved at runtime by `eph env`, using the actual assigned ports from the running services.
 
@@ -165,11 +173,20 @@ Interpolation is resolved at runtime by `eph env`, using the actual assigned por
 Commands follow a simple pattern:
 
 ```
-eph up [services...]     # Start
-eph down [services...]   # Stop
-eph status               # Show state
-eph env                  # Export environment
+eph up [services...]            # Start
+eph down [--rm] [services...]   # Stop; --rm (-r) also removes the stopped containers
+eph clean                       # Full reset: remove all eph containers and per-workspace
+                                # named volumes, and clear persisted state (deletes volume data)
+eph status                      # Show state
+eph env                         # Export environment
 ```
+
+### Reaping containers
+
+There are two levels of teardown:
+
+- `eph down` stops services but leaves their containers (and volumes) in place, so a later `eph up` can reuse them. With `--rm` (`-r`) it also removes the stopped containers.
+- `eph clean` is a full reset for the workspace: it removes all eph containers and the per-workspace named volumes, and clears persisted state. Because it deletes the named volumes, any data they hold is lost.
 
 The `env` command outputs shell-compatible export statements:
 

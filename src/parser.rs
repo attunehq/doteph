@@ -21,9 +21,10 @@
 //! DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/app
 //! ```
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tracing::warn;
 
 // ============================================================================
 // AST Types
@@ -147,7 +148,20 @@ pub fn parse(input: &str) -> Result<EphFile> {
             match parse_service_property(service, key, value, line_num) {
                 Ok(()) => continue,
                 Err(_) if is_env_var_name(key) => {
-                    // Unknown property but looks like an env var - switch to top-level
+                    // Unknown property, but the key looks like a SCREAMING_SNAKE_CASE
+                    // env var name. We intentionally end the current section here and
+                    // reclassify this key as a top-level environment variable. This
+                    // supports files that list service sections first and trailing
+                    // env vars without a blank line, but it also silently swallows
+                    // typos in service property names, so emit a warning to make the
+                    // behavior discoverable.
+                    warn!(
+                        "Key '{}' inside section [{}] at line {} is not a known service \
+                         property; it looks like an environment variable, so the section \
+                         was ended and the key was treated as a top-level variable. If you \
+                         meant a service property, check for a typo.",
+                        key, service_name, line_num
+                    );
                     current_service = None;
                     env_vars.push(EnvVar {
                         name: key.to_string(),
@@ -370,6 +384,45 @@ post-start=cargo sqlx fixtures load
         let result = parse(input).unwrap();
         let pg = result.services.get("postgres").unwrap();
         assert_eq!(pg.post_start.len(), 2);
+    }
+
+    #[test]
+    fn test_env_looking_key_in_section_ends_section() {
+        // A SCREAMING_SNAKE_CASE key that is not a known service property is
+        // intentionally and deterministically reclassified as a top-level env
+        // var, ending the current section. (A tracing::warn! is emitted to make
+        // this discoverable, but behavior is unchanged.)
+        let input = r#"
+[postgres]
+image=postgres:16
+port=5432
+DATABASE_URL=postgres://localhost/app
+LOG_LEVEL=debug
+"#;
+        let result = parse(input).unwrap();
+
+        // The service only captured the known properties before the env-looking key.
+        let pg = result.services.get("postgres").unwrap();
+        assert!(matches!(&pg.source, ServiceSource::Image(img) if img == "postgres:16"));
+        assert_eq!(pg.ports.len(), 1);
+        assert!(!pg.env.contains_key("DATABASE_URL"));
+
+        // The env-looking keys ended the section and became top-level vars.
+        let names: Vec<&str> = result.env_vars.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, vec!["DATABASE_URL", "LOG_LEVEL"]);
+        assert_eq!(result.env_vars[0].value, "postgres://localhost/app");
+    }
+
+    #[test]
+    fn test_unknown_non_env_key_in_section_errors() {
+        // A non-env-looking unknown property is still a hard error (not silently
+        // reclassified), so genuine typos in lowercase keys are caught.
+        let input = r#"
+[postgres]
+image=postgres:16
+prot=5432
+"#;
+        assert!(parse(input).is_err());
     }
 
     #[test]

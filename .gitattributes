@@ -1,0 +1,5 @@
+# Normalize line endings: store LF in the repo, regardless of contributor OS.
+* text=auto eol=lf
+
+# Binary / generated files git should not touch.
+Cargo.lock text eol=lf

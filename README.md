@@ -119,17 +119,19 @@ S3_ENDPOINT=http://localhost:${minio.port.api}
 |----------|-------------|
 | `image=` | Docker image to pull and run |
 | `dockerfile=` | Build from Dockerfile instead |
+| `context=` | Build context for `dockerfile=` |
 | `compose=` | Use docker-compose file |
 | `run=` | Shell command (non-Docker) |
+| `command=` | Override container command |
 | `port=` | Single port to expose |
 | `port.<name>=` | Named port to expose |
 | `env.<KEY>=` | Environment variable for the container |
 | `volume=` | Volume mount (`name:path` or `./host:path`) |
-| `command=` | Override container command |
 | `healthcheck=` | Command to check if service is ready |
 | `ready-timeout=` | Seconds to wait for healthcheck (default: 30) |
 | `post-start=` | Command to run after service is healthy |
 | `pre-stop=` | Command to run before stopping |
+| `expose.<name>=` | Expose a port from a `compose=` service for interpolation |
 
 ### Interpolation
 
@@ -137,25 +139,47 @@ Environment variables can reference service properties:
 
 - `${service.port}` - The assigned host port (for single-port services)
 - `${service.port.name}` - A named port
-- `${service.host}` - Always `localhost` for now
+- `${service.host}` - Always `localhost`
+
+Service ports are published on `127.0.0.1` only. They are reachable from your
+machine but are not exposed to the local network.
+
+### Secrets
+
+A `.eph` file may contain credentials (for example `env.POSTGRES_PASSWORD`).
+`eph env` prints these values to stdout so they can be loaded into your shell,
+so treat the file accordingly: use throwaway, dev-only credentials, or add the
+`.eph` file to `.gitignore` if it holds anything sensitive.
 
 ## Commands
 
 ```
-eph up [service...]     Start services (all or specific ones)
-eph down [service...]   Stop services
-eph status              Show running services and their ports
-eph env [-f format]     Print environment variables
-eph check               Validate .eph file
-eph info                Show workspace info (ID, paths)
+eph up [service...]         Start services (all or specific ones)
+eph down [--rm] [service...] Stop services; --rm (-r) also removes the stopped containers
+eph clean                   Full reset: remove all eph containers and per-workspace
+                            named volumes, and clear persisted state (deletes volume data)
+eph status                  Show running services and their ports
+eph env [-f format]         Print environment variables
+eph check                   Validate .eph file
+eph info                    Show workspace info (ID, paths)
 ```
 
 ## How It Works
 
 1. **Workspace ID**: Each directory with a `.eph` file gets a unique ID (SHA256 of absolute path)
 2. **Container names**: Services are named `eph-{short_id}-{service}` to avoid conflicts
-3. **Port assignment**: Docker assigns random available ports; eph tracks them
-4. **State**: Running service info is persisted to `~/.local/share/eph/{short_id}/`
+3. **Port assignment**: Docker assigns random available ports; eph tracks them. Ports are published on `127.0.0.1` only, so they are reachable from your machine but not exposed to the local network
+4. **State**: Running service info is persisted to the platform local-data directory under `eph/{short_id}/`:
+   - Linux: `~/.local/share/eph/{short_id}/`
+   - macOS: `~/Library/Application Support/eph/{short_id}/`
+   - Windows: `%LOCALAPPDATA%\eph\{short_id}\`
+
+## Platform Support
+
+`eph` runs natively on Linux and macOS. On Windows it requires WSL, because
+shell command services (`run=`), `post-start`/`pre-stop` hooks, shell health
+checks, and process management all shell out to `sh` and `kill`. Docker-image
+services are the cross-platform path.
 
 ## Development
 

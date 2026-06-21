@@ -2,13 +2,13 @@
 
 use crate::parser::{EphFile, Service, ServiceSource};
 use crate::workspace::Workspace;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use bollard::Docker;
 use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
     StartContainerOptions, StopContainerOptions,
 };
 use bollard::image::CreateImageOptions;
-use bollard::Docker;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -50,6 +50,17 @@ impl RunningService {
     pub fn named_port(&self, name: &str) -> Option<u16> {
         self.ports.get(name).copied()
     }
+}
+
+/// Summary of resources removed by [`ServiceManager::clean`].
+#[derive(Debug, Default)]
+pub struct CleanSummary {
+    /// Number of services stopped and removed.
+    pub services_removed: usize,
+    /// Number of named volumes removed.
+    pub volumes_removed: usize,
+    /// Whether the persisted state directory was removed.
+    pub state_removed: bool,
 }
 
 // ============================================================================
@@ -98,13 +109,12 @@ impl ServiceState {
 
         // Ensure directory exists
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("Failed to create state directory: {}", parent.display()))?;
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
+                format!("Failed to create state directory: {}", parent.display())
+            })?;
         }
 
-        let contents =
-            serde_json::to_string_pretty(self).context("Failed to serialize state")?;
+        let contents = serde_json::to_string_pretty(self).context("Failed to serialize state")?;
 
         tokio::fs::write(&path, contents)
             .await
@@ -212,18 +222,18 @@ impl DockerClient {
     /// Stop a container
     pub async fn stop_container(&self, name: &str) -> Result<()> {
         if let Some(info) = self.get_container(name).await?
-            && info.is_running {
-                info!("Stopping container {}", name);
-                self.client
-                    .stop_container(&info.id, Some(StopContainerOptions { t: 10 }))
-                    .await
-                    .context("Failed to stop container")?;
-            }
+            && info.is_running
+        {
+            info!("Stopping container {}", name);
+            self.client
+                .stop_container(&info.id, Some(StopContainerOptions { t: 10 }))
+                .await
+                .context("Failed to stop container")?;
+        }
         Ok(())
     }
 
     /// Remove a container
-    #[allow(dead_code)]
     pub async fn remove_container(&self, name: &str) -> Result<()> {
         if let Some(info) = self.get_container(name).await? {
             info!("Removing container {}", name);
@@ -239,6 +249,26 @@ impl DockerClient {
                 .context("Failed to remove container")?;
         }
         Ok(())
+    }
+
+    /// Remove a named volume, ignoring "not found" errors
+    pub async fn remove_volume(&self, name: &str) -> Result<()> {
+        use bollard::errors::Error as BollardError;
+        use bollard::volume::RemoveVolumeOptions;
+
+        info!("Removing volume {}", name);
+        match self
+            .client
+            .remove_volume(name, Some(RemoveVolumeOptions { force: true }))
+            .await
+        {
+            Ok(()) => Ok(()),
+            // Volume already gone (or never created) - treat as success.
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("Failed to remove volume {}", name)),
+        }
     }
 
     /// Execute a command inside a running container
@@ -307,7 +337,10 @@ impl DockerClient {
             port_bindings.insert(
                 container_port,
                 Some(vec![bollard::service::PortBinding {
-                    host_ip: Some("0.0.0.0".to_string()),
+                    // Bind to loopback only: published ports must be reachable
+                    // from localhost (RunningService::host() returns "localhost"),
+                    // not from the entire network.
+                    host_ip: Some("127.0.0.1".to_string()),
                     host_port: None, // Random port
                 }]),
             );
@@ -373,10 +406,7 @@ impl DockerClient {
         };
 
         // Create container
-        debug!(
-            "Creating container {} from image {}",
-            container_name, image
-        );
+        debug!("Creating container {} from image {}", container_name, image);
         let response = self
             .client
             .create_container(
@@ -536,60 +566,87 @@ impl ServiceManager {
     }
 
     /// Start a single service
-    pub async fn start_service(
-        &mut self,
-        name: &str,
-        service: &Service,
-    ) -> Result<RunningService> {
+    pub async fn start_service(&mut self, name: &str, service: &Service) -> Result<RunningService> {
         let container_name = self.workspace.container_name(name);
 
-        // Check if already running (for Docker-based services)
-        if !matches!(service.source, ServiceSource::Command(_) | ServiceSource::Compose(_))
-            && let Some(existing) = self.docker.get_container(&container_name).await? {
-                if existing.is_running {
-                    info!("Service {} already running", name);
-                    // Record in state even for already-running containers
-                    self.state.services.insert(
-                        name.to_string(),
-                        ServiceStateEntry {
-                            container_id: existing.id.clone(),
-                            ports: existing.ports.clone(),
-                        },
-                    );
-                    return Ok(RunningService {
-                        name: name.to_string(),
-                        container_id: existing.id,
-                        ports: existing.ports,
-                    });
-                } else {
-                    // Container exists but not running, start it
-                    info!("Starting existing container for {}", name);
-                    self.docker.start_container(&existing.id).await?;
-                    let refreshed = self
-                        .docker
-                        .get_container(&container_name)
-                        .await?
-                        .context("Container disappeared after start")?;
-                    
-                    // Wait for health check
-                    self.wait_for_healthy(name, service, &refreshed.id).await?;
-                    
-                    // Record in state
-                    self.state.services.insert(
-                        name.to_string(),
-                        ServiceStateEntry {
-                            container_id: refreshed.id.clone(),
-                            ports: refreshed.ports.clone(),
-                        },
-                    );
-                    
-                    return Ok(RunningService {
-                        name: name.to_string(),
-                        container_id: refreshed.id,
-                        ports: refreshed.ports,
-                    });
-                }
+        // Dedup run= (shell command) services: the Docker-based guard below
+        // explicitly skips ServiceSource::Command, so without this check running
+        // `eph up` twice would spawn a second process and orphan the first.
+        // Probe the tracked PID the same way status() does (`kill -0 <pid>`).
+        if matches!(service.source, ServiceSource::Command(_))
+            && let Some(&pid) = self.state.processes.get(name)
+        {
+            let alive = TokioCommand::new("kill")
+                .args(["-0", &pid.to_string()])
+                .output()
+                .await
+                .is_ok_and(|o| o.status.success());
+            if alive {
+                info!("Service {} already running (PID {})", name, pid);
+                let ports = self
+                    .state
+                    .services
+                    .get(name)
+                    .map(|entry| entry.ports.clone())
+                    .unwrap_or_default();
+                return Ok(RunningService {
+                    name: name.to_string(),
+                    container_id: format!("pid:{}", pid),
+                    ports,
+                });
             }
+        }
+
+        // Check if already running (for Docker-based services)
+        if !matches!(
+            service.source,
+            ServiceSource::Command(_) | ServiceSource::Compose(_)
+        ) && let Some(existing) = self.docker.get_container(&container_name).await?
+        {
+            if existing.is_running {
+                info!("Service {} already running", name);
+                // Record in state even for already-running containers
+                self.state.services.insert(
+                    name.to_string(),
+                    ServiceStateEntry {
+                        container_id: existing.id.clone(),
+                        ports: existing.ports.clone(),
+                    },
+                );
+                return Ok(RunningService {
+                    name: name.to_string(),
+                    container_id: existing.id,
+                    ports: existing.ports,
+                });
+            } else {
+                // Container exists but not running, start it
+                info!("Starting existing container for {}", name);
+                self.docker.start_container(&existing.id).await?;
+                let refreshed = self
+                    .docker
+                    .get_container(&container_name)
+                    .await?
+                    .context("Container disappeared after start")?;
+
+                // Wait for health check
+                self.wait_for_healthy(name, service, &refreshed.id).await?;
+
+                // Record in state
+                self.state.services.insert(
+                    name.to_string(),
+                    ServiceStateEntry {
+                        container_id: refreshed.id.clone(),
+                        ports: refreshed.ports.clone(),
+                    },
+                );
+
+                return Ok(RunningService {
+                    name: name.to_string(),
+                    container_id: refreshed.id,
+                    ports: refreshed.ports,
+                });
+            }
+        }
 
         // Create and start new service
         info!("Creating service {}", name);
@@ -599,10 +656,11 @@ impl ServiceManager {
                     .docker
                     .run_image(&container_name, image, service, &self.workspace)
                     .await?;
-                
+
                 // Wait for health check
-                self.wait_for_healthy(name, service, &r.container_id).await?;
-                
+                self.wait_for_healthy(name, service, &r.container_id)
+                    .await?;
+
                 r
             }
             ServiceSource::Dockerfile(path) => {
@@ -611,18 +669,15 @@ impl ServiceManager {
                     .docker
                     .build_and_run(&container_name, &dockerfile_path, service, &self.workspace)
                     .await?;
-                
+
                 // Wait for health check
-                self.wait_for_healthy(name, service, &r.container_id).await?;
-                
+                self.wait_for_healthy(name, service, &r.container_id)
+                    .await?;
+
                 r
             }
-            ServiceSource::Command(cmd) => {
-                self.start_shell_command(name, cmd, service).await?
-            }
-            ServiceSource::Compose(path) => {
-                self.start_compose(name, path, service).await?
-            }
+            ServiceSource::Command(cmd) => self.start_shell_command(name, cmd, service).await?,
+            ServiceSource::Compose(path) => self.start_compose(name, path, service).await?,
             ServiceSource::None => {
                 bail!("Service {} has no source defined", name);
             }
@@ -677,17 +732,17 @@ impl ServiceManager {
                     return Ok(());
                 }
 
-                let exit_code = self
-                    .docker
-                    .exec_in_container(container_id, &parts)
-                    .await?;
+                let exit_code = self.docker.exec_in_container(container_id, &parts).await?;
 
                 if exit_code == 0 {
                     info!("Service {} is healthy", name);
                     return Ok(());
                 }
 
-                debug!("Health check for {} failed (exit {}), retrying...", name, exit_code);
+                debug!(
+                    "Health check for {} failed (exit {}), retrying...",
+                    name, exit_code
+                );
                 sleep(check_interval).await;
             }
         })
@@ -854,15 +909,17 @@ impl ServiceManager {
                 .await;
 
             if let Ok(output) = port_output
-                && output.status.success() {
-                    let port_str = String::from_utf8_lossy(&output.stdout);
-                    // Output is like "0.0.0.0:12345" or ":::12345"
-                    if let Some(port) = port_str.trim().rsplit(':').next()
-                        && let Ok(p) = port.parse::<u16>() {
-                            ports.insert(port_name.clone(), p);
-                            continue;
-                        }
+                && output.status.success()
+            {
+                let port_str = String::from_utf8_lossy(&output.stdout);
+                // Output is like "0.0.0.0:12345" or ":::12345"
+                if let Some(port) = port_str.trim().rsplit(':').next()
+                    && let Ok(p) = port.parse::<u16>()
+                {
+                    ports.insert(port_name.clone(), p);
+                    continue;
                 }
+            }
 
             // Fallback to declared port
             ports.insert(port_name, port_mapping.container_port);
@@ -913,10 +970,11 @@ impl ServiceManager {
         })
     }
 
-    /// Stop all services
-    pub async fn stop_all(&mut self, eph: &EphFile) -> Result<()> {
+    /// Stop all services. When `remove` is true, also remove containers
+    /// (and compose resources) so they do not accumulate.
+    pub async fn stop_all(&mut self, eph: &EphFile, remove: bool) -> Result<()> {
         for (name, service) in &eph.services {
-            self.stop_service(name, service).await?;
+            self.stop_service(name, service, remove).await?;
         }
         self.state.services.clear();
         self.state.processes.clear();
@@ -924,8 +982,15 @@ impl ServiceManager {
         Ok(())
     }
 
-    /// Stop a single service
-    pub async fn stop_service(&mut self, name: &str, service: &Service) -> Result<()> {
+    /// Stop a single service. When `remove` is true, also remove the underlying
+    /// container after stopping it (compose uses `down`, which already removes
+    /// containers; killing a shell command process already removes it).
+    pub async fn stop_service(
+        &mut self,
+        name: &str,
+        service: &Service,
+        remove: bool,
+    ) -> Result<()> {
         // Run pre-stop hooks
         if !service.pre_stop.is_empty() {
             info!("Running pre-stop hooks for {}", name);
@@ -975,11 +1040,58 @@ impl ServiceManager {
             _ => {
                 let container_name = self.workspace.container_name(name);
                 self.docker.stop_container(&container_name).await?;
+                if remove {
+                    self.docker.remove_container(&container_name).await?;
+                }
             }
         }
 
         self.state.services.remove(name);
         Ok(())
+    }
+
+    /// Fully reset the workspace: stop and remove every service's container
+    /// (or compose resources / process), remove every per-workspace named
+    /// volume, clear in-memory state, and delete the persisted state file.
+    pub async fn clean(&mut self, eph: &EphFile) -> Result<CleanSummary> {
+        let mut summary = CleanSummary::default();
+
+        for (name, service) in &eph.services {
+            // Stop and remove the underlying resource for this service.
+            self.stop_service(name, service, true).await?;
+            summary.services_removed += 1;
+
+            // Remove per-workspace named volumes. A volume entry is a named
+            // volume (not a bind mount) when its host part does not begin with
+            // "." or "/". The real Docker volume name is derived via
+            // Workspace::volume_name(service, base).
+            for volume in &service.volumes {
+                let base = volume.split_once(':').map(|(b, _)| b).unwrap_or(volume);
+                if base.starts_with('.') || base.starts_with('/') {
+                    continue; // bind mount, not a managed named volume
+                }
+                let volume_name = self.workspace.volume_name(name, base);
+                self.docker.remove_volume(&volume_name).await?;
+                summary.volumes_removed += 1;
+            }
+        }
+
+        // Clear in-memory state.
+        self.state.services.clear();
+        self.state.processes.clear();
+
+        // Remove the persisted state file (and its directory).
+        let state_dir = self.workspace.state_dir()?;
+        if state_dir.exists() {
+            tokio::fs::remove_dir_all(&state_dir)
+                .await
+                .with_context(|| {
+                    format!("Failed to remove state directory: {}", state_dir.display())
+                })?;
+            summary.state_removed = true;
+        }
+
+        Ok(summary)
     }
 
     /// Save the current state to disk
@@ -994,17 +1106,18 @@ impl ServiceManager {
         for (name, entry) in &self.state.services {
             let container_name = self.workspace.container_name(name);
             if let Some(info) = self.docker.get_container(&container_name).await?
-                && info.is_running {
-                    // Use saved state's ports (which have proper names) instead of docker's
-                    result.insert(
-                        name.clone(),
-                        RunningService {
-                            name: name.clone(),
-                            container_id: info.id,
-                            ports: entry.ports.clone(),
-                        },
-                    );
-                }
+                && info.is_running
+            {
+                // Use saved state's ports (which have proper names) instead of docker's
+                result.insert(
+                    name.clone(),
+                    RunningService {
+                        name: name.clone(),
+                        container_id: info.id,
+                        ports: entry.ports.clone(),
+                    },
+                );
+            }
         }
 
         // Check shell command processes

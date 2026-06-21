@@ -468,10 +468,7 @@ REDIS_URL=redis://localhost:${redis.port}
     // Create the marker script that creates a file in the workspace
     ws.write_file(
         "marker.sh",
-        &format!(
-            "#!/bin/sh\ntouch {}/post-start-ran",
-            ws.path().display()
-        ),
+        &format!("#!/bin/sh\ntouch {}/post-start-ran", ws.path().display()),
     );
 
     // Update .eph to use our script

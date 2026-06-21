@@ -37,7 +37,14 @@ enum Commands {
         /// Specific services to stop (defaults to all)
         #[arg(value_name = "SERVICE")]
         services: Vec<String>,
+
+        /// Remove containers after stopping them (instead of just stopping)
+        #[arg(short = 'r', long = "rm")]
+        rm: bool,
     },
+
+    /// Stop and remove all services, named volumes, and persisted state
+    Clean,
 
     /// Show status of services
     Status,
@@ -74,7 +81,8 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Up { services } => cmd_up(services).await,
-        Commands::Down { services } => cmd_down(services).await,
+        Commands::Down { services, rm } => cmd_down(services, rm).await,
+        Commands::Clean => cmd_clean().await,
         Commands::Status => cmd_status().await,
         Commands::Env { format } => cmd_env(&format).await,
         Commands::Check => cmd_check().await,
@@ -93,7 +101,9 @@ async fn cmd_up(service_filter: Vec<String>) -> Result<()> {
     } else {
         let mut running = HashMap::new();
         for name in &service_filter {
-            let service = eph.services.get(name)
+            let service = eph
+                .services
+                .get(name)
                 .with_context(|| format!("Unknown service: {}", name))?;
             let result = manager.start_service(name, service).await?;
             running.insert(name.clone(), result);
@@ -121,23 +131,52 @@ async fn cmd_up(service_filter: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_down(service_filter: Vec<String>) -> Result<()> {
+async fn cmd_down(service_filter: Vec<String>, rm: bool) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
 
     let mut manager = ServiceManager::new(workspace).await?;
 
+    let action = if rm { "stopped and removed" } else { "stopped" };
+
     if service_filter.is_empty() {
-        manager.stop_all(&eph).await?;
-        println!("All services stopped");
+        manager.stop_all(&eph, rm).await?;
+        println!("All services {}", action);
     } else {
         for name in &service_filter {
-            let service = eph.services.get(name)
+            let service = eph
+                .services
+                .get(name)
                 .with_context(|| format!("Unknown service: {}", name))?;
-            manager.stop_service(name, service).await?;
-            println!("Stopped {}", name);
+            manager.stop_service(name, service, rm).await?;
+            println!("{} {}", if rm { "Removed" } else { "Stopped" }, name);
         }
     }
+
+    Ok(())
+}
+
+async fn cmd_clean() -> Result<()> {
+    let workspace = Workspace::find_from_cwd()?;
+    let eph = load_eph_file(&workspace)?;
+
+    let mut manager = ServiceManager::new(workspace).await?;
+    let summary = manager.clean(&eph).await?;
+
+    println!("Workspace cleaned:");
+    println!(
+        "  Services stopped and removed: {}",
+        summary.services_removed
+    );
+    println!("  Named volumes removed: {}", summary.volumes_removed);
+    println!(
+        "  Persisted state: {}",
+        if summary.state_removed {
+            "removed"
+        } else {
+            "none"
+        }
+    );
 
     Ok(())
 }
@@ -170,7 +209,9 @@ async fn cmd_status() -> Result<()> {
             }
         }
 
-        let stopped: Vec<_> = eph.services.keys()
+        let stopped: Vec<_> = eph
+            .services
+            .keys()
             .filter(|n| !running.contains_key(*n))
             .collect();
         if !stopped.is_empty() {
@@ -281,8 +322,7 @@ fn load_eph_file(workspace: &Workspace) -> Result<EphFile> {
     let path = workspace.eph_file_path();
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read {}", path.display()))?;
-    parser::parse(&contents)
-        .with_context(|| format!("Failed to parse {}", path.display()))
+    parser::parse(&contents).with_context(|| format!("Failed to parse {}", path.display()))
 }
 
 fn escape_bash(s: &str) -> String {
@@ -296,4 +336,68 @@ fn escape_fish(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('$', "\\$")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests lock in the escaping behavior for the double-quoted output
+    // context used by `eph env` (`export NAME="<escaped>"` / `set -gx NAME
+    // "<escaped>"`). Inside double quotes, the shell only treats \ " $ ` (and
+    // for fish, \ " $) specially, so those are the only characters escaped.
+    // Literal newlines are preserved as-is: they are valid inside double quotes
+    // for `eval`. The tests are deliberately shell-free; they assert the exact
+    // produced strings rather than invoking a shell.
+    //
+    // Backslash must be escaped first so that backslashes introduced while
+    // escaping the other characters are not themselves doubled.
+
+    #[test]
+    fn test_escape_bash_special_chars() {
+        // Double quote -> \"
+        assert_eq!(escape_bash("\""), "\\\"");
+        // Dollar sign -> \$
+        assert_eq!(escape_bash("$"), "\\$");
+        // Backtick -> \`
+        assert_eq!(escape_bash("`"), "\\`");
+        // Backslash -> \\
+        assert_eq!(escape_bash("\\"), "\\\\");
+        // Newline is preserved unchanged
+        assert_eq!(escape_bash("\n"), "\n");
+    }
+
+    #[test]
+    fn test_escape_bash_combined() {
+        // a"b$c`d\e<newline>f
+        let input = "a\"b$c`d\\e\nf";
+        // a \" b \$ c \` d \\ e <newline> f
+        assert_eq!(escape_bash(input), "a\\\"b\\$c\\`d\\\\e\nf");
+        // A literal backslash followed by a dollar must produce \\ then \$,
+        // not a single escaped sequence.
+        assert_eq!(escape_bash("\\$"), "\\\\\\$");
+    }
+
+    #[test]
+    fn test_escape_fish_special_chars() {
+        // Double quote -> \"
+        assert_eq!(escape_fish("\""), "\\\"");
+        // Dollar sign -> \$
+        assert_eq!(escape_fish("$"), "\\$");
+        // Backslash -> \\
+        assert_eq!(escape_fish("\\"), "\\\\");
+        // Newline is preserved unchanged
+        assert_eq!(escape_fish("\n"), "\n");
+        // fish does not treat backticks specially inside double quotes, so a
+        // backtick is passed through untouched.
+        assert_eq!(escape_fish("`"), "`");
+    }
+
+    #[test]
+    fn test_escape_fish_combined() {
+        let input = "a\"b$c`d\\e\nf";
+        // Backtick stays literal for fish.
+        assert_eq!(escape_fish(input), "a\\\"b\\$c`d\\\\e\nf");
+        assert_eq!(escape_fish("\\$"), "\\\\\\$");
+    }
 }
