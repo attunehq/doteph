@@ -192,3 +192,13 @@ make check            # Run clippy
 make format           # Format code
 make precommit        # Run all checks before committing
 ```
+
+## License
+
+`eph` is licensed under the [MIT License](LICENSE), Copyright (c) 2026
+Attune, Inc.
+
+The repository also vendors third-party Rust coding-guidance skills under
+[`.agents/skills/`](.agents/skills/) (notably the MIT-licensed
+[`rust-skills`](.agents/skills/rust-skills/) pack). See [NOTICE](NOTICE) for
+attribution and the licenses of vendored and externally sourced material.
