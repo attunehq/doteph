@@ -4,11 +4,11 @@ use crate::parser::{EphFile, Service, ServiceSource};
 use crate::workspace::Workspace;
 use anyhow::{Context, Result, bail};
 use bollard::Docker;
-use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
-    StartContainerOptions, StopContainerOptions,
+use bollard::models::{ContainerCreateBody, ContainerSummaryStateEnum, HostConfig, PortBinding};
+use bollard::query_parameters::{
+    CreateContainerOptions, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
+    RemoveContainerOptionsBuilder, RemoveVolumeOptionsBuilder, StopContainerOptionsBuilder,
 };
-use bollard::image::CreateImageOptions;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -176,11 +176,12 @@ impl DockerClient {
 
         let containers = self
             .client
-            .list_containers(Some(ListContainersOptions {
-                all: true,
-                filters,
-                ..Default::default()
-            }))
+            .list_containers(Some(
+                ListContainersOptionsBuilder::new()
+                    .all(true)
+                    .filters(&filters)
+                    .build(),
+            ))
             .await
             .context("failed to list containers")?;
 
@@ -195,7 +196,7 @@ impl DockerClient {
             return Ok(None);
         };
 
-        let is_running = container.state.as_ref().is_some_and(|s| s == "running");
+        let is_running = container.state == Some(ContainerSummaryStateEnum::RUNNING);
 
         // Extract port mappings
         let mut ports = HashMap::new();
@@ -223,7 +224,7 @@ impl DockerClient {
     /// Start an existing container
     pub(crate) async fn start_container(&self, id: &str) -> Result<()> {
         self.client
-            .start_container(id, None::<StartContainerOptions<String>>)
+            .start_container(id, None::<bollard::query_parameters::StartContainerOptions>)
             .await
             .context("failed to start container")?;
         Ok(())
@@ -236,7 +237,10 @@ impl DockerClient {
         {
             info!("Stopping container {}", name);
             self.client
-                .stop_container(&info.id, Some(StopContainerOptions { t: 10 }))
+                .stop_container(
+                    &info.id,
+                    Some(StopContainerOptionsBuilder::new().t(10).build()),
+                )
                 .await
                 .context("failed to stop container")?;
         }
@@ -250,10 +254,7 @@ impl DockerClient {
             self.client
                 .remove_container(
                     &info.id,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
+                    Some(RemoveContainerOptionsBuilder::new().force(true).build()),
                 )
                 .await
                 .context("failed to remove container")?;
@@ -264,12 +265,14 @@ impl DockerClient {
     /// Remove a named volume, ignoring "not found" errors
     pub(crate) async fn remove_volume(&self, name: &str) -> Result<()> {
         use bollard::errors::Error as BollardError;
-        use bollard::volume::RemoveVolumeOptions;
 
         info!("Removing volume {}", name);
         match self
             .client
-            .remove_volume(name, Some(RemoveVolumeOptions { force: true }))
+            .remove_volume(
+                name,
+                Some(RemoveVolumeOptionsBuilder::new().force(true).build()),
+            )
             .await
         {
             Ok(()) => Ok(()),
@@ -283,14 +286,15 @@ impl DockerClient {
 
     /// Execute a command inside a running container
     pub(crate) async fn exec_in_container(&self, container_id: &str, cmd: &[&str]) -> Result<i64> {
-        use bollard::exec::{CreateExecOptions, StartExecResults};
+        use bollard::exec::StartExecResults;
+        use bollard::models::ExecConfig;
 
         let exec = self
             .client
             .create_exec(
                 container_id,
-                CreateExecOptions {
-                    cmd: Some(cmd.to_vec()),
+                ExecConfig {
+                    cmd: Some(cmd.iter().map(ToString::to_string).collect()),
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
                     ..Default::default()
@@ -336,17 +340,16 @@ impl DockerClient {
         self.ensure_image(image).await?;
 
         // Build port bindings - let Docker assign host ports
-        let mut exposed_ports: HashMap<String, HashMap<(), ()>> = HashMap::new();
-        let mut port_bindings: HashMap<String, Option<Vec<bollard::service::PortBinding>>> =
-            HashMap::new();
+        let mut exposed_ports: Vec<String> = Vec::new();
+        let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
 
         for port_mapping in &service.ports {
             let container_port = format!("{}/tcp", port_mapping.container_port);
-            exposed_ports.insert(container_port.clone(), HashMap::new());
+            exposed_ports.push(container_port.clone());
             // Empty host port = random assignment
             port_bindings.insert(
                 container_port,
-                Some(vec![bollard::service::PortBinding {
+                Some(vec![PortBinding {
                     // Bind to loopback only: published ports must be reachable
                     // from localhost (RunningService::host() returns "localhost"),
                     // not from the entire network.
@@ -394,7 +397,7 @@ impl DockerClient {
             })
             .collect();
 
-        let host_config = bollard::service::HostConfig {
+        let host_config = HostConfig {
             port_bindings: Some(port_bindings),
             binds: Some(binds),
             ..Default::default()
@@ -406,7 +409,7 @@ impl DockerClient {
             .as_ref()
             .map(|c| shell_words::split(c).unwrap_or_else(|_| vec![c.clone()]));
 
-        let config = Config {
+        let config = ContainerCreateBody {
             image: Some(image.to_string()),
             exposed_ports: Some(exposed_ports),
             env: Some(env),
@@ -421,8 +424,8 @@ impl DockerClient {
             .client
             .create_container(
                 Some(CreateContainerOptions {
-                    name: container_name,
-                    platform: None,
+                    name: Some(container_name.to_string()),
+                    ..Default::default()
                 }),
                 config,
             )
@@ -431,7 +434,10 @@ impl DockerClient {
 
         // Start container
         self.client
-            .start_container(&response.id, None::<StartContainerOptions<String>>)
+            .start_container(
+                &response.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
             .await
             .context("failed to start container")?;
 
@@ -521,10 +527,7 @@ impl DockerClient {
 
         info!("Pulling image {}", image);
         let mut stream = self.client.create_image(
-            Some(CreateImageOptions {
-                from_image: image,
-                ..Default::default()
-            }),
+            Some(CreateImageOptionsBuilder::new().from_image(image).build()),
             None,
             None,
         );
