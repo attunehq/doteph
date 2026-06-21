@@ -1,0 +1,58 @@
+eph
+
+Copyright (c) 2026 Attune, Inc.
+
+This repository contains `eph`, a tool for managing ephemeral, per-workspace
+development services ("dotenv for services").
+
+Unless a file or directory states otherwise, the contents of this repository
+are licensed under the MIT License. See LICENSE.
+
+Third-party and externally sourced material retains its own copyright and
+license, as identified below and in or near the affected files.
+
+==============================================================================
+Vendored agent guidance (.agents/skills/)
+==============================================================================
+
+This directory contains Rust coding-guidance "skills" consumed by AI coding
+agents. Full provenance and the conflict decisions between the sources are
+documented in .agents/skills/readme.md.
+
+* .agents/skills/rust-skills/
+    The "rust-skills" rule pack from leonardomso/rust-skills
+    (https://github.com/leonardomso/rust-skills), vendored at commit
+    89910e8585331dabbecd400ae132b4070ecf24af.
+    Copyright (c) 2025 Leonardo Maldonado.
+    Licensed under the MIT License. The full upstream license text is
+    preserved in-tree at .agents/skills/rust-skills/LICENSE and must be
+    retained in any copy or substantial portion of that directory.
+
+* .agents/skills/rust100k-architecture-docs/
+  .agents/skills/rust100k-build-performance/
+  .agents/skills/rust100k-testing-discipline/
+    Guidance skills derived from Alex Kladov's ("matklad") "Rust100k" article
+    series (https://matklad.github.io/2021/09/05/Rust100k.html). The skill
+    text originated in the Homeport project; the underlying ideas are credited
+    to the cited articles.
+
+* .agents/skills/parse-dont-validate/
+  .agents/skills/names-are-not-type-safety/
+    Guidance skills derived from Alexis King's articles "Parse, don't validate"
+    (https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/) and
+    "Names are not type safety"
+    (https://lexi-lambda.github.io/blog/2020/11/01/names-are-not-type-safety/).
+    The skill text originated in the Homeport project; the underlying ideas are
+    credited to the cited articles.
+
+==============================================================================
+Third-party dependencies
+==============================================================================
+
+`eph` depends on third-party Rust crates declared in Cargo.toml and pinned in
+Cargo.lock, including (non-exhaustively) anyhow, bollard, clap, dirs,
+futures-util, hex, serde, serde_json, sha2, shell-words, tokio, tracing, and
+tracing-subscriber. Each remains under its own license (predominantly MIT
+and/or Apache-2.0). Their license texts are distributed with the respective
+crates via crates.io; run `cargo license` or `cargo about generate` to produce
+a complete dependency license report.
