@@ -5,6 +5,10 @@ ephemeral, per-workspace development services. Contributions that improve
 correctness, the `.eph` format, cross-platform behavior, documentation, or
 maintainability are all welcome.
 
+For the design rationale, the build/test workflow in depth, and a tour of the
+source, see the [Developer Guide](docs/developer-guide/README.md). This file is
+the short version: setup, working style, and the PR/release process.
+
 ## Local Setup
 
 Install Rust (stable), Git, and Docker. Docker must be running for the
@@ -44,11 +48,16 @@ These are the same checks CI enforces:
 ```sh
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
-cargo test                       # needs a running Docker daemon
+cargo test -- --test-threads=1   # needs a running Docker daemon
 ```
 
-`make precommit` runs the format and lint steps; `make test` runs the full
-suite.
+CI runs these on every push and pull request, and additionally runs the
+heavyweight stress suite (`cargo test --test stress -- --ignored
+--test-threads=1`). The integration tests start real containers, so they are run
+single-threaded to avoid host-port contention. `make precommit` runs the format
+and lint steps; `make test` runs the standard suite. See the
+[Developer Guide](docs/developer-guide/building-and-testing.md) for the full
+breakdown.
 
 ## AI-Assisted Contributions
 
