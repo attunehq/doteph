@@ -1,62 +1,336 @@
+# Build and publish eph releases to GitHub Releases.
+#
+# Triggered on pull requests, main pushes, manual dry runs, and version tags
+# (v*). Builds binaries for all supported platforms in parallel: native macOS
+# and linux-gnu-x64, plus cross-compiled linux-arm64, musl, and windows targets
+# via cargo-cross. eph is pure Rust (bollard talks to Docker over a unix socket
+# or a Windows named pipe, with no TLS), so every target cross-compiles with no
+# system dependencies.
+#
+# PR/main builds are dry runs that only prove the matrix compiles. A version tag
+# additionally signs/notarizes the macOS binaries and publishes a GitHub Release
+# with auto-generated notes (the release notes ARE the changelog).
+#
+# macOS signing requires these repository secrets to be configured; until they
+# are set, tag releases fail at the signing step (unsigned PR/main dry runs still
+# pass):
+#   APPLE_CERTIFICATE_BASE64      Developer ID Application cert, base64-encoded .p12
+#   APPLE_CERTIFICATE_PASSWORD    Password for the .p12
+#   APPLE_TEAM_ID                 Apple Developer Team ID (signing identity)
+#   APPLE_ID                      Apple ID email for notarytool
+#   APPLE_APP_SPECIFIC_PASSWORD   App-specific password for the Apple ID
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+    pull_request:
+        branches: [main]
+    merge_group:
+        types: [checks_requested]
+    push:
+        branches: [main]
+        tags:
+            - "v*"
+    workflow_dispatch:
+        inputs:
+            dry_run:
+                description: "Dry run (skip release creation)"
+                type: boolean
+                default: false
 
-permissions:
-  contents: write
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+env:
+    CARGO_TERM_COLOR: always
+    CARGO_HTTP_TIMEOUT: "60"
+    CARGO_NET_RETRY: "10"
 
 jobs:
-  build:
-    name: Build ${{ matrix.artifact }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            artifact: eph-linux-x86_64
-          - os: macos-latest
-            artifact: eph-macos-arm64
-          - os: windows-latest
-            artifact: eph-windows-x86_64
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --locked
-      - name: Package binary
-        shell: bash
-        run: |
-          set -euo pipefail
-          out="dist/${{ matrix.artifact }}"
-          mkdir -p "$out"
-          cp README.md LICENSE NOTICE "$out/"
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp target/release/eph.exe "$out/"
-            7z a -tzip "dist/${{ matrix.artifact }}.zip" "./$out"
-          else
-            cp target/release/eph "$out/"
-            tar -czf "dist/${{ matrix.artifact }}.tar.gz" -C dist "${{ matrix.artifact }}"
-          fi
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.artifact }}
-          path: |
-            dist/*.tar.gz
-            dist/*.zip
+    prepare:
+        name: Prepare
+        runs-on: ubuntu-latest
+        outputs:
+            version: ${{ steps.version.outputs.version }}
+            tag: ${{ steps.version.outputs.tag }}
+            prerelease: ${{ steps.version.outputs.prerelease }}
+            publish: ${{ steps.version.outputs.publish }}
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
 
-  publish:
-    name: Publish GitHub release
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          path: dist
-          merge-multiple: true
-      - env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist/* --generate-notes
+            - name: Extract version from tag
+              id: version
+              env:
+                  DRY_RUN_INPUT: ${{ inputs.dry_run || 'false' }}
+                  EVENT_NAME: ${{ github.event_name }}
+                  REF: ${{ github.ref }}
+                  REF_NAME: ${{ github.ref_name }}
+              run: |
+                  PUBLISH=false
+
+                  if [[ "$DRY_RUN_INPUT" == "true" ]]; then
+                    if [[ "$REF" == refs/tags/v* ]]; then
+                      TAG="$REF_NAME"
+                    else
+                      TAG=$(git describe --always --tags)
+                    fi
+                    VERSION="${TAG#v}"
+                    echo "::notice::Dry run using version: $TAG"
+                  elif [[ "$REF" == refs/tags/v* ]]; then
+                    TAG="$REF_NAME"
+                    VERSION="${TAG#v}"
+                    PUBLISH=true
+                  elif [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "merge_group" || "$REF" == "refs/heads/main" ]]; then
+                    TAG=$(git describe --always --tags)
+                    VERSION="${TAG#v}"
+                    echo "::notice::Release dry run using version: $TAG"
+                  else
+                    echo "::error::Release workflow must be triggered by a version tag (v*) unless it is a dry run"
+                    exit 1
+                  fi
+
+                  # Detect prerelease (anything with a dash after X.Y.Z, or non-semver like commit hashes)
+                  if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    PRERELEASE=false
+                  else
+                    PRERELEASE=true
+                  fi
+
+                  {
+                    echo "tag=${TAG}"
+                    echo "version=${VERSION}"
+                    echo "prerelease=${PRERELEASE}"
+                    echo "publish=${PUBLISH}"
+                  } >> "$GITHUB_OUTPUT"
+                  echo "Release version: ${VERSION} (prerelease: ${PRERELEASE}, publish: ${PUBLISH})"
+
+    build:
+        name: Build ${{ matrix.target }}
+        needs: prepare
+        runs-on: ${{ matrix.runner }}
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    # macOS builds (both targets on macos-latest via --target).
+                    - target: x86_64-apple-darwin
+                      runner: macos-latest
+                      cross: false
+                    - target: aarch64-apple-darwin
+                      runner: macos-latest
+                      cross: false
+
+                    # Linux GNU builds.
+                    - target: x86_64-unknown-linux-gnu
+                      runner: ubuntu-latest
+                      cross: false
+                    - target: aarch64-unknown-linux-gnu
+                      runner: ubuntu-latest
+                      cross: true
+
+                    # Linux musl builds (fully static).
+                    - target: x86_64-unknown-linux-musl
+                      runner: ubuntu-latest
+                      cross: true
+                    - target: aarch64-unknown-linux-musl
+                      runner: ubuntu-latest
+                      cross: true
+
+                    # Windows build using cross (simpler than native MinGW setup).
+                    - target: x86_64-pc-windows-gnu
+                      runner: ubuntu-latest
+                      cross: true
+
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install Rust toolchain
+              run: |
+                  rustup toolchain install stable
+                  rustup target add ${{ matrix.target }}
+
+            - name: Install cargo-cross
+              if: matrix.cross
+              uses: taiki-e/install-action@v2
+              with:
+                  tool: cargo-cross
+                  checksum: true
+
+            - name: Setup Rust cache
+              uses: Swatinem/rust-cache@v2
+              with:
+                  # PRs exercise the release matrix early; main-branch dry runs
+                  # warm the default-branch cache that tag releases can restore.
+                  shared-key: release-${{ matrix.target }}
+
+            # Inject the resolved version so the binary's `--version` matches the
+            # tag without relying on git being present inside cross containers.
+            - name: Build with cargo cross
+              if: matrix.cross
+              env:
+                  EPH_VERSION: ${{ needs.prepare.outputs.tag }}
+                  TARGET: ${{ matrix.target }}
+              run: cargo cross build --target "$TARGET" --release --locked
+
+            - name: Build native
+              if: ${{ !matrix.cross }}
+              env:
+                  EPH_VERSION: ${{ needs.prepare.outputs.tag }}
+                  TARGET: ${{ matrix.target }}
+              run: cargo build --target "$TARGET" --release --locked
+
+            - name: Import signing certificate
+              if: needs.prepare.outputs.publish == 'true' && runner.os == 'macOS'
+              env:
+                  APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+                  APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+              run: |
+                  echo -n "$APPLE_CERTIFICATE_BASE64" | base64 --decode -o "$RUNNER_TEMP/certificate.p12"
+                  security create-keychain -p "$APPLE_CERTIFICATE_PASSWORD" "$RUNNER_TEMP/build.keychain"
+                  security default-keychain -s "$RUNNER_TEMP/build.keychain"
+                  security unlock-keychain -p "$APPLE_CERTIFICATE_PASSWORD" "$RUNNER_TEMP/build.keychain"
+                  security import "$RUNNER_TEMP/certificate.p12" -k "$RUNNER_TEMP/build.keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+                  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$APPLE_CERTIFICATE_PASSWORD" "$RUNNER_TEMP/build.keychain"
+                  rm "$RUNNER_TEMP/certificate.p12"
+
+            - name: Sign macOS binary
+              if: needs.prepare.outputs.publish == 'true' && runner.os == 'macOS'
+              env:
+                  APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+                  TARGET: ${{ matrix.target }}
+              run: |
+                  BINARY="target/${TARGET}/release/eph"
+                  codesign --sign "$APPLE_TEAM_ID" \
+                           --timestamp \
+                           --options=runtime \
+                           --force \
+                           "$BINARY"
+
+            - name: Store notarization credentials
+              if: needs.prepare.outputs.publish == 'true' && runner.os == 'macOS'
+              env:
+                  APPLE_ID: ${{ secrets.APPLE_ID }}
+                  APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+                  APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+              run: |
+                  xcrun notarytool store-credentials "notarytool-password" \
+                          --apple-id "$APPLE_ID" \
+                          --team-id "$APPLE_TEAM_ID" \
+                          --password "$APPLE_APP_SPECIFIC_PASSWORD"
+
+            - name: Submit for notarization
+              if: needs.prepare.outputs.publish == 'true' && runner.os == 'macOS'
+              env:
+                  TARGET: ${{ matrix.target }}
+              run: |
+                  BINARY="target/${TARGET}/release/eph"
+                  zip "$RUNNER_TEMP/eph-macos.zip" "$BINARY"
+                  xcrun notarytool submit "$RUNNER_TEMP/eph-macos.zip" \
+                          --keychain-profile "notarytool-password" \
+                          --wait
+
+            - name: Cleanup keychain
+              if: needs.prepare.outputs.publish == 'true' && runner.os == 'macOS' && always()
+              run: security delete-keychain "$RUNNER_TEMP/build.keychain" || true
+
+            - name: Package binary
+              id: package
+              shell: bash
+              run: |
+                  TARGET="${{ matrix.target }}"
+                  ARCHIVE_NAME="eph-${TARGET}"
+                  ARCHIVE_DIR="artifacts/${ARCHIVE_NAME}"
+                  mkdir -p "${ARCHIVE_DIR}"
+
+                  # Copy binary (Windows has .exe extension)
+                  if [[ "$TARGET" == *"windows"* ]]; then
+                    cp "target/${TARGET}/release/eph.exe" "${ARCHIVE_DIR}/"
+                  else
+                    cp "target/${TARGET}/release/eph" "${ARCHIVE_DIR}/"
+                  fi
+
+                  # Include docs and license metadata
+                  cp README.md LICENSE NOTICE "${ARCHIVE_DIR}/"
+
+                  # Create tarball
+                  (cd artifacts && tar -czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}")
+                  rm -rf "${ARCHIVE_DIR}"
+
+                  echo "archive=artifacts/${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: eph-${{ matrix.target }}
+                  path: ${{ steps.package.outputs.archive }}
+                  if-no-files-found: error
+                  retention-days: 7
+
+    release:
+        name: Release
+        needs: [prepare, build]
+        if: needs.prepare.outputs.publish == 'true'
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Download all artifacts
+              uses: actions/download-artifact@v4
+              with:
+                  path: artifacts
+                  pattern: eph-*
+                  merge-multiple: true
+
+            - name: List artifacts
+              run: ls -la "artifacts/"
+
+            - name: Generate checksums
+              working-directory: artifacts
+              run: |
+                  sha256sum ./*.tar.gz > checksums.txt
+                  echo "Generated checksums:"
+                  cat checksums.txt
+
+            - name: Publish GitHub release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+                  TAG: ${{ needs.prepare.outputs.tag }}
+              run: |
+                  RELEASE_FLAG="--latest"
+                  if [[ "$PRERELEASE" == "true" ]]; then
+                    RELEASE_FLAG="--prerelease"
+                  fi
+
+                  gh release create "$TAG" \
+                    --generate-notes \
+                    "$RELEASE_FLAG" \
+                    --title "$TAG" \
+                    artifacts/*.tar.gz \
+                    artifacts/checksums.txt
+
+            - name: Write release summary
+              env:
+                  REPOSITORY: ${{ github.repository }}
+                  TAG: ${{ needs.prepare.outputs.tag }}
+              run: |
+                  {
+                    echo "## Released: $TAG"
+                    echo ""
+                    echo "Published with auto-generated release notes."
+                    echo ""
+                    echo "[View the release](https://github.com/${REPOSITORY}/releases/tag/${TAG})"
+                    echo ""
+                    echo "### Checksums"
+                    echo ""
+                    echo '```'
+                    cat artifacts/checksums.txt
+                    echo '```'
+                  } >> "$GITHUB_STEP_SUMMARY"
