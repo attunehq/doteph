@@ -1,6 +1,9 @@
 [package]
 name = "eph"
-version = "0.1.0"
+# Versioning comes from the git tag (see build.rs / EPH_VERSION), not from this
+# field. It is pinned to 0.0.0 to make clear the crate version is not the source
+# of truth for releases.
+version = "0.0.0"
 edition = "2024"
 description = "Ephemeral services per workspace - dotenv for services"
 license = "MIT"

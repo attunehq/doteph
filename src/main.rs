@@ -22,7 +22,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "eph")]
 #[command(about = "Ephemeral services per workspace - dotenv for services")]
-#[command(version)]
+#[command(version = env!("EPH_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

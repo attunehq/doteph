@@ -18,13 +18,35 @@ connection strings into your shell with `eval "$(eph env)"`.
 
 ## Install
 
+Install the latest release binary (verifies a SHA-256 checksum before
+installing):
+
 ```sh
-cargo install --path .   # from a source checkout
+# Linux / macOS
+curl -sSfL https://raw.githubusercontent.com/attunehq/doteph/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/attunehq/doteph/main/scripts/install.ps1 | iex
+```
+
+Pass `-v X.Y.Z` (shell) or set `$env:Version` (PowerShell) to pin a version, or
+download a `tar.gz` directly from the
+[releases page](https://github.com/attunehq/doteph/releases). Prebuilt binaries
+are published for macOS (x86_64, arm64), Linux glibc and musl (x86_64, arm64),
+and Windows (x86_64).
+
+Or build from a source checkout:
+
+```sh
+cargo install --path .
 # or
 make install
 ```
 
-`eph` runs natively on Linux and macOS. On Windows, run it inside WSL.
+`eph` runs natively on Linux, macOS, and Windows. On Windows you can also run it
+inside WSL.
 
 ## Quick taste
 
