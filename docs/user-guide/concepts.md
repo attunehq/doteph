@@ -120,35 +120,32 @@ this directory.
 
 ## The service lifecycle
 
-Starting a service is **idempotent** and has three paths:
+Bringing a service up to a healthy state is **idempotent** and has three paths:
 
 1. **Already running** -> `eph up` detects it and reuses it. Nothing restarts.
 2. **Stopped but still present** (after `eph down`) -> the existing container is
-   restarted. This is fast, and it reuses the existing data. **`post-start`
-   hooks do *not* run again** on this path.
-3. **Not present** -> a fresh container is created, the image pulled or built if
-   needed, and the health check awaited. **`post-start` hooks run only once
-   every service in the same `eph up` is healthy** -- a second phase after all
-   the start paths above complete. Deferring hooks this way means a hook can
-   reference any other service's assigned port (for example a migration whose
-   `DATABASE_URL` interpolates `${postgres.port}`), and hooks run with eph's
-   resolved environment injected (see
-   [The `.eph` file](eph-file.md#hook-environment)).
+   restarted. This is fast, and it reuses the existing data.
+3. **Not present** -> a fresh container is created and the image pulled or built
+   if needed.
 
-That second point is the one that surprises people: migrations or seed scripts
-in `post-start` run when the container is *created*, not every time you `up`. To
-force them to run again, recreate the container with `eph down --rm` (then `eph
-up`) or `eph clean`, or run the script directly with
-[`eph run`](command-reference.md#eph-run-cmd). See
-[Troubleshooting](troubleshooting.md#post-start-hooks-did-not-run-again).
+This lifecycle applies to `image` and `dockerfile` services. **`run`** services
+are tracked by process ID: an alive process is reused, otherwise it is
+respawned. **`compose`** services delegate to `docker compose up -d` on every
+`eph up` (which is itself idempotent).
 
-This lifecycle (paths 1-3 above) applies to `image` and `dockerfile` services.
-The other two source types behave a little differently:
+Once **every** service in the same `eph up` is healthy, eph runs `post-start`
+hooks in a second phase, regardless of which start path each service took.
+Deferring hooks this way means a hook can reference any other service's assigned
+port (for example a migration whose `DATABASE_URL` interpolates
+`${postgres.port}`), and hooks run with eph's resolved environment injected (see
+[The `.eph` file](eph-file.md#hook-environment)).
 
-- **`run`** services are tracked by process ID. `eph up` re-runs `post-start`
-  whenever the process is not already alive (it is skipped if it is).
-- **`compose`** services delegate to `docker compose up -d` on every `eph up`
-  (which is itself idempotent), and their `post-start` hooks run **every** time.
+> **`post-start` runs on every `eph up`**, not only on fresh creation. Write
+> hooks to be idempotent -- a migration that no-ops when already applied, an
+> `INSERT ... ON CONFLICT` seed. A failing `post-start` aborts the `up`. For
+> one-off or non-idempotent work, run it explicitly with
+> [`eph run`](command-reference.md#eph-run-cmd) instead of wiring it into
+> `post-start`.
 
 The three levels of teardown:
 

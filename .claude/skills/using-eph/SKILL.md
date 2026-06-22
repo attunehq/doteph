@@ -68,7 +68,7 @@ Three deliberately distinct levels, from lightest to heaviest:
 | Command | Effect |
 | --- | --- |
 | `eph down` | Stop services; keep containers and volume data for a fast restart. |
-| `eph down --rm` (alias `-r`) | Also remove the containers; named-volume data is kept. The next `up` recreates them and re-runs `post-start`. |
+| `eph down --rm` (alias `-r`) | Also remove the containers; named-volume data is kept. The next `up` recreates them. |
 | `eph clean` | Full reset: remove containers, remove per-workspace named volumes (**deletes that data**), and delete saved state. |
 
 `compose` services are always fully torn down (`--rm` is a no-op for them);
@@ -133,6 +133,13 @@ Each hook receives, layered in this order (later wins):
 hook may reference any other service's port (`${redis.port}` resolves even if
 redis started after the service whose hook needs it).
 
+`post-start` runs on **every** `eph up` (fresh create *or* restart), and a
+failing `post-start` aborts the `up`; a failing `pre-stop` aborts the `down` /
+`clean` and leaves the service running so you can fix and retry. Write hooks to
+be idempotent (a migration that no-ops when already applied, an
+`INSERT ... ON CONFLICT` seed). For one-off, non-idempotent work, use `eph run`
+instead.
+
 ## Running one-off commands with the environment: `eph run`
 
 `eph run <cmd>...` runs a command in the workspace root with the resolved
@@ -155,9 +162,10 @@ ad-hoc queries) -- unlike `post-start`, it runs every time you invoke it.
 
 - **Ports are random and change per create.** Never hardcode a host port; always
   go through `eph env`.
-- **Idempotent up.** For `image`/`dockerfile` services, `post-start` runs only on
-  a fresh create, not on a restart, so migrations are not re-run on every `up`.
-  To force them: `eph down --rm && eph up`, or `eph clean && eph up`.
+- **Idempotent up.** A running service is reused and a stopped one restarted, but
+  `post-start` hooks run on **every** `eph up` regardless. Write them to be
+  idempotent (migrations that no-op when applied), or move one-off work to
+  `eph run`. A failing `post-start` aborts the `up`.
 - **Image health checks have no shell**: one whitespace-split command, no pipes,
   `&&`, `$VAR`, or quoted spaces, and the binary must exist in the image.
 - **A service with no health check** is given a fixed short wait, so it may need a

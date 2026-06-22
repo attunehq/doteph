@@ -114,18 +114,28 @@ engine.
 **`ServiceManager`** owns the `Workspace`, a `DockerClient`, and the loaded
 `ServiceState`:
 
-- `start_service` is the idempotent core. For `run=` services it first probes the
-  tracked PID (`kill -0`) to avoid spawning duplicates. For Docker services it
-  checks for an existing container: running -> reuse; stopped -> restart (and
-  **skip** `post-start`); absent -> create fresh via the matching source path and
-  **run** `post-start`. `start_all` iterates and saves state.
+- `start_services` is the entry point and runs in two phases: phase 1 brings each
+  target to a healthy state via `create_service`, saves state, then phase 2 runs
+  every target's `post-start` hooks with the resolved environment. `start_all` is
+  a thin wrapper with an empty filter.
+- `create_service` is the idempotent core that produces a healthy `RunningService`
+  (no hooks). For `run=` services it first probes the tracked PID (`kill -0`) to
+  avoid spawning duplicates. For Docker services it checks for an existing
+  container: running -> reuse; stopped -> restart; absent -> create fresh via the
+  matching source path. `post-start` is **not** run here -- it runs in phase 2 of
+  `start_services` for every target, on every `eph up`, so hooks must be
+  idempotent.
 - `wait_for_healthy` polls `exec_in_container` (image/dockerfile) on a 1s
   interval under a `tokio::time::timeout`; no health check means a 500 ms sleep.
   `start_shell_command` and `start_compose` have their own host-side `sh -c`
   health-check loops (compose default 60s).
-- `stop_service` runs `pre-stop` (failures logged), then stops by source type:
-  Docker (stop, optionally remove), `run` (SIGTERM, wait, SIGKILL), or compose
-  (`docker compose down`). `stop_all` clears state.
+- `stop_service` takes the loaded `EphFile` and a snapshot of running services,
+  runs `pre-stop` with the resolved environment (a failure is **propagated**,
+  aborting teardown), then stops by source type: Docker (stop, optionally
+  remove), `run` (SIGTERM, wait, SIGKILL), or compose (`docker compose down`).
+  `stop_all` snapshots running services once up front and clears state.
+- `resolve_env_vars` / `command_env` / `hook_env` build the resolved environment
+  shared by `eph env`, `eph run`, and the lifecycle hooks.
 - `clean` stops+removes everything, removes per-workspace named volumes (skipping
   bind mounts), clears state, and deletes the state directory, returning a
   `CleanSummary`.
@@ -160,5 +170,7 @@ interpolation live in `main.rs`):
 if `--verbose`, else info) writing to **stderr** so stdout stays clean for `eph
 env`, and dispatches to `cmd_*` functions. Each `cmd_*` resolves the workspace,
 loads and parses `.eph` (`load_eph_file`), and drives the relevant
-`ServiceManager` calls. `cmd_env` builds the resolver closure over running
-services and passes it to `parser::resolve_interpolations`.
+`ServiceManager` calls. `cmd_env` and `cmd_run` resolve the environment through
+`service::resolve_env_vars` (and `ServiceManager::command_env` for `cmd_run`),
+the same builder the lifecycle hooks use; `cmd_run` then execs the given command
+with that environment and propagates its exit code.

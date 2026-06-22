@@ -78,23 +78,31 @@ port=5432   # this whole thing is the value, and fails to parse
 Symptoms: `invalid port number at line N`, or an image/URL that mysteriously has
 ` # ...` appended. Move the comment to its own line above.
 
-## `post-start` hooks did not run again
+## `post-start` ran again and broke (or duplicated data)
 
-For `image`/`dockerfile` services, `post-start` runs when a container is
-**created**, not on every `eph up`. After `eph down` (which keeps the container),
-the next `eph up` **restarts** the existing container and does **not** re-run
-`post-start`. This is intentional - it avoids re-running migrations every time.
-(`run` services re-run `post-start` whenever the process is not already alive,
-and `compose` services re-run it on every `eph up`, so this section applies to
-container-image services.)
+`post-start` hooks run on **every** `eph up`, including when a stopped container
+is restarted -- not just on first creation. A hook that is not idempotent (a
+plain `INSERT` seed, a one-shot setup script) will repeat its effect and may
+fail or duplicate rows on the second `eph up`.
 
-To force `post-start` to run again, recreate the container:
+Fixes:
 
-```sh
-eph down --rm && eph up      # fresh container, keeps named-volume data
-# or
-eph clean && eph up          # fresh container AND fresh data
-```
+- Make the hook idempotent: a migration that no-ops when already applied, an
+  `INSERT ... ON CONFLICT DO NOTHING` seed, `CREATE TABLE IF NOT EXISTS`.
+- Move one-off or destructive work out of `post-start` and run it explicitly
+  with [`eph run`](command-reference.md#eph-run-cmd) when you actually want it.
+
+## `eph down` or `eph clean` fails on a `pre-stop` hook
+
+A failing `pre-stop` hook **aborts** the teardown and leaves the service running,
+so the hook (a backup, a drain) can be fixed and retried rather than silently
+skipped. If a broken `pre-stop` is wedging teardown:
+
+- Fix the hook and re-run `eph down` / `eph clean`.
+- Or temporarily blank the `pre-stop=` line in `.eph`, then tear down.
+- Or remove the container directly with `docker rm -f <container>` (names are
+  `eph-<short_id>-<service>`; see `eph info`) and delete the state directory
+  shown by `eph info`.
 
 ## A port reference did not resolve
 

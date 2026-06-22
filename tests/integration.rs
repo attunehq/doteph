@@ -464,6 +464,87 @@ REDIS_URL=redis://localhost:${redis.port}
     ws.eph_ok(&["down"]).await;
 }
 
+/// post-start hooks run on every `eph up`, including when a stopped container is
+/// restarted -- not only on fresh creation.
+#[tokio::test]
+async fn post_start_reruns_on_restart() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+post-start=printf 'x' >> ran-count
+"#,
+    );
+
+    // Fresh create -> post-start runs once.
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    // Stop but keep the container, then bring it back up (the restart path).
+    ws.eph_ok(&["down"]).await;
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let count = std::fs::read_to_string(ws.path().join("ran-count")).unwrap_or_default();
+    assert_eq!(
+        count.len(),
+        2,
+        "post-start should run on both create and restart, got {count:?}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// A failing pre-stop hook aborts `eph down` and leaves the service running so
+/// the hook can be retried.
+#[tokio::test]
+async fn pre_stop_failure_aborts_down() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+pre-stop=exit 1
+"#,
+    );
+
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    // down must fail because the pre-stop hook fails.
+    let out = ws.eph(&["down"]).await;
+    assert!(
+        !out.status.success(),
+        "down should fail when a pre-stop hook fails"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("pre-stop hook failed"),
+        "expected a pre-stop failure message, got: {stderr}"
+    );
+
+    // The service is left running so the operator can fix and retry.
+    let status = ws.eph_ok(&["status"]).await;
+    assert!(
+        status.contains("redis") && status.contains("localhost:"),
+        "service should still be running after a failed down: {status}"
+    );
+
+    // Fix the hook, then tear down cleanly (also lets Drop's `eph down` succeed
+    // rather than leaking the container).
+    ws.write_file(
+        ".eph",
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+pre-stop=true
+"#,
+    );
+    ws.eph_ok(&["down"]).await;
+}
+
 /// A pre-stop hook should receive the same resolved environment as post-start.
 #[tokio::test]
 async fn pre_stop_hook_receives_resolved_env() {

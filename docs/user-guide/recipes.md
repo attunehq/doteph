@@ -88,9 +88,11 @@ post-start=npm run db:seed
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 ```
 
-Remember `post-start` runs when the container is **created**, not on every `up`.
-To re-run from scratch: `eph down --rm && eph up`, or `eph clean && eph up`. See
-[Troubleshooting](troubleshooting.md#post-start-hooks-did-not-run-again).
+`post-start` runs on **every** `eph up`, so keep these commands idempotent (a
+migration that no-ops when already applied, an `INSERT ... ON CONFLICT` seed). A
+failing `post-start` aborts the `up`. For a destructive re-seed from scratch,
+recreate the data volume with `eph clean && eph up`, or run the seed on demand
+with `eph run` (below).
 
 **On demand with `eph run`** - for a re-seed you can repeat any time, skip the
 hook and run the command directly. It gets the same environment (`$DATABASE_URL`,
@@ -181,5 +183,5 @@ A `.eph` file can contain credentials (for example `env.POSTGRES_PASSWORD`), and
 |----------------|-----|
 | Pause for the day, keep everything | `eph down` |
 | Free the containers, keep the data | `eph down --rm` |
-| Re-run `post-start` migrations on next `up` | `eph down --rm` then `eph up` |
+| Re-run migrations/seeds against the running data | `eph run <your migrate/seed cmd>` |
 | Wipe data and start completely clean | `eph clean` then `eph up` |

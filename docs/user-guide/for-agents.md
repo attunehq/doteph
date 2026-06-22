@@ -41,9 +41,10 @@ DATABASE_URL=$(eph env -f json | jq -r .DATABASE_URL)
 
 | Command | Effect |
 |---------|--------|
-| `eph up [svc...]` | Start all / named services. Pulls/builds, waits for health, runs `post-start` (image/dockerfile: fresh create only; run: when not alive; compose: every up). |
-| `eph down [--rm \| -r] [svc...]` | Stop all / named. `--rm` (alias `-r`) also removes containers. Compose is always fully torn down. |
-| `eph clean` | Full reset: remove containers + named volumes + state. Deletes data. |
+| `eph up [svc...]` | Start all / named services. Pulls/builds, waits for health, then runs `post-start` for every service on **every** `eph up`. A failing `post-start` aborts the `up`. |
+| `eph down [--rm \| -r] [svc...]` | Stop all / named. `--rm` (alias `-r`) also removes containers. Compose is always fully torn down. A failing `pre-stop` aborts the `down`. |
+| `eph clean` | Full reset: remove containers + named volumes + state. Deletes data. A failing `pre-stop` aborts it. |
+| `eph run <cmd>...` | Run a command in the workspace root with the resolved env + `EPH_*` metadata. Exits with the command's code. |
 | `eph status` | Running services and ports. |
 | `eph env [-f export\|fish\|json]` | Print resolved top-level env vars (stdout). |
 | `eph check` | Validate `.eph` (no Docker). |
@@ -104,7 +105,7 @@ env`, with `${postgres.port}` filled in at runtime.
 | `command=` | Override container CMD (shell-word split, no shell). |
 | `healthcheck=` | image/dockerfile: no shell. run/compose: `sh -c`. |
 | `ready-timeout=` | Seconds (default 30; compose 60). |
-| `post-start=` / `pre-stop=` | Host `sh -c` in workspace root; repeatable. |
+| `post-start=` / `pre-stop=` | Host `sh -c` in workspace root; repeatable. Run with the resolved env + `EPH_*` metadata + the service's `env.X` injected. `post-start` runs on every `up` (after all services healthy); failure aborts `up`. `pre-stop` failure aborts `down`/`clean`. |
 
 ### Interpolation (resolved by `eph env`, running services only)
 
@@ -121,9 +122,10 @@ reference a compose service's `expose.<name>=` port as `${svc.port.<name>}`.
 ## Behaviors that matter
 
 - **Idempotent up** (image/dockerfile): running -> reused; stopped-but-present ->
-  restarted (no `post-start`); absent -> created fresh (runs `post-start`). To
-  re-run migrations: `eph down --rm && eph up` or `eph clean && eph up`. (`run`
-  re-runs `post-start` when its PID is not alive; `compose` re-runs it every up.)
+  restarted; absent -> created fresh. `run` reuses a live PID or respawns;
+  `compose` delegates to `docker compose up -d`. Regardless of path, `post-start`
+  runs for every service on **every** `eph up` -- keep hooks idempotent, or use
+  `eph run` for one-off work.
 - **Ports are random and change per create.** Never hardcode; always go through
   `eph env`.
 - **Image health checks have no shell** - one whitespace-split command, no

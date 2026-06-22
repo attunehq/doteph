@@ -709,15 +709,19 @@ impl ServiceManager {
     ///
     /// 1. Every target service is created (or reused) and waited on until
     ///    healthy. No hooks run yet.
-    /// 2. For each *freshly created* service, its `post-start` hooks run with
-    ///    the fully-resolved environment.
+    /// 2. Every target service's `post-start` hooks run with the fully-resolved
+    ///    environment.
     ///
     /// Deferring the hooks to phase 2 means a hook can reference any service in
     /// the workspace -- a database migration whose `DATABASE_URL` interpolates
     /// `${postgres.port}` resolves correctly even though, within a single
     /// `eph up`, postgres might have been created before the service whose hook
-    /// needs it. Hooks only run for freshly created services, preserving the
-    /// "migrations do not re-run on every `up`" guarantee.
+    /// needs it.
+    ///
+    /// `post-start` hooks run on **every** `eph up`, not only when a service is
+    /// freshly created. Hooks are therefore expected to be idempotent (a
+    /// migration that no-ops when already applied, an `INSERT ... ON CONFLICT`
+    /// seed); use [`eph run`](crate) for one-off, non-idempotent operations.
     ///
     /// # Errors
     ///
@@ -744,26 +748,17 @@ impl ServiceManager {
             filter.iter().collect()
         };
 
-        // Phase 1: create or reuse every target, waiting for health. Track which
-        // services were freshly created so only those run post-start hooks.
+        // Phase 1: create or reuse every target, waiting for health.
         let mut running = HashMap::new();
-        let mut freshly_created: Vec<String> = Vec::new();
         for name in &targets {
             let service = &eph.services[*name];
-            let (result, created) = self.create_service(name, service).await?;
-            if created {
-                freshly_created.push((*name).clone());
-            }
+            let result = self.create_service(name, service).await?;
             running.insert((*name).clone(), result);
         }
 
         // Persist before running hooks so a hook that itself shells out to eph,
         // or that fails, leaves accurate state behind.
         self.state.save(&self.workspace).await?;
-
-        if freshly_created.is_empty() {
-            return Ok(running);
-        }
 
         // Phase 2: run post-start hooks with the full environment. Merge the
         // services already running from a previous `up` so cross-service
@@ -773,8 +768,8 @@ impl ServiceManager {
             resolved.insert(name.clone(), svc.clone());
         }
 
-        for name in &freshly_created {
-            let service = &eph.services[name];
+        for name in &targets {
+            let service = &eph.services[*name];
             if service.post_start.is_empty() {
                 continue;
             }
@@ -803,14 +798,10 @@ impl ServiceManager {
     /// process cannot be started, or the service fails its healthcheck within
     /// the configured timeout.
     ///
-    /// The returned boolean is `true` only when the service was freshly created
-    /// (as opposed to reused or restarted); the caller uses it to decide whether
-    /// to run `post-start` hooks.
-    async fn create_service(
-        &mut self,
-        name: &str,
-        service: &Service,
-    ) -> Result<(RunningService, bool)> {
+    /// This only brings the service to a healthy state; `post-start` hooks are
+    /// run separately by [`start_services`](Self::start_services) once every
+    /// service is up.
+    async fn create_service(&mut self, name: &str, service: &Service) -> Result<RunningService> {
         let container_name = self.workspace.container_name(name);
 
         // Dedup run= (shell command) services: the Docker-based guard below
@@ -833,14 +824,11 @@ impl ServiceManager {
                     .get(name)
                     .map(|entry| entry.ports.clone())
                     .unwrap_or_default();
-                return Ok((
-                    RunningService {
-                        name: name.to_string(),
-                        container_id: format!("pid:{}", pid),
-                        ports,
-                    },
-                    false,
-                ));
+                return Ok(RunningService {
+                    name: name.to_string(),
+                    container_id: format!("pid:{}", pid),
+                    ports,
+                });
             }
         }
 
@@ -860,14 +848,11 @@ impl ServiceManager {
                         ports: existing.ports.clone(),
                     },
                 );
-                return Ok((
-                    RunningService {
-                        name: name.to_string(),
-                        container_id: existing.id,
-                        ports: existing.ports,
-                    },
-                    false,
-                ));
+                return Ok(RunningService {
+                    name: name.to_string(),
+                    container_id: existing.id,
+                    ports: existing.ports,
+                });
             } else {
                 // Container exists but not running, start it
                 info!("Starting existing container for {}", name);
@@ -890,14 +875,11 @@ impl ServiceManager {
                     },
                 );
 
-                return Ok((
-                    RunningService {
-                        name: name.to_string(),
-                        container_id: refreshed.id,
-                        ports: refreshed.ports,
-                    },
-                    false,
-                ));
+                return Ok(RunningService {
+                    name: name.to_string(),
+                    container_id: refreshed.id,
+                    ports: refreshed.ports,
+                });
             }
         }
 
@@ -944,7 +926,7 @@ impl ServiceManager {
 
         // post-start hooks run in a later phase (see `start_services`), once
         // every service is healthy, so a hook can reference any service.
-        Ok((running, true))
+        Ok(running)
     }
 
     /// Wait for a service to become healthy
@@ -1249,14 +1231,15 @@ impl ServiceManager {
     ///
     /// When `remove` is true, also remove the underlying container after
     /// stopping it (compose uses `down`, which already removes containers;
-    /// killing a `run` process already removes it). Pre-stop hook failures and
-    /// the best-effort process/compose teardown are logged rather than
-    /// propagated, so a stale or already-stopped service does not error.
+    /// killing a `run` process already removes it). The process/compose teardown
+    /// itself is best-effort and logged rather than propagated, so a stale or
+    /// already-stopped service does not error.
     ///
     /// # Errors
     ///
-    /// Returns an error if a Docker stop or remove call fails for an
-    /// `image`/`dockerfile` service.
+    /// Returns an error if a `pre-stop` hook fails (the service is left running
+    /// so the hook can be retried), or if a Docker stop or remove call fails for
+    /// an `image`/`dockerfile` service.
     pub async fn stop_service(
         &mut self,
         name: &str,
@@ -1266,14 +1249,17 @@ impl ServiceManager {
         running: &HashMap<String, RunningService>,
     ) -> Result<()> {
         // Run pre-stop hooks with the resolved environment, the same way
-        // post-start hooks receive it.
+        // post-start hooks receive it. A failing hook aborts the teardown
+        // (before the service is stopped), mirroring how a failing post-start
+        // aborts `eph up`: if the pre-stop backup/drain did not succeed, you
+        // almost certainly do not want the data to go away underneath it.
         if !service.pre_stop.is_empty() {
             info!("Running pre-stop hooks for {}", name);
             let env = self.hook_env(eph, running, service);
             for cmd in &service.pre_stop {
-                if let Err(e) = self.run_hook(cmd, &env).await {
-                    warn!("Pre-stop hook failed: {}", e);
-                }
+                self.run_hook(cmd, &env)
+                    .await
+                    .with_context(|| format!("pre-stop hook failed for service '{}'", name))?;
             }
         }
 

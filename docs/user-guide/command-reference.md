@@ -32,10 +32,8 @@ eph up postgres redis  # just these two
 - Pulls/builds images as needed and waits for each `healthcheck`. Once **every**
   service started by this `up` is healthy, `post-start` hooks run -- deferring
   them to this second phase means a hook can reference any other service's
-  assigned port. For `image`/`dockerfile` services those hooks run only on a
-  fresh create (not when a stopped container is restarted); `run` services re-run
-  them when the process is not already alive; `compose` services run them on
-  every `eph up`. See
+  assigned port. Hooks run on **every** `eph up` (fresh create or restart), so
+  they should be idempotent; a failing `post-start` aborts the `up`. See
   [Core Concepts](concepts.md#the-service-lifecycle).
 - Hooks run with eph's resolved environment injected -- the same variables
   `eph env` prints, plus `EPH_*` metadata and the service's own `env.X` values.
@@ -46,7 +44,9 @@ eph up postgres redis  # just these two
 ## `eph down [--rm] [SERVICE...]`
 
 Stop services. With no arguments, stops all; with names, stops only those. Runs
-`pre-stop` hooks first.
+`pre-stop` hooks first -- a failing `pre-stop` hook aborts the `down` and leaves
+the service running so you can fix the hook and retry (see
+[The `.eph` file](eph-file.md#lifecycle-hooks)).
 
 | Flag | Description |
 |------|-------------|
@@ -60,7 +60,7 @@ eph down postgres      # stop just postgres
 
 Without `--rm`, containers and their data remain for a fast restart. With
 `--rm`, containers are removed (named-volume data is kept); the next `eph up`
-creates fresh containers and re-runs `post-start`.
+creates fresh containers.
 
 > Two exceptions. **`compose`** services are always torn down with `docker
 > compose down`, so `--rm` makes no difference for them. **`run`** services are
@@ -89,6 +89,12 @@ Workspace cleaned:
 
 > This **deletes the data** in named volumes. Bind mounts (host paths) are not
 > touched.
+
+> Like `eph down`, `clean` runs each service's `pre-stop` hooks first, and a
+> failing hook aborts the reset before anything is removed. If a broken
+> `pre-stop` hook is wedging `clean`, fix the hook (or temporarily blank the
+> `pre-stop=` line) and retry, or remove the container with `docker rm -f` and
+> delete the state directory shown by `eph info`.
 
 ## `eph status`
 

@@ -250,20 +250,21 @@ which runs an arbitrary command with these variables set.
 
 Important behavior:
 
-- For `image`/`dockerfile` services, `post-start` runs only when a container is
-  **created fresh**, not when a stopped container is restarted by a later `eph
-  up`. For `run` services it runs whenever the process is not already alive, and
-  for `compose` services it runs on **every** `eph up`. (See
-  [Core Concepts](concepts.md#the-service-lifecycle).) A failing `post-start`
+- `post-start` runs on **every** `eph up`, for every service, regardless of
+  whether the container was freshly created or an existing one was restarted.
+  Write hooks to be idempotent (a migration that no-ops when applied, an
+  `INSERT ... ON CONFLICT` seed); for one-off or destructive work use
+  [`eph run`](command-reference.md#eph-run-cmd) instead. A failing `post-start`
   aborts `eph up`.
 - `post-start` hooks run only after **every** service in the same `eph up` is
   healthy, so a hook may reference any other service's assigned port through a
   top-level variable (for example a `DATABASE_URL` that interpolates
   `${postgres.port}`).
-- `pre-stop` failures are logged but do not stop the teardown.
+- A failing `pre-stop` hook aborts the `eph down` / `eph clean` and leaves the
+  service running, so a backup or drain that fails is not silently skipped. Fix
+  the hook and retry, or blank the `pre-stop=` line to force teardown.
 
-See [Core Concepts](concepts.md#the-service-lifecycle) for exactly when each
-path is taken.
+See [Core Concepts](concepts.md#the-service-lifecycle) for the full lifecycle.
 
 ## Interpolation
 
