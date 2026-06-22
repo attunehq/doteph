@@ -1,4 +1,4 @@
-.PHONY: help format check check-fix cargo-sort precommit dev release test test-unit test-integration test-stress install install-dev clean
+.PHONY: help format check check-fix cargo-sort skills skills-check precommit dev release test test-unit test-integration test-stress install install-dev clean
 
 .DEFAULT_GOAL := help
 
@@ -8,6 +8,8 @@ help:
 	@echo "  make check            - Run clippy linter"
 	@echo "  make check-fix        - Run clippy with automatic fixes"
 	@echo "  make cargo-sort       - Sort dependencies in Cargo.toml"
+	@echo "  make skills           - Refresh the bundled agent skills in the repo"
+	@echo "  make skills-check     - Verify the checked-in skills match the binary"
 	@echo "  make precommit        - Run checks and fixes before committing"
 	@echo "  make dev              - Build in debug mode"
 	@echo "  make release          - Build in release mode"
@@ -31,7 +33,17 @@ check-fix:
 cargo-sort:
 	cargo sort
 
-precommit: check-fix format
+# Refresh the checked-in copies of the bundled agent skills from their source
+# under skills/<slug>/SKILL.md. --force so an edit to the source overwrites the
+# committed copy; precommit runs this so a source edit is reflected before commit
+# (CI's `eph skills check` fails closed otherwise).
+skills:
+	cargo run --quiet -- skills install --force
+
+skills-check:
+	cargo run --quiet -- skills check
+
+precommit: check-fix format skills
 	@echo "Ready to commit!"
 
 dev:

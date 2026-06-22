@@ -180,6 +180,66 @@ State directory: /home/you/.local/share/eph/a1b2c3d4
 Use the container prefix and short ID to find this workspace's resources with
 the `docker` CLI.
 
+## `eph skills install [--dir DIR] [--force]`
+
+Install the agent skills bundled into the `eph` binary into the repository, so a
+coding agent working in this checkout discovers how to use `eph` (drive `eph up`,
+load `eph env`, tear down). The skills are embedded in the binary, so this is
+offline and self-contained.
+
+| Flag | Description |
+|------|-------------|
+| `--dir DIR` | Skills directory to install into, relative to the repo root. Repeatable. Defaults to `.claude/skills` and `.agents/skills`. |
+| `--force` | Overwrite an existing skill file even if it was edited locally. |
+
+```sh
+eph skills install
+```
+
+```
+  created: .claude/skills/using-eph/SKILL.md
+  created: .agents/skills/using-eph/SKILL.md
+
+Commit these files so your agents discover them on checkout.
+```
+
+- The target is the **git repository root** containing the current directory (so
+  the skills land at the top of the repo regardless of where you run it); it
+  falls back to the current directory when you are not inside a git repo.
+- A file that already matches what the binary would write is reported as
+  `unchanged`. One that differs is left untouched and reported as `skipped`
+  unless you pass `--force`, so a local edit is never clobbered silently.
+- Commit the written files. Re-run `eph skills install` (or `--force`) after
+  upgrading `eph` to pull in any updated skill text.
+
+## `eph skills check [--dir DIR]`
+
+Verify the installed skills match the binary's embedded source, without changing
+anything. Prints one line per file and **exits non-zero** if any is missing or
+has drifted, so CI can run it as a drift guard.
+
+```sh
+eph skills check
+```
+
+```
+  up to date: .claude/skills/using-eph/SKILL.md
+  up to date: .agents/skills/using-eph/SKILL.md
+```
+
+The rendered skill is deterministic and version-independent, so a checked-in copy
+stays byte-stable across `eph` upgrades that do not change the skill text: this
+check goes red only on a real drift (a hand edit, or a stale install left behind
+when the skill source changed), not on every release.
+
+## `eph skills list`
+
+List the skills bundled into this `eph` binary, with the version they ship in.
+
+```sh
+eph skills list
+```
+
 ## Commands that do not exist (by design)
 
 The list above is the complete command set. A couple of things people look for

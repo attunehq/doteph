@@ -68,7 +68,9 @@ eph down               # stop when you are done
   full command reference. New here? Start with
   [Getting Started](docs/user-guide/getting-started.md).
 - **[For Agents and Scripts](docs/user-guide/for-agents.md)** - a terse quick
-  reference for AI coding agents and automation.
+  reference for AI coding agents and automation. Run `eph skills install` to drop
+  that guidance into a repo as a skill your agent discovers automatically (see the
+  [command reference](docs/user-guide/command-reference.md#eph-skills-install---dir-dir---force)).
 - **[Developer Guide](docs/developer-guide/README.md)** - architecture, building
   and testing, and a tour of the internals, for working on `eph` itself.
 - **[Contributing](CONTRIBUTING.md)** - working style, pull requests, releases.

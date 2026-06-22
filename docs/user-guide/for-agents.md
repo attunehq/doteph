@@ -48,7 +48,14 @@ DATABASE_URL=$(eph env -f json | jq -r .DATABASE_URL)
 | `eph env [-f export\|fish\|json]` | Print resolved top-level env vars (stdout). |
 | `eph check` | Validate `.eph` (no Docker). |
 | `eph info` | Workspace id / prefix / paths. |
+| `eph skills install` | Install this page as a discoverable agent skill into the repo (`.claude/skills`, `.agents/skills`). No Docker. |
+| `eph skills check` | Verify the installed skill is current (non-zero exit on drift). No Docker. |
 | `-v` / `--verbose` | Debug logging to stderr. |
+
+To persist this guidance as a skill your agent discovers automatically on every
+checkout, run `eph skills install` and commit the written files. It bundles a
+`using-eph` skill (the same material as this page) into `.claude/skills/` and
+`.agents/skills/`. Re-run it after upgrading `eph` to refresh the text.
 
 Output is on stdout; logs on stderr. Unknown service/format names are errors.
 
