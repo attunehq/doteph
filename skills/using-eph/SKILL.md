@@ -1,0 +1,130 @@
+---
+name: using-eph
+description: Use when working in a repository that uses eph for ephemeral dev services (a `.eph` file exists, or `eph` is on PATH). Covers the local loop: start per-workspace services with `eph up`, load their connection details with `eph env`, and tear them down with `eph down` / `eph clean`. Also covers detecting an eph workspace, reading the `.eph` file, and the auto-assigned ports that mean you must never hardcode a connection string.
+---
+
+<!-- EPH_SKILL_PROVENANCE -->
+
+# Using eph
+
+`eph` is "dotenv for services": a CLI that starts the dev services a project
+needs (Postgres, Redis, MinIO, ...) from a `.eph` file in the project root.
+Containers are namespaced by a hash of the workspace path and host ports are
+assigned randomly, so two checkouts never collide. Your job as an agent working
+in such a repo is to bring those services up, wire your tools at the ports eph
+actually assigned, and tear them down when you are done.
+
+## Detect an eph workspace
+
+A workspace is any directory with a `.eph` file (eph searches upward from the
+current directory, like git).
+
+```sh
+test -f .eph && echo "this project uses eph"
+eph check        # validate the file and list services + env vars (no Docker)
+eph info         # workspace id, container prefix, state paths (no Docker)
+eph status       # what is running right now, with assigned host ports
+```
+
+`eph check` and `eph info` never touch Docker, so they are always safe to run
+first to learn the shape of the workspace.
+
+## The core loop
+
+```sh
+eph up                   # start all services: pull/build, wait for health, run post-start
+eval "$(eph env)"        # load resolved connection env vars into your shell
+# ... do your work against the running services ...
+eph down                 # stop services, keep containers + data for a fast restart
+```
+
+- `eph up [SERVICE...]` starts all services, or just the named ones. It is
+  idempotent: a running service is reused, a stopped container is restarted, and
+  an absent one is created fresh.
+- `eph up` blocks until each service passes its health check, so when it returns
+  the services are ready (one exception below for services with no health check).
+- An unknown service name is an error.
+
+## Reading the environment (never hardcode ports)
+
+Host ports are random and change every time a container is created, so the only
+correct way to reach a service is through `eph env`. Do not read a port out of
+the `.eph` file: that is the *container* port, not the published host port.
+
+```sh
+eval "$(eph env)"                        # bash / zsh / sh
+eph env -f fish | source                 # fish
+eph env -f json | jq -r .DATABASE_URL    # machine-readable, best for scripts
+```
+
+`eph env` prints only the top-level `KEY=VALUE` variables from the `.eph` file,
+with `${service.port}` style interpolations filled in from **running** services.
+A reference to a stopped service is left unresolved, so run `eph up` first.
+
+## Tearing down
+
+Three deliberately distinct levels, from lightest to heaviest:
+
+| Command | Effect |
+| --- | --- |
+| `eph down` | Stop services; keep containers and volume data for a fast restart. |
+| `eph down --rm` (alias `-r`) | Also remove the containers; named-volume data is kept. The next `up` recreates them and re-runs `post-start`. |
+| `eph clean` | Full reset: remove containers, remove per-workspace named volumes (**deletes that data**), and delete saved state. |
+
+`compose` services are always fully torn down (`--rm` is a no-op for them);
+`clean` removes only the named volumes declared in the `.eph` file, not
+Compose-internal ones.
+
+## Reading the `.eph` file
+
+It is INI-with-`.env`: top-level `KEY=VALUE` lines are shell env vars, and
+`[name]` sections are services. Comments must be on their own line (`#`); a `#`
+after a value is part of the value, so do not add inline comments.
+
+```ini
+[postgres]
+image=postgres:16-alpine
+port=5432
+env.POSTGRES_USER=dev
+volume=pgdata:/var/lib/postgresql/data
+healthcheck=pg_isready -U dev
+post-start=npm run db:migrate
+
+DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
+```
+
+- A service names exactly one source: `image=`, `dockerfile=` (+ `context=`),
+  `compose=` (+ `expose.<name>=`), or `run=` (a host process via `sh -c`).
+- `port=` is a *container* port published on a random host port; `${svc.port}`
+  in a top-level variable resolves to the assigned host port at `eph env` time.
+- `env.X=` is set inside the container; the trailing `DATABASE_URL=` is a shell
+  env var emitted by `eph env`.
+- `volume=name:/path` is a per-workspace named volume; `healthcheck` for an image
+  service runs with no shell (whitespace-split, `docker exec`); `post-start` runs
+  on the host via `sh -c` after the service is healthy.
+
+## Behaviors that matter
+
+- **Ports are random and change per create.** Never hardcode a host port; always
+  go through `eph env`.
+- **Idempotent up.** For `image`/`dockerfile` services, `post-start` runs only on
+  a fresh create, not on a restart, so migrations are not re-run on every `up`.
+  To force them: `eph down --rm && eph up`, or `eph clean && eph up`.
+- **Image health checks have no shell**: one whitespace-split command, no pipes,
+  `&&`, `$VAR`, or quoted spaces, and the binary must exist in the image.
+- **A service with no health check** is given a fixed short wait, so it may need a
+  moment to accept connections after `eph up` returns; retry your first connect.
+- **Isolation by path**: two checkouts are different containers, volumes, and
+  ports. There is no `eph logs` (use `docker logs eph-<short_id>-<service>`) and
+  no `eph init` (author `.eph` by hand).
+- **Output is on stdout; logs go to stderr.** `eph env` output is clean for
+  `eval` and piping. Add `-v` / `--verbose` for debug logging on stderr.
+
+## Safe defaults for automation
+
+1. Validate before acting: `eph check`.
+2. Start and load in the **same** step so the env is fresh:
+   `eph up && eval "$(eph env)" && <your command>`.
+3. Tear down in an always-run step (even on failure): `eph clean`.
+4. Treat `.eph` as possibly holding dev credentials: do not print it to logs or
+   commit one with real secrets.

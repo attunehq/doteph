@@ -12,7 +12,15 @@ fit together. For where each decision lives in the code, see
   dispatches each subcommand to a small `cmd_*` glue function. Nothing here is
   public API.
 - `src/lib.rs` - the library crate (`eph`) that holds all reusable logic, split
-  into four modules: `parser`, `workspace`, `service`, and `env`.
+  into five modules: `parser`, `workspace`, `service`, `env`, and `skills`.
+- `src/skills.rs` / `skills/` - the agent skills bundled into the binary. Each
+  `skills/<slug>/SKILL.md` is embedded with `include_str!`; `eph skills install`
+  writes it into a consuming repo's `.claude/skills/` and `.agents/skills/`, `eph
+  skills check` fails closed when a checked-in copy has drifted from the embedded
+  source (a deterministic, version-independent lint wired into
+  `.github/workflows/ci.yml`), and `eph skills list` shows what is bundled. These
+  teach an agent to *use* `eph`, and are distinct from the repo-local Rust skills
+  under `.agents/skills/` that guide agents working *on* `eph`.
 
 Keeping the logic in a library means the behavior is unit- and doc-testable
 without going through the CLI, and the binary stays a dumb adapter.
@@ -170,6 +178,7 @@ eph status                      # show state
 eph env [-f format]             # export resolved environment
 eph check                       # validate the .eph file
 eph info                        # workspace metadata
+eph skills <install|check|list> # manage the bundled agent skills
 ```
 
 `eph env` writes shell-ready output to stdout while all logs go to stderr, so it

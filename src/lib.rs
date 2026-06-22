@@ -2,9 +2,11 @@
 //!
 //! This library holds the reusable logic behind the `eph` CLI: parsing `.eph`
 //! files ([`parser`]), resolving a workspace from the filesystem
-//! ([`workspace`]), managing Docker-backed services ([`service`]), and
-//! rendering resolved environment variables for shell `eval` ([`mod@env`]). The
-//! binary in `main.rs` is a thin clap front end over these APIs.
+//! ([`workspace`]), managing Docker-backed services ([`service`]), rendering
+//! resolved environment variables for shell `eval` ([`mod@env`]), and the agent
+//! skills bundled into the binary and installed into a consuming repo
+//! ([`skills`]). The binary in `main.rs` is a thin clap front end over these
+//! APIs.
 
 #![warn(missing_docs)]
 #![deny(clippy::correctness)]
@@ -16,6 +18,7 @@
 pub mod env;
 pub mod parser;
 pub mod service;
+pub mod skills;
 pub mod workspace;
 
 pub use env::{escape_bash, escape_fish, render, render_export, render_fish, render_json};

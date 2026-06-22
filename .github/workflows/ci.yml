@@ -26,6 +26,15 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # The agent skills bundled in the binary (`eph skills install`) are
+      # committed under `.claude/skills/` and `.agents/skills/`. This fails the
+      # build if a change edits a skill's source without re-running the install,
+      # so the checked-in copies never drift from `skills/<slug>/SKILL.md`. It is
+      # a deterministic, content-only lint (no Docker), so it lives in the lint
+      # job rather than the Docker-backed test job.
+      - name: Bundled skills are in sync
+        run: cargo run --quiet -- skills check
+
   test:
     name: Build and test (with Docker)
     runs-on: ubuntu-latest

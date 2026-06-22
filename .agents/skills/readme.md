@@ -4,6 +4,14 @@ This directory vendors the Rust guidance used when writing, reviewing, or
 refactoring `eph` (the `doteph` repo). It was copied from the Homeport repo's
 `.agents/skills/` set.
 
+> **`using-eph/` is different.** That skill is generated, not vendored: it is
+> bundled into the `eph` binary and written here by `eph skills install`, and it
+> teaches an agent to *use* `eph`, not to work *on* it. Do not hand-edit it; edit
+> `skills/using-eph/SKILL.md` at the repo root and re-run `eph skills install`.
+> CI (`eph skills check`) fails if the checked-in copy drifts from the source.
+> Everything else in this directory is the repo-local Rust guidance described
+> below.
+
 - `rust-skills/`: installed from `leonardomso/rust-skills` at commit
   `89910e8585331dabbecd400ae132b4070ecf24af` (179 rules, MIT licensed).
 - `rust100k-*`: skills derived from Matklad's Rust100k article index at
