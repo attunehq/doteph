@@ -1,6 +1,6 @@
 //! Service management - starting, stopping, and managing Docker containers
 
-use crate::parser::{EphFile, Service, ServiceSource};
+use crate::parser::{EphFile, PortMapping, Service, ServiceSource};
 use crate::workspace::Workspace;
 use anyhow::{Context, Result, bail};
 use bollard::Docker;
@@ -148,6 +148,32 @@ pub(crate) struct ContainerInfo {
     pub(crate) id: String,
     pub(crate) is_running: bool,
     pub(crate) ports: HashMap<String, u16>,
+}
+
+/// Re-key raw container port bindings by their declared names.
+///
+/// `get_container` exposes host ports keyed by the container-port number (e.g.
+/// `"9000"`) plus a positional `"default"`. This maps those onto the
+/// user-facing names from the `.eph` file (`api`, `console`) so that
+/// `${svc.port.<name>}` interpolation resolves. Ports with no declared name
+/// fall back to `"default"`, matching the fresh-create path.
+///
+/// Used by both the create path (`run_image`) and the restart path
+/// (`start_service`), so a container that is merely restarted rather than
+/// recreated keeps its named ports.
+fn map_named_ports(declared: &[PortMapping], raw: &HashMap<String, u16>) -> HashMap<String, u16> {
+    let mut named = HashMap::new();
+    for port_mapping in declared {
+        let key = port_mapping.container_port.to_string();
+        if let Some(&host_port) = raw.get(&key) {
+            let name = port_mapping
+                .name
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            named.insert(name, host_port);
+        }
+    }
+    named
 }
 
 /// Docker client wrapper
@@ -478,17 +504,7 @@ impl DockerClient {
             .context("container disappeared after creation")?;
 
         // Map port names
-        let mut named_ports = HashMap::new();
-        for port_mapping in &service.ports {
-            let key = port_mapping.container_port.to_string();
-            if let Some(&host_port) = info.ports.get(&key) {
-                let name = port_mapping
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| "default".to_string());
-                named_ports.insert(name, host_port);
-            }
-        }
+        let named_ports = map_named_ports(&service.ports, &info.ports);
 
         Ok(RunningService {
             name: service.name.clone(),
@@ -676,18 +692,22 @@ impl ServiceManager {
         {
             if existing.is_running {
                 info!("Service {} already running", name);
+                // Re-map declared port names onto the raw host ports, exactly as
+                // the fresh-create path does, so named-port interpolation keeps
+                // resolving across an `eph up` on an already-running container.
+                let named_ports = map_named_ports(&service.ports, &existing.ports);
                 // Record in state even for already-running containers
                 self.state.services.insert(
                     name.to_string(),
                     ServiceStateEntry {
                         container_id: existing.id.clone(),
-                        ports: existing.ports.clone(),
+                        ports: named_ports.clone(),
                     },
                 );
                 return Ok(RunningService {
                     name: name.to_string(),
                     container_id: existing.id,
-                    ports: existing.ports,
+                    ports: named_ports,
                 });
             } else {
                 // Container exists but not running, start it
@@ -702,19 +722,25 @@ impl ServiceManager {
                 // Wait for health check
                 self.wait_for_healthy(name, service, &refreshed.id).await?;
 
+                // Re-map declared port names onto the refreshed host ports. The
+                // restart path otherwise records raw container-port-number keys
+                // (e.g. "9000"), which breaks `${svc.port.<name>}` after a
+                // down/up cycle. Mirrors the fresh-create path.
+                let named_ports = map_named_ports(&service.ports, &refreshed.ports);
+
                 // Record in state
                 self.state.services.insert(
                     name.to_string(),
                     ServiceStateEntry {
                         container_id: refreshed.id.clone(),
-                        ports: refreshed.ports.clone(),
+                        ports: named_ports.clone(),
                     },
                 );
 
                 return Ok(RunningService {
                     name: name.to_string(),
                     container_id: refreshed.id,
-                    ports: refreshed.ports,
+                    ports: named_ports,
                 });
             }
         }
@@ -1309,5 +1335,81 @@ impl ServiceManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn port(name: Option<&str>, container_port: u16) -> PortMapping {
+        PortMapping {
+            name: name.map(str::to_string),
+            container_port,
+        }
+    }
+
+    /// Raw bindings as produced by `get_container`: keyed by container-port
+    /// number, plus a positional `"default"`.
+    fn raw(pairs: &[(&str, u16)]) -> HashMap<String, u16> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect()
+    }
+
+    #[test]
+    fn maps_declared_names_onto_host_ports() {
+        let declared = vec![port(Some("api"), 9000), port(Some("console"), 9001)];
+        let raw = raw(&[("9000", 32790), ("9001", 32791), ("default", 32790)]);
+
+        let mapped = map_named_ports(&declared, &raw);
+
+        assert_eq!(mapped.get("api"), Some(&32790));
+        assert_eq!(mapped.get("console"), Some(&32791));
+        // Raw container-port-number keys are dropped; only declared names remain.
+        assert_eq!(mapped.get("9000"), None);
+        assert_eq!(mapped.len(), 2);
+    }
+
+    #[test]
+    fn unnamed_port_falls_back_to_default() {
+        let declared = vec![port(None, 5432)];
+        let raw = raw(&[("5432", 49153), ("default", 49153)]);
+
+        let mapped = map_named_ports(&declared, &raw);
+
+        assert_eq!(mapped.get("default"), Some(&49153));
+        assert_eq!(mapped.len(), 1);
+    }
+
+    /// Regression for #14: re-keying the raw bindings reproduces the same map on
+    /// the restart path that the fresh-create path produced, so a down/up cycle
+    /// does not lose named ports.
+    #[test]
+    fn restart_remapping_matches_fresh_create() {
+        let declared = vec![port(Some("api"), 9000), port(Some("console"), 9001)];
+        // Fresh create and a later restart can land on different host ports, but
+        // both go through the same name mapping. The keys must stay stable.
+        let fresh = map_named_ports(&declared, &raw(&[("9000", 32790), ("9001", 32791)]));
+        let restarted = map_named_ports(&declared, &raw(&[("9000", 40000), ("9001", 40001)]));
+
+        let mut fresh_keys: Vec<_> = fresh.keys().cloned().collect();
+        let mut restarted_keys: Vec<_> = restarted.keys().cloned().collect();
+        fresh_keys.sort();
+        restarted_keys.sort();
+        assert_eq!(fresh_keys, vec!["api".to_string(), "console".to_string()]);
+        assert_eq!(fresh_keys, restarted_keys);
+    }
+
+    #[test]
+    fn declared_port_absent_from_bindings_is_skipped() {
+        let declared = vec![port(Some("api"), 9000), port(Some("metrics"), 9999)];
+        // The container never published 9999.
+        let mapped = map_named_ports(&declared, &raw(&[("9000", 32790)]));
+
+        assert_eq!(mapped.get("api"), Some(&32790));
+        assert_eq!(mapped.get("metrics"), None);
+        assert_eq!(mapped.len(), 1);
     }
 }
