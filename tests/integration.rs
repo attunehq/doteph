@@ -678,7 +678,10 @@ REDIS_URL=redis://localhost:${redis.port}
 
     let captured = std::fs::read_to_string(ws.path().join("pre-stop-env"))
         .expect("pre-stop hook did not write pre-stop-env");
-    assert_eq!(captured, redis_url, "pre-stop hook saw a different REDIS_URL");
+    assert_eq!(
+        captured, redis_url,
+        "pre-stop hook saw a different REDIS_URL"
+    );
 }
 
 // ============================================================================
