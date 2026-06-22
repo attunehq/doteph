@@ -100,8 +100,56 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 - `env.X=` is set inside the container; the trailing `DATABASE_URL=` is a shell
   env var emitted by `eph env`.
 - `volume=name:/path` is a per-workspace named volume; `healthcheck` for an image
-  service runs with no shell (whitespace-split, `docker exec`); `post-start` runs
-  on the host via `sh -c` after the service is healthy.
+  service runs with no shell (whitespace-split, `docker exec`); `post-start` and
+  `pre-stop` run on the host via `sh -c` (after the service is healthy / before
+  it is stopped) with eph's resolved environment injected (see below).
+
+## Lifecycle hooks see eph's environment
+
+`post-start` and `pre-stop` hooks run with the same variables `eph env` emits
+already in their environment, so a database migration just works:
+
+```ini
+[postgres]
+image=postgres:16-alpine
+port=5432
+env.POSTGRES_USER=dev
+healthcheck=pg_isready -U dev
+post-start=psql "$DATABASE_URL" -f schema.sql   # DATABASE_URL is already set
+
+DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
+```
+
+Each hook receives, layered in this order (later wins):
+
+1. the resolved top-level `.eph` variables (exactly what `eph env` prints),
+2. `EPH_*` metadata: `EPH_WORKSPACE_ID`, `EPH_WORKSPACE_ROOT`,
+   `EPH_CONTAINER_PREFIX`, and per service `EPH_<SERVICE>_HOST`,
+   `EPH_<SERVICE>_PORT`, `EPH_<SERVICE>_PORT_<NAME>` (for named ports),
+   `EPH_<SERVICE>_CONTAINER` (service names upper-cased, `-` -> `_`),
+3. the owning service's own `env.X=` values.
+
+`post-start` hooks run only after **every** service in the `up` is healthy, so a
+hook may reference any other service's port (`${redis.port}` resolves even if
+redis started after the service whose hook needs it).
+
+## Running one-off commands with the environment: `eph run`
+
+`eph run <cmd>...` runs a command in the workspace root with the resolved
+environment (the `eph env` variables plus the `EPH_*` metadata) already set, so
+you do not have to `eval "$(eph env)"` first:
+
+```sh
+eph run psql "$DATABASE_URL"        # NOTE: $DATABASE_URL is expanded by YOUR shell
+eph run ./scripts/seed.sh           # the script sees DATABASE_URL, EPH_* itself
+eph run sh -c 'psql "$DATABASE_URL" < dump.sql'   # use sh -c for shell features
+```
+
+The command is executed directly, not through a shell, so eph does not expand
+`$VAR` in the arguments; wrap it in `sh -c '...'` when you need shell expansion
+of eph's injected variables, piping, or globbing. `eph run` exits with the
+command's own exit code. Use it for repeatable operations (seeding, resets,
+ad-hoc queries) -- unlike `post-start`, it runs every time you invoke it.
 
 ## Behaviors that matter
 

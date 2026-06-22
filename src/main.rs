@@ -16,7 +16,6 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eph::parser::{self, EphFile, ServiceSource};
 use eph::{ServiceManager, Workspace, skills};
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitCode};
@@ -67,6 +66,24 @@ enum Commands {
         /// Output format: export (default), fish, json
         #[arg(short, long, default_value = "export")]
         format: String,
+    },
+
+    /// Run a command with eph's resolved environment.
+    ///
+    /// The command runs in the workspace root with the same connection
+    /// variables `eph env` emits, plus `EPH_*` metadata, so you can do
+    /// `eph run psql "$DATABASE_URL"` or `eph run ./scripts/seed.sh` without
+    /// `eval`-ing anything first. The command is executed directly, not through
+    /// a shell; use `eph run sh -c '...'` if you need shell features.
+    Run {
+        /// The command and its arguments.
+        #[arg(
+            value_name = "CMD",
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        command: Vec<String>,
     },
 
     /// Parse and validate .eph file
@@ -135,6 +152,7 @@ async fn main() -> Result<ExitCode> {
         Commands::Clean => cmd_clean().await.map(|()| ExitCode::SUCCESS),
         Commands::Status => cmd_status().await.map(|()| ExitCode::SUCCESS),
         Commands::Env { format } => cmd_env(&format).await.map(|()| ExitCode::SUCCESS),
+        Commands::Run { command } => cmd_run(command).await,
         Commands::Check => cmd_check().await.map(|()| ExitCode::SUCCESS),
         Commands::Info => cmd_info().await.map(|()| ExitCode::SUCCESS),
         // Skills commands are synchronous filesystem work; they do not touch
@@ -163,22 +181,7 @@ async fn cmd_up(service_filter: Vec<String>) -> Result<()> {
 
     let mut manager = ServiceManager::new(workspace).await?;
 
-    let running = if service_filter.is_empty() {
-        manager.start_all(&eph).await?
-    } else {
-        let mut running = HashMap::new();
-        for name in &service_filter {
-            let service = eph
-                .services
-                .get(name)
-                .with_context(|| format!("unknown service: {}", name))?;
-            let result = manager.start_service(name, service).await?;
-            running.insert(name.clone(), result);
-        }
-        // Save state after starting individual services
-        manager.save_state().await?;
-        running
-    };
+    let running = manager.start_services(&eph, &service_filter).await?;
 
     // Print summary
     println!();
@@ -210,12 +213,17 @@ async fn cmd_down(service_filter: Vec<String>, rm: bool) -> Result<()> {
         manager.stop_all(&eph, rm).await?;
         println!("All services {}", action);
     } else {
+        // Snapshot running services once so pre-stop hooks see the full
+        // environment as it was before teardown began.
+        let running = manager.status().await?;
         for name in &service_filter {
             let service = eph
                 .services
                 .get(name)
                 .with_context(|| format!("unknown service: {}", name))?;
-            manager.stop_service(name, service, rm).await?;
+            manager
+                .stop_service(name, service, rm, &eph, &running)
+                .await?;
             println!("{} {}", if rm { "Removed" } else { "Stopped" }, name);
         }
     }
@@ -301,32 +309,45 @@ async fn cmd_env(format: &str) -> Result<()> {
     let manager = ServiceManager::new(workspace).await?;
     let running = manager.status().await?;
 
-    // Build resolver for interpolation
-    let resolver = |service: &str, property: &str| -> Option<String> {
-        let svc = running.get(service)?;
-        match property {
-            "host" => Some(svc.host().to_string()),
-            "port" => svc.port().map(|p| p.to_string()),
-            prop if prop.starts_with("port.") => {
-                let name = &prop[5..];
-                svc.named_port(name).map(|p| p.to_string())
-            }
-            _ => None,
-        }
-    };
-
-    // Collect resolved environment variables
-    let mut env_vars: Vec<(String, String)> = Vec::new();
-
-    for var in &eph.env_vars {
-        let resolved = parser::resolve_interpolations(&var.value, resolver);
-        env_vars.push((var.name.clone(), resolved));
-    }
+    // The resolved KEY=VALUE pairs, shared with the lifecycle-hook and `eph run`
+    // machinery so a developer's shell and a post-start hook see the same env.
+    let env_vars = eph::resolve_env_vars(&eph, &running);
 
     // Render in the requested format
     print!("{}", eph::render(&env_vars, format)?);
 
     Ok(())
+}
+
+/// Run an arbitrary command with eph's resolved environment overlaid on the
+/// current process environment, returning the command's own exit code.
+async fn cmd_run(command: Vec<String>) -> Result<ExitCode> {
+    let workspace = Workspace::find_from_cwd()?;
+    let workspace_root = workspace.path.clone();
+    let eph = load_eph_file(&workspace)?;
+
+    let manager = ServiceManager::new(workspace).await?;
+    let running = manager.status().await?;
+    let env = manager.command_env(&eph, &running);
+
+    // `required = true` on the arg guarantees a non-empty vector.
+    let (program, rest) = command
+        .split_first()
+        .expect("clap guarantees at least one argument");
+
+    // Inherit eph's stdio so the command is fully interactive, and run it from
+    // the workspace root so relative paths resolve the way hooks do.
+    let status = StdCommand::new(program)
+        .args(rest)
+        .current_dir(&workspace_root)
+        .envs(env)
+        .status()
+        .with_context(|| format!("failed to run command: {}", program))?;
+
+    // Propagate the child's exit code. A process killed by a signal has no
+    // code; report the conventional 128 + signal-style failure as 1.
+    let code = status.code().unwrap_or(1);
+    Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
 }
 
 async fn cmd_check() -> Result<()> {

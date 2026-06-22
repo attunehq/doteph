@@ -222,11 +222,31 @@ repeatable and run in order:
 ```ini
 [postgres]
 image=postgres:16-alpine
+env.POSTGRES_USER=dev
 healthcheck=pg_isready -U dev
-post-start=npm run db:migrate
-post-start=npm run db:seed
+post-start=psql "$DATABASE_URL" -f schema.sql
 pre-stop=./scripts/backup.sh
+
+DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 ```
+
+### Hook environment
+
+Hooks run with eph's resolved environment injected, layered in this order (later
+entries win where names collide):
+
+1. the resolved top-level `.eph` variables -- exactly what `eph env` prints, with
+   `${service.port}` filled in (so `$DATABASE_URL` above is already set);
+2. `EPH_*` metadata variables:
+   - `EPH_WORKSPACE_ID`, `EPH_WORKSPACE_ROOT`, `EPH_CONTAINER_PREFIX`;
+   - per service `EPH_<SERVICE>_HOST`, `EPH_<SERVICE>_PORT`,
+     `EPH_<SERVICE>_PORT_<NAME>` (for named ports), and `EPH_<SERVICE>_CONTAINER`.
+     Service names are upper-cased with `-` replaced by `_`, so `auth-db` becomes
+     `EPH_AUTH_DB_PORT`;
+3. the owning service's own `env.X=` values.
+
+The same environment is available outside hooks via [`eph run`](command-reference.md#eph-run-cmd),
+which runs an arbitrary command with these variables set.
 
 Important behavior:
 
@@ -236,6 +256,10 @@ Important behavior:
   for `compose` services it runs on **every** `eph up`. (See
   [Core Concepts](concepts.md#the-service-lifecycle).) A failing `post-start`
   aborts `eph up`.
+- `post-start` hooks run only after **every** service in the same `eph up` is
+  healthy, so a hook may reference any other service's assigned port through a
+  top-level variable (for example a `DATABASE_URL` that interpolates
+  `${postgres.port}`).
 - `pre-stop` failures are logged but do not stop the teardown.
 
 See [Core Concepts](concepts.md#the-service-lifecycle) for exactly when each

@@ -127,12 +127,19 @@ Starting a service is **idempotent** and has three paths:
    restarted. This is fast, and it reuses the existing data. **`post-start`
    hooks do *not* run again** on this path.
 3. **Not present** -> a fresh container is created, the image pulled or built if
-   needed, the health check awaited, and then **`post-start` hooks run**.
+   needed, and the health check awaited. **`post-start` hooks run only once
+   every service in the same `eph up` is healthy** -- a second phase after all
+   the start paths above complete. Deferring hooks this way means a hook can
+   reference any other service's assigned port (for example a migration whose
+   `DATABASE_URL` interpolates `${postgres.port}`), and hooks run with eph's
+   resolved environment injected (see
+   [The `.eph` file](eph-file.md#hook-environment)).
 
 That second point is the one that surprises people: migrations or seed scripts
 in `post-start` run when the container is *created*, not every time you `up`. To
 force them to run again, recreate the container with `eph down --rm` (then `eph
-up`) or `eph clean`. See
+up`) or `eph clean`, or run the script directly with
+[`eph run`](command-reference.md#eph-run-cmd). See
 [Troubleshooting](troubleshooting.md#post-start-hooks-did-not-run-again).
 
 This lifecycle (paths 1-3 above) applies to `image` and `dockerfile` services.

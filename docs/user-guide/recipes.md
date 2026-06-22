@@ -68,10 +68,11 @@ See [Defining Services](services.md#compose---delegate-to-docker-compose).
 
 ## Seeding a database
 
-Two approaches:
+Three approaches:
 
 **Post-start hook** - runs your project's own migrate/seed commands on the host
-after the container is healthy:
+after the container is healthy. The hook already has eph's resolved environment,
+so `$DATABASE_URL` is set without any `eval`:
 
 ```ini
 [postgres]
@@ -83,11 +84,26 @@ env.POSTGRES_DB=myapp
 healthcheck=pg_isready -U dev
 post-start=npm run db:migrate
 post-start=npm run db:seed
+
+DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 ```
 
 Remember `post-start` runs when the container is **created**, not on every `up`.
 To re-run from scratch: `eph down --rm && eph up`, or `eph clean && eph up`. See
 [Troubleshooting](troubleshooting.md#post-start-hooks-did-not-run-again).
+
+**On demand with `eph run`** - for a re-seed you can repeat any time, skip the
+hook and run the command directly. It gets the same environment (`$DATABASE_URL`,
+`EPH_*`) as a `post-start` hook would:
+
+```sh
+eph run npm run db:migrate
+eph run npm run db:seed
+eph run psql "$DATABASE_URL" -f fixtures.sql   # $DATABASE_URL from your shell
+```
+
+Unlike `post-start`, this runs every time you invoke it, so it is the simplest
+way to reset data without recreating the container.
 
 **Init scripts via bind mount** - the official Postgres/MySQL images run any
 `*.sql`/`*.sh` in `/docker-entrypoint-initdb.d` on first initialization of the
