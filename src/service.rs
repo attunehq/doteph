@@ -1292,7 +1292,12 @@ impl ServiceManager {
         // (before the service is stopped), mirroring how a failing post-start
         // aborts `eph up`: if the pre-stop backup/drain did not succeed, you
         // almost certainly do not want the data to go away underneath it.
-        if !skip_hooks && !service.pre_stop.is_empty() {
+        //
+        // Only run them for a service that is actually running: `stop_all`
+        // iterates every service in the `.eph` file, so without this gate a
+        // never-started or already-stopped service's pre-stop hook would run
+        // (and, being fatal, could break `eph down` for an unrelated service).
+        if !skip_hooks && running.contains_key(name) && !service.pre_stop.is_empty() {
             info!("Running pre-stop hooks for {}", name);
             let env = self.hook_env(eph, running, service);
             for cmd in &service.pre_stop {

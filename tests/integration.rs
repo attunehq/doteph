@@ -602,6 +602,38 @@ pre-stop=true
     ws.eph_ok(&["down"]).await;
 }
 
+/// A failing `pre-stop` hook on a service that is **not running** must not break
+/// `eph down`. `stop_all` iterates every service in the `.eph` file, so the hook
+/// of a never-started service must be skipped rather than run (and fail).
+#[tokio::test]
+async fn pre_stop_skipped_for_non_running_service() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+
+[never_started]
+image=redis:7-alpine
+port=6379
+pre-stop=exit 1
+"#,
+    );
+
+    // Bring up only redis; `never_started` stays down with its failing hook.
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    // A full `eph down` iterates every service but must not run the stopped
+    // service's pre-stop hook, so it succeeds.
+    let out = ws.eph(&["down"]).await;
+    assert!(
+        out.status.success(),
+        "down should not run pre-stop for a non-running service: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A targeted `eph down <service>` persists state, so the stopped service is
 /// dropped from `state.json` immediately rather than lingering until the next
 /// `eph status` reconciles it.
