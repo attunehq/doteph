@@ -1352,10 +1352,7 @@ mod tests {
     /// Raw bindings as produced by `get_container`: keyed by container-port
     /// number, plus a positional `"default"`.
     fn raw(pairs: &[(&str, u16)]) -> HashMap<String, u16> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), *v))
-            .collect()
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
 
     #[test]
