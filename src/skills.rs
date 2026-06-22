@@ -17,9 +17,9 @@
 //! `check` serve as a CI drift guard rather than going red on every release.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// The marker line a bundled skill carries just below its front matter.
 /// [`BundledSkill::render`] replaces it with a static provenance comment marking
@@ -99,6 +99,36 @@ pub struct InstallOutcome {
     pub status: Installed,
 }
 
+/// Reject any skill directory that would escape `root`.
+///
+/// Skill directories are documented as repository-relative, and both [`install`]
+/// and [`check`] resolve them with `root.join(dir)`. A `join` silently lets an
+/// absolute path replace `root` entirely, and `..` components walk above it, so
+/// `--dir ../other` or `--dir /etc` would write or read outside the checkout.
+/// Confine every directory to `root` up front so a stray `--dir` cannot.
+///
+/// # Errors
+///
+/// Returns an error naming the first directory that is absolute or contains a
+/// parent-directory (`..`) component.
+fn confine_to_root(dirs: &[PathBuf]) -> Result<()> {
+    for dir in dirs {
+        if dir.is_absolute() {
+            bail!(
+                "skill directory {} must be relative to the repository root, not absolute",
+                dir.display()
+            );
+        }
+        if dir.components().any(|c| c == Component::ParentDir) {
+            bail!(
+                "skill directory {} must stay within the repository root (no `..` components)",
+                dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Write every bundled skill into each of `dirs` (resolved against `root`).
 ///
 /// An existing file that already matches is left as [`Installed::Unchanged`]. One
@@ -108,9 +138,11 @@ pub struct InstallOutcome {
 ///
 /// # Errors
 ///
-/// Returns an error if a directory cannot be created or a file cannot be read or
-/// written.
+/// Returns an error if a directory is absolute or escapes `root` (see
+/// [`confine_to_root`]), or if a directory cannot be created or a file cannot be
+/// read or written.
 pub fn install(root: &Path, dirs: &[PathBuf], force: bool) -> Result<Vec<InstallOutcome>> {
+    confine_to_root(dirs)?;
     let mut outcomes = Vec::new();
     for skill in BUNDLED {
         let rendered = skill.render();
@@ -170,8 +202,10 @@ pub struct CheckOutcome {
 ///
 /// # Errors
 ///
-/// Returns an error if a skill file exists but cannot be read.
+/// Returns an error if a directory is absolute or escapes `root` (see
+/// [`confine_to_root`]), or if a skill file exists but cannot be read.
 pub fn check(root: &Path, dirs: &[PathBuf]) -> Result<Vec<CheckOutcome>> {
+    confine_to_root(dirs)?;
     let mut outcomes = Vec::new();
     for skill in BUNDLED {
         let rendered = skill.render();
@@ -271,6 +305,41 @@ mod tests {
         let forced_status = forced.iter().find(|o| o.path == edited).unwrap().status;
         assert_eq!(forced_status, Installed::Updated);
         assert_eq!(fs::read_to_string(&edited).unwrap(), BUNDLED[0].render());
+    }
+
+    #[test]
+    fn dirs_that_escape_the_root_are_rejected_before_touching_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // A parent-directory traversal and an absolute path both escape `root`;
+        // install and check must refuse both rather than write/read outside it.
+        for escaping in [PathBuf::from("../other"), PathBuf::from("nested/../..")] {
+            let dirs = [escaping.clone()];
+            assert!(
+                install(root, &dirs, true).is_err(),
+                "install should reject {}",
+                escaping.display()
+            );
+            assert!(
+                check(root, &dirs).is_err(),
+                "check should reject {}",
+                escaping.display()
+            );
+            // Nothing was written above the root.
+            assert!(!root.join("../other/using-eph/SKILL.md").exists());
+        }
+
+        // An absolute path would let `join` discard `root` entirely.
+        let absolute = [root.join("abs-target")];
+        assert!(install(root, &absolute, true).is_err());
+        assert!(check(root, &absolute).is_err());
+        assert!(!root.join("abs-target/using-eph/SKILL.md").exists());
+
+        // A plain nested relative dir stays within the root and is accepted.
+        let ok = [PathBuf::from("vendor/skills")];
+        assert!(install(root, &ok, false).is_ok());
+        assert!(root.join("vendor/skills/using-eph/SKILL.md").exists());
     }
 
     #[test]
