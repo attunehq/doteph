@@ -602,6 +602,53 @@ pre-stop=true
     ws.eph_ok(&["down"]).await;
 }
 
+/// A targeted `eph down <service>` persists state, so the stopped service is
+/// dropped from `state.json` immediately rather than lingering until the next
+/// `eph status` reconciles it.
+#[tokio::test]
+async fn targeted_down_persists_state() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+
+[cache]
+image=redis:7-alpine
+port=6379
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    // Locate state.json via `eph info`.
+    let info = ws.eph_ok(&["info"]).await;
+    let state_dir = info
+        .lines()
+        .find_map(|l| l.strip_prefix("State directory: "))
+        .expect("info should print the state directory");
+    let state_path = std::path::Path::new(state_dir.trim()).join("state.json");
+
+    let before = std::fs::read_to_string(&state_path).expect("state.json should exist after up");
+    assert!(before.contains("redis") && before.contains("cache"));
+
+    // Stop just one service.
+    ws.eph_ok(&["down", "redis"]).await;
+
+    let after = std::fs::read_to_string(&state_path).expect("state.json should still exist");
+    assert!(
+        !after.contains("redis"),
+        "redis should be gone from state.json after a targeted down: {after}"
+    );
+    assert!(
+        after.contains("cache"),
+        "cache should remain in state.json: {after}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
 /// A pre-stop hook should receive the same resolved environment as post-start.
 #[tokio::test]
 async fn pre_stop_hook_receives_resolved_env() {

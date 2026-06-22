@@ -71,11 +71,9 @@ creates fresh containers.
 
 > Two exceptions. **`compose`** services are always torn down with `docker
 > compose down`, so `--rm` makes no difference for them. **`run`** services are
-> always killed (there is no container to keep). Also note that a *targeted*
-> `eph down <service>` updates only in-memory state - it does not rewrite
-> `state.json` (only `eph down` with no arguments does); the leftover entry is
-> harmlessly reconciled away by `eph status`. (The container itself is still only
-> removed when you pass `--rm`.)
+> always killed (there is no container to keep). A *targeted* `eph down <service>`
+> persists the updated state, so the stopped services drop out of `state.json`
+> immediately. (The container itself is still only removed when you pass `--rm`.)
 
 ## `eph clean`
 

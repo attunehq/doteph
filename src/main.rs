@@ -251,6 +251,10 @@ async fn cmd_down(service_filter: Vec<String>, rm: bool, skip_hooks: bool) -> Re
                 .await?;
             println!("{} {}", if rm { "Removed" } else { "Stopped" }, name);
         }
+        // Persist so the stopped services are dropped from state.json, not just
+        // from the in-memory copy. stop_all already saves; a targeted down must
+        // too, or the file keeps stale entries until the next `eph status`.
+        manager.save_state().await?;
     }
 
     Ok(())

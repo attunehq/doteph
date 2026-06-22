@@ -56,7 +56,7 @@ pub struct BundledSkill {
 
 impl BundledSkill {
     /// The skill file as it should appear on disk, with the provenance marker
-    /// replaced by the [`PROVENANCE`] comment. The output is deterministic and
+    /// replaced by the `PROVENANCE` comment. The output is deterministic and
     /// version-independent, so a checked-in copy stays byte-stable across `eph`
     /// upgrades that do not change the skill text. That is precisely what lets
     /// [`check`] run as a CI drift guard without going red on every release.
@@ -139,7 +139,7 @@ fn confine_to_root(dirs: &[PathBuf]) -> Result<()> {
 /// # Errors
 ///
 /// Returns an error if a directory is absolute or escapes `root` (see
-/// [`confine_to_root`]), or if a directory cannot be created or a file cannot be
+/// `confine_to_root`), or if a directory cannot be created or a file cannot be
 /// read or written.
 pub fn install(root: &Path, dirs: &[PathBuf], force: bool) -> Result<Vec<InstallOutcome>> {
     confine_to_root(dirs)?;
@@ -203,7 +203,7 @@ pub struct CheckOutcome {
 /// # Errors
 ///
 /// Returns an error if a directory is absolute or escapes `root` (see
-/// [`confine_to_root`]), or if a skill file exists but cannot be read.
+/// `confine_to_root`), or if a skill file exists but cannot be read.
 pub fn check(root: &Path, dirs: &[PathBuf]) -> Result<Vec<CheckOutcome>> {
     confine_to_root(dirs)?;
     let mut outcomes = Vec::new();

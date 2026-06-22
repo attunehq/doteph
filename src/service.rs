@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 
 /// Runtime information about a running service.
 ///
-/// Returned by [`ServiceManager::start_service`] and friends, and queried for
+/// Returned by [`ServiceManager::start_services`] and friends, and queried for
 /// connection details via [`host`](Self::host), [`port`](Self::port), and
 /// [`named_port`](Self::named_port) when expanding interpolations.
 #[derive(Debug, Clone)]
