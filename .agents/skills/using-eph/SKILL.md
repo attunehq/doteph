@@ -140,6 +140,11 @@ be idempotent (a migration that no-ops when already applied, an
 `INSERT ... ON CONFLICT` seed). For one-off, non-idempotent work, use `eph run`
 instead.
 
+Pass `--skip-hooks` to skip hooks for one invocation: `eph up --skip-hooks`
+starts services without `post-start`; `eph down --skip-hooks` /
+`eph clean --skip-hooks` tear down without `pre-stop` (the escape hatch when a
+broken `pre-stop` hook is wedging teardown).
+
 ## Running one-off commands with the environment: `eph run`
 
 `eph run <cmd>...` runs a command in the workspace root with the resolved

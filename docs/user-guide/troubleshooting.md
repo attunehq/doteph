@@ -99,10 +99,8 @@ so the hook (a backup, a drain) can be fixed and retried rather than silently
 skipped. If a broken `pre-stop` is wedging teardown:
 
 - Fix the hook and re-run `eph down` / `eph clean`.
-- Or temporarily blank the `pre-stop=` line in `.eph`, then tear down.
-- Or remove the container directly with `docker rm -f <container>` (names are
-  `eph-<short_id>-<service>`; see `eph info`) and delete the state directory
-  shown by `eph info`.
+- Or skip the hooks for this teardown: `eph down --skip-hooks` /
+  `eph clean --skip-hooks`.
 
 ## A port reference did not resolve
 

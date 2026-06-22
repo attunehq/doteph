@@ -22,9 +22,14 @@ Logging always goes to **stderr**; command output goes to **stdout**.
 Start services. With no arguments, starts all services in the `.eph` file. With
 service names, starts only those.
 
+| Flag | Description |
+|------|-------------|
+| `--skip-hooks` | Bring services up healthy but do not run their `post-start` hooks. |
+
 ```sh
 eph up                 # all services
 eph up postgres redis  # just these two
+eph up --skip-hooks    # start everything but skip post-start (e.g. migrations)
 ```
 
 - Idempotent: a running service is reused; a stopped-but-present container is
@@ -51,11 +56,13 @@ the service running so you can fix the hook and retry (see
 | Flag | Description |
 |------|-------------|
 | `-r`, `--rm` | Also remove the stopped containers (not just stop them). |
+| `--skip-hooks` | Stop without running `pre-stop` hooks (escape hatch for a broken hook). |
 
 ```sh
 eph down               # stop all, keep containers
 eph down --rm          # stop all and remove containers
 eph down postgres      # stop just postgres
+eph down --skip-hooks  # stop without running pre-stop hooks
 ```
 
 Without `--rm`, containers and their data remain for a fast restart. With
@@ -76,8 +83,13 @@ Full reset for the workspace. Stops and removes every service's container (or
 Compose project / process), removes every **per-workspace named volume**, and
 deletes the persisted state file.
 
+| Flag | Description |
+|------|-------------|
+| `--skip-hooks` | Tear everything down without running `pre-stop` hooks. |
+
 ```sh
 eph clean
+eph clean --skip-hooks   # reset even if a pre-stop hook is broken
 ```
 
 ```
@@ -92,9 +104,7 @@ Workspace cleaned:
 
 > Like `eph down`, `clean` runs each service's `pre-stop` hooks first, and a
 > failing hook aborts the reset before anything is removed. If a broken
-> `pre-stop` hook is wedging `clean`, fix the hook (or temporarily blank the
-> `pre-stop=` line) and retry, or remove the container with `docker rm -f` and
-> delete the state directory shown by `eph info`.
+> `pre-stop` hook is wedging `clean`, pass `--skip-hooks` to reset anyway.
 
 ## `eph status`
 

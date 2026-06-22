@@ -699,7 +699,7 @@ impl ServiceManager {
     /// Returns an error if any service fails to start or if state cannot be
     /// saved.
     pub async fn start_all(&mut self, eph: &EphFile) -> Result<HashMap<String, RunningService>> {
-        self.start_services(eph, &[]).await
+        self.start_services(eph, &[], false).await
     }
 
     /// Start the requested services (or all of them when `filter` is empty),
@@ -723,6 +723,9 @@ impl ServiceManager {
     /// migration that no-ops when already applied, an `INSERT ... ON CONFLICT`
     /// seed); use [`eph run`](crate) for one-off, non-idempotent operations.
     ///
+    /// When `skip_hooks` is true, phase 2 is skipped entirely: services are
+    /// brought up healthy but no `post-start` hooks run.
+    ///
     /// # Errors
     ///
     /// Returns an error if a service name in `filter` is unknown, if any service
@@ -732,6 +735,7 @@ impl ServiceManager {
         &mut self,
         eph: &EphFile,
         filter: &[String],
+        skip_hooks: bool,
     ) -> Result<HashMap<String, RunningService>> {
         // Resolve the target set: every service, or just the requested ones (in
         // the order requested). post-start hooks run in a second phase once all
@@ -759,6 +763,10 @@ impl ServiceManager {
         // Persist before running hooks so a hook that itself shells out to eph,
         // or that fails, leaves accurate state behind.
         self.state.save(&self.workspace).await?;
+
+        if skip_hooks {
+            return Ok(running);
+        }
 
         // Phase 2: run post-start hooks with the full environment. Merge the
         // services already running from a previous `up` so cross-service
@@ -1214,12 +1222,13 @@ impl ServiceManager {
     ///
     /// Returns an error if stopping a service fails (see
     /// [`stop_service`](Self::stop_service)) or if state cannot be saved.
-    pub async fn stop_all(&mut self, eph: &EphFile, remove: bool) -> Result<()> {
+    pub async fn stop_all(&mut self, eph: &EphFile, remove: bool, skip_hooks: bool) -> Result<()> {
         // Snapshot the running services once, before any teardown, so every
         // pre-stop hook sees the full environment as it was when `down` began.
         let running = self.status().await?;
         for (name, service) in &eph.services {
-            self.stop_service(name, service, remove, eph, &running).await?;
+            self.stop_service(name, service, remove, eph, &running, skip_hooks)
+                .await?;
         }
         self.state.services.clear();
         self.state.processes.clear();
@@ -1235,6 +1244,9 @@ impl ServiceManager {
     /// itself is best-effort and logged rather than propagated, so a stale or
     /// already-stopped service does not error.
     ///
+    /// When `skip_hooks` is true, the `pre-stop` hooks are not run -- the escape
+    /// hatch for a broken hook that would otherwise wedge teardown.
+    ///
     /// # Errors
     ///
     /// Returns an error if a `pre-stop` hook fails (the service is left running
@@ -1247,13 +1259,14 @@ impl ServiceManager {
         remove: bool,
         eph: &EphFile,
         running: &HashMap<String, RunningService>,
+        skip_hooks: bool,
     ) -> Result<()> {
         // Run pre-stop hooks with the resolved environment, the same way
         // post-start hooks receive it. A failing hook aborts the teardown
         // (before the service is stopped), mirroring how a failing post-start
         // aborts `eph up`: if the pre-stop backup/drain did not succeed, you
         // almost certainly do not want the data to go away underneath it.
-        if !service.pre_stop.is_empty() {
+        if !skip_hooks && !service.pre_stop.is_empty() {
             info!("Running pre-stop hooks for {}", name);
             let env = self.hook_env(eph, running, service);
             for cmd in &service.pre_stop {
@@ -1325,11 +1338,15 @@ impl ServiceManager {
     ///
     /// Returns a [`CleanSummary`] describing what was removed.
     ///
+    /// When `skip_hooks` is true, `pre-stop` hooks are not run, so a broken hook
+    /// cannot block the reset.
+    ///
     /// # Errors
     ///
-    /// Returns an error if stopping a service, removing a named volume, or
-    /// deleting the state directory fails.
-    pub async fn clean(&mut self, eph: &EphFile) -> Result<CleanSummary> {
+    /// Returns an error if a `pre-stop` hook fails (unless `skip_hooks`), if
+    /// stopping a service, removing a named volume, or deleting the state
+    /// directory fails.
+    pub async fn clean(&mut self, eph: &EphFile, skip_hooks: bool) -> Result<CleanSummary> {
         let mut summary = CleanSummary::default();
 
         // Snapshot running services once so pre-stop hooks see the full
@@ -1338,7 +1355,8 @@ impl ServiceManager {
 
         for (name, service) in &eph.services {
             // Stop and remove the underlying resource for this service.
-            self.stop_service(name, service, true, eph, &running).await?;
+            self.stop_service(name, service, true, eph, &running, skip_hooks)
+                .await?;
             summary.services_removed += 1;
 
             // Remove per-workspace named volumes. A volume entry is a named

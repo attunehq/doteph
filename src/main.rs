@@ -41,6 +41,10 @@ enum Commands {
         /// Specific services to start (defaults to all)
         #[arg(value_name = "SERVICE")]
         services: Vec<String>,
+
+        /// Bring services up healthy but do not run their post-start hooks
+        #[arg(long = "skip-hooks")]
+        skip_hooks: bool,
     },
 
     /// Stop all services
@@ -52,10 +56,18 @@ enum Commands {
         /// Remove containers after stopping them (instead of just stopping)
         #[arg(short = 'r', long = "rm")]
         rm: bool,
+
+        /// Stop services without running their pre-stop hooks
+        #[arg(long = "skip-hooks")]
+        skip_hooks: bool,
     },
 
     /// Stop and remove all services, named volumes, and persisted state
-    Clean,
+    Clean {
+        /// Tear everything down without running pre-stop hooks
+        #[arg(long = "skip-hooks")]
+        skip_hooks: bool,
+    },
 
     /// Show status of services
     Status,
@@ -147,9 +159,20 @@ async fn main() -> Result<ExitCode> {
         .init();
 
     match cli.command {
-        Commands::Up { services } => cmd_up(services).await.map(|()| ExitCode::SUCCESS),
-        Commands::Down { services, rm } => cmd_down(services, rm).await.map(|()| ExitCode::SUCCESS),
-        Commands::Clean => cmd_clean().await.map(|()| ExitCode::SUCCESS),
+        Commands::Up {
+            services,
+            skip_hooks,
+        } => cmd_up(services, skip_hooks)
+            .await
+            .map(|()| ExitCode::SUCCESS),
+        Commands::Down {
+            services,
+            rm,
+            skip_hooks,
+        } => cmd_down(services, rm, skip_hooks)
+            .await
+            .map(|()| ExitCode::SUCCESS),
+        Commands::Clean { skip_hooks } => cmd_clean(skip_hooks).await.map(|()| ExitCode::SUCCESS),
         Commands::Status => cmd_status().await.map(|()| ExitCode::SUCCESS),
         Commands::Env { format } => cmd_env(&format).await.map(|()| ExitCode::SUCCESS),
         Commands::Run { command } => cmd_run(command).await,
@@ -175,13 +198,15 @@ async fn main() -> Result<ExitCode> {
     }
 }
 
-async fn cmd_up(service_filter: Vec<String>) -> Result<()> {
+async fn cmd_up(service_filter: Vec<String>, skip_hooks: bool) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
 
     let mut manager = ServiceManager::new(workspace).await?;
 
-    let running = manager.start_services(&eph, &service_filter).await?;
+    let running = manager
+        .start_services(&eph, &service_filter, skip_hooks)
+        .await?;
 
     // Print summary
     println!();
@@ -201,7 +226,7 @@ async fn cmd_up(service_filter: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_down(service_filter: Vec<String>, rm: bool) -> Result<()> {
+async fn cmd_down(service_filter: Vec<String>, rm: bool, skip_hooks: bool) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
 
@@ -210,7 +235,7 @@ async fn cmd_down(service_filter: Vec<String>, rm: bool) -> Result<()> {
     let action = if rm { "stopped and removed" } else { "stopped" };
 
     if service_filter.is_empty() {
-        manager.stop_all(&eph, rm).await?;
+        manager.stop_all(&eph, rm, skip_hooks).await?;
         println!("All services {}", action);
     } else {
         // Snapshot running services once so pre-stop hooks see the full
@@ -222,7 +247,7 @@ async fn cmd_down(service_filter: Vec<String>, rm: bool) -> Result<()> {
                 .get(name)
                 .with_context(|| format!("unknown service: {}", name))?;
             manager
-                .stop_service(name, service, rm, &eph, &running)
+                .stop_service(name, service, rm, &eph, &running, skip_hooks)
                 .await?;
             println!("{} {}", if rm { "Removed" } else { "Stopped" }, name);
         }
@@ -231,12 +256,12 @@ async fn cmd_down(service_filter: Vec<String>, rm: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_clean() -> Result<()> {
+async fn cmd_clean(skip_hooks: bool) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
 
     let mut manager = ServiceManager::new(workspace).await?;
-    let summary = manager.clean(&eph).await?;
+    let summary = manager.clean(&eph, skip_hooks).await?;
 
     println!("Workspace cleaned:");
     println!(

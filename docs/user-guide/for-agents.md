@@ -41,9 +41,9 @@ DATABASE_URL=$(eph env -f json | jq -r .DATABASE_URL)
 
 | Command | Effect |
 |---------|--------|
-| `eph up [svc...]` | Start all / named services. Pulls/builds, waits for health, then runs `post-start` for every service on **every** `eph up`. A failing `post-start` aborts the `up`. |
-| `eph down [--rm \| -r] [svc...]` | Stop all / named. `--rm` (alias `-r`) also removes containers. Compose is always fully torn down. A failing `pre-stop` aborts the `down`. |
-| `eph clean` | Full reset: remove containers + named volumes + state. Deletes data. A failing `pre-stop` aborts it. |
+| `eph up [svc...]` | Start all / named services. Pulls/builds, waits for health, then runs `post-start` for every service on **every** `eph up`. A failing `post-start` aborts the `up`. `--skip-hooks` skips `post-start`. |
+| `eph down [--rm \| -r] [svc...]` | Stop all / named. `--rm` (alias `-r`) also removes containers. Compose is always fully torn down. A failing `pre-stop` aborts the `down`; `--skip-hooks` bypasses `pre-stop`. |
+| `eph clean` | Full reset: remove containers + named volumes + state. Deletes data. A failing `pre-stop` aborts it; `--skip-hooks` bypasses `pre-stop`. |
 | `eph run <cmd>...` | Run a command in the workspace root with the resolved env + `EPH_*` metadata. Exits with the command's code. |
 | `eph status` | Running services and ports. |
 | `eph env [-f export\|fish\|json]` | Print resolved top-level env vars (stdout). |

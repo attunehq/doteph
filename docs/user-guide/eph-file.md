@@ -262,7 +262,9 @@ Important behavior:
   `${postgres.port}`).
 - A failing `pre-stop` hook aborts the `eph down` / `eph clean` and leaves the
   service running, so a backup or drain that fails is not silently skipped. Fix
-  the hook and retry, or blank the `pre-stop=` line to force teardown.
+  the hook and retry, or pass `--skip-hooks` to tear down without running it.
+- `eph up --skip-hooks` likewise brings services up without running their
+  `post-start` hooks.
 
 See [Core Concepts](concepts.md#the-service-lifecycle) for the full lifecycle.
 

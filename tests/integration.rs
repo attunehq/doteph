@@ -496,6 +496,63 @@ post-start=printf 'x' >> ran-count
     ws.eph_ok(&["down"]).await;
 }
 
+/// `eph up --skip-hooks` brings services up healthy but does not run their
+/// post-start hooks.
+#[tokio::test]
+async fn up_skip_hooks_does_not_run_post_start() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+post-start=touch post-start-ran
+"#,
+    );
+
+    ws.eph_ok(&["up", "--skip-hooks", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    // Service is up...
+    let status = ws.eph_ok(&["status"]).await;
+    assert!(status.contains("redis") && status.contains("localhost:"));
+
+    // ...but the hook did not run.
+    assert!(
+        !ws.path().join("post-start-ran").exists(),
+        "post-start should be skipped with --skip-hooks"
+    );
+
+    ws.eph_ok(&["down", "redis"]).await;
+}
+
+/// `--skip-hooks` lets teardown bypass a failing pre-stop hook.
+#[tokio::test]
+async fn down_skip_hooks_bypasses_failing_pre_stop() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+pre-stop=exit 1
+"#,
+    );
+
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    // A plain down fails on the hook...
+    let failed = ws.eph(&["down"]).await;
+    assert!(!failed.status.success(), "down should fail on the bad hook");
+
+    // ...but --skip-hooks tears it down anyway.
+    ws.eph_ok(&["down", "--skip-hooks"]).await;
+    let status = ws.eph_ok(&["status"]).await;
+    assert!(
+        status.contains("stopped") || status.contains("No services running"),
+        "service should be stopped after --skip-hooks down: {status}"
+    );
+}
+
 /// A failing pre-stop hook aborts `eph down` and leaves the service running so
 /// the hook can be retried.
 #[tokio::test]

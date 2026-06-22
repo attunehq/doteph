@@ -117,7 +117,8 @@ engine.
 - `start_services` is the entry point and runs in two phases: phase 1 brings each
   target to a healthy state via `create_service`, saves state, then phase 2 runs
   every target's `post-start` hooks with the resolved environment. `start_all` is
-  a thin wrapper with an empty filter.
+  a thin wrapper with an empty filter. A `skip_hooks` flag (CLI `--skip-hooks`)
+  short-circuits phase 2.
 - `create_service` is the idempotent core that produces a healthy `RunningService`
   (no hooks). For `run=` services it first probes the tracked PID (`kill -0`) to
   avoid spawning duplicates. For Docker services it checks for an existing
@@ -131,9 +132,10 @@ engine.
   health-check loops (compose default 60s).
 - `stop_service` takes the loaded `EphFile` and a snapshot of running services,
   runs `pre-stop` with the resolved environment (a failure is **propagated**,
-  aborting teardown), then stops by source type: Docker (stop, optionally
-  remove), `run` (SIGTERM, wait, SIGKILL), or compose (`docker compose down`).
-  `stop_all` snapshots running services once up front and clears state.
+  aborting teardown, unless `skip_hooks` / CLI `--skip-hooks`), then stops by
+  source type: Docker (stop, optionally remove), `run` (SIGTERM, wait, SIGKILL),
+  or compose (`docker compose down`). `stop_all` and `clean` snapshot running
+  services once up front and thread `skip_hooks` through; `stop_all` clears state.
 - `resolve_env_vars` / `command_env` / `hook_env` build the resolved environment
   shared by `eph env`, `eph run`, and the lifecycle hooks.
 - `clean` stops+removes everything, removes per-workspace named volumes (skipping
