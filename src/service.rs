@@ -1,6 +1,6 @@
 //! Service management - starting, stopping, and managing Docker containers
 
-use crate::parser::{EphFile, PortMapping, Service, ServiceSource};
+use crate::parser::{EphFile, PortMapping, Service, ServiceSource, resolve_interpolations};
 use crate::workspace::Workspace;
 use anyhow::{Context, Result, bail};
 use bollard::Docker;
@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 
 /// Runtime information about a running service.
 ///
-/// Returned by [`ServiceManager::start_service`] and friends, and queried for
+/// Returned by [`ServiceManager::start_services`] and friends, and queried for
 /// connection details via [`host`](Self::host), [`port`](Self::port), and
 /// [`named_port`](Self::named_port) when expanding interpolations.
 #[derive(Debug, Clone)]
@@ -61,6 +61,90 @@ impl RunningService {
     pub fn named_port(&self, name: &str) -> Option<u16> {
         self.ports.get(name).copied()
     }
+}
+
+/// Resolve the top-level `KEY=VALUE` environment variables declared in an
+/// [`EphFile`] against the currently running services.
+///
+/// This expands `${service.host}`, `${service.port}`, and `${service.port.NAME}`
+/// interpolations using the assigned host ports in `running`, and is exactly
+/// the set of pairs that `eph env` emits. A reference to a service that is not
+/// in `running` is left as the literal `${...}` placeholder, matching
+/// [`resolve_interpolations`].
+///
+/// It is shared by `eph env` and by the lifecycle-hook / `eph run` machinery so
+/// that a `post-start` hook, a `pre-stop` hook, and a developer's shell all see
+/// the same resolved environment.
+#[must_use]
+pub fn resolve_env_vars(
+    eph: &EphFile,
+    running: &HashMap<String, RunningService>,
+) -> Vec<(String, String)> {
+    let resolver = |service: &str, property: &str| -> Option<String> {
+        let svc = running.get(service)?;
+        match property {
+            "host" => Some(svc.host().to_string()),
+            "port" => svc.port().map(|p| p.to_string()),
+            prop if prop.starts_with("port.") => svc.named_port(&prop[5..]).map(|p| p.to_string()),
+            _ => None,
+        }
+    };
+
+    eph.env_vars
+        .iter()
+        .map(|var| {
+            (
+                var.name.clone(),
+                resolve_interpolations(&var.value, resolver),
+            )
+        })
+        .collect()
+}
+
+/// Build the `EPH_*` metadata variables describing the workspace and the
+/// running services.
+///
+/// These let a hook or `eph run` command address eph's own resources without
+/// re-deriving them: `EPH_WORKSPACE_ID`, `EPH_WORKSPACE_ROOT`,
+/// `EPH_CONTAINER_PREFIX`, and per service `EPH_<SERVICE>_HOST`,
+/// `EPH_<SERVICE>_PORT`, `EPH_<SERVICE>_PORT_<NAME>`, and
+/// `EPH_<SERVICE>_CONTAINER`. Service names are upper-cased with `-` replaced by
+/// `_` so they are valid shell identifiers (e.g. `auth-db` -> `EPH_AUTH_DB_PORT`).
+fn eph_metadata_env(
+    workspace: &Workspace,
+    running: &HashMap<String, RunningService>,
+) -> Vec<(String, String)> {
+    let mut vars = vec![
+        ("EPH_WORKSPACE_ID".to_string(), workspace.id.clone()),
+        (
+            "EPH_WORKSPACE_ROOT".to_string(),
+            workspace.path.display().to_string(),
+        ),
+        (
+            "EPH_CONTAINER_PREFIX".to_string(),
+            workspace.container_prefix(),
+        ),
+    ];
+
+    for (name, svc) in running {
+        let key = name.to_uppercase().replace('-', "_");
+        vars.push((format!("EPH_{key}_HOST"), svc.host().to_string()));
+        if let Some(port) = svc.port() {
+            vars.push((format!("EPH_{key}_PORT"), port.to_string()));
+        }
+        for (port_name, port) in &svc.ports {
+            if port_name != "default" {
+                let pkey = port_name.to_uppercase().replace('-', "_");
+                vars.push((format!("EPH_{key}_PORT_{pkey}"), port.to_string()));
+            }
+        }
+        vars.push((
+            format!("EPH_{key}_CONTAINER"),
+            workspace.container_name(name),
+        ));
+    }
+
+    vars
 }
 
 /// Summary of resources removed by [`ServiceManager::clean`].
@@ -623,20 +707,104 @@ impl ServiceManager {
 
     /// Start every service defined in the [`EphFile`] and persist state.
     ///
+    /// Convenience wrapper over [`start_services`](Self::start_services) with no
+    /// filter.
+    ///
     /// # Errors
     ///
-    /// Returns an error if any service fails to start (see
-    /// [`start_service`](Self::start_service)) or if state cannot be saved.
+    /// Returns an error if any service fails to start or if state cannot be
+    /// saved.
     pub async fn start_all(&mut self, eph: &EphFile) -> Result<HashMap<String, RunningService>> {
-        let mut running = HashMap::new();
+        self.start_services(eph, &[], false).await
+    }
 
-        for (name, service) in &eph.services {
-            let result = self.start_service(name, service).await?;
-            running.insert(name.clone(), result);
+    /// Start the requested services (or all of them when `filter` is empty),
+    /// then run `post-start` hooks once every service is healthy.
+    ///
+    /// Startup happens in two phases:
+    ///
+    /// 1. Every target service is created (or reused) and waited on until
+    ///    healthy. No hooks run yet.
+    /// 2. Every target service's `post-start` hooks run with the fully-resolved
+    ///    environment.
+    ///
+    /// Deferring the hooks to phase 2 means a hook can reference any service in
+    /// the workspace -- a database migration whose `DATABASE_URL` interpolates
+    /// `${postgres.port}` resolves correctly even though, within a single
+    /// `eph up`, postgres might have been created before the service whose hook
+    /// needs it.
+    ///
+    /// `post-start` hooks run on **every** `eph up`, not only when a service is
+    /// freshly created. Hooks are therefore expected to be idempotent (a
+    /// migration that no-ops when already applied, an `INSERT ... ON CONFLICT`
+    /// seed); use [`eph run`](crate) for one-off, non-idempotent operations.
+    ///
+    /// When `skip_hooks` is true, phase 2 is skipped entirely: services are
+    /// brought up healthy but no `post-start` hooks run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a service name in `filter` is unknown, if any service
+    /// fails to start, if a `post-start` hook fails, or if state cannot be
+    /// saved.
+    pub async fn start_services(
+        &mut self,
+        eph: &EphFile,
+        filter: &[String],
+        skip_hooks: bool,
+    ) -> Result<HashMap<String, RunningService>> {
+        // Resolve the target set: every service, or just the requested ones (in
+        // the order requested). post-start hooks run in a second phase once all
+        // of these are healthy, so the phase-1 start order does not affect
+        // whether a hook's cross-service references resolve.
+        let targets: Vec<&String> = if filter.is_empty() {
+            eph.services.keys().collect()
+        } else {
+            for name in filter {
+                if !eph.services.contains_key(name) {
+                    bail!("unknown service: {}", name);
+                }
+            }
+            filter.iter().collect()
+        };
+
+        // Phase 1: create or reuse every target, waiting for health.
+        let mut running = HashMap::new();
+        for name in &targets {
+            let service = &eph.services[*name];
+            let result = self.create_service(name, service).await?;
+            running.insert((*name).clone(), result);
         }
 
-        // Save state
+        // Persist before running hooks so a hook that itself shells out to eph,
+        // or that fails, leaves accurate state behind.
         self.state.save(&self.workspace).await?;
+
+        if skip_hooks {
+            return Ok(running);
+        }
+
+        // Phase 2: run post-start hooks with the full environment. Merge the
+        // services already running from a previous `up` so cross-service
+        // references resolve even on a filtered `eph up <one-service>`.
+        let mut resolved = self.status().await?;
+        for (name, svc) in &running {
+            resolved.insert(name.clone(), svc.clone());
+        }
+
+        for name in &targets {
+            let service = &eph.services[*name];
+            if service.post_start.is_empty() {
+                continue;
+            }
+            info!("Running post-start hooks for {}", name);
+            let env = self.hook_env(eph, &resolved, service);
+            for cmd in &service.post_start {
+                self.run_hook(cmd, &env)
+                    .await
+                    .with_context(|| format!("post-start hook failed for service '{}'", name))?;
+            }
+        }
 
         Ok(running)
     }
@@ -651,9 +819,13 @@ impl ServiceManager {
     /// # Errors
     ///
     /// Returns an error if the image cannot be pulled or built, the container or
-    /// process cannot be started, the service fails its healthcheck within the
-    /// configured timeout, or a `post-start` hook fails.
-    pub async fn start_service(&mut self, name: &str, service: &Service) -> Result<RunningService> {
+    /// process cannot be started, or the service fails its healthcheck within
+    /// the configured timeout.
+    ///
+    /// This only brings the service to a healthy state; `post-start` hooks are
+    /// run separately by [`start_services`](Self::start_services) once every
+    /// service is up.
+    async fn create_service(&mut self, name: &str, service: &Service) -> Result<RunningService> {
         let container_name = self.workspace.container_name(name);
 
         // Dedup run= (shell command) services: the Docker-based guard below
@@ -786,14 +958,8 @@ impl ServiceManager {
             },
         );
 
-        // Run post-start hooks
-        if !service.post_start.is_empty() {
-            info!("Running post-start hooks for {}", name);
-            for cmd in &service.post_start {
-                self.run_hook(cmd).await?;
-            }
-        }
-
+        // post-start hooks run in a later phase (see `start_services`), once
+        // every service is healthy, so a hook can reference any service.
         Ok(running)
     }
 
@@ -1082,9 +1248,13 @@ impl ServiceManager {
     ///
     /// Returns an error if stopping a service fails (see
     /// [`stop_service`](Self::stop_service)) or if state cannot be saved.
-    pub async fn stop_all(&mut self, eph: &EphFile, remove: bool) -> Result<()> {
+    pub async fn stop_all(&mut self, eph: &EphFile, remove: bool, skip_hooks: bool) -> Result<()> {
+        // Snapshot the running services once, before any teardown, so every
+        // pre-stop hook sees the full environment as it was when `down` began.
+        let running = self.status().await?;
         for (name, service) in &eph.services {
-            self.stop_service(name, service, remove).await?;
+            self.stop_service(name, service, remove, eph, &running, skip_hooks)
+                .await?;
         }
         self.state.services.clear();
         self.state.processes.clear();
@@ -1096,27 +1266,44 @@ impl ServiceManager {
     ///
     /// When `remove` is true, also remove the underlying container after
     /// stopping it (compose uses `down`, which already removes containers;
-    /// killing a `run` process already removes it). Pre-stop hook failures and
-    /// the best-effort process/compose teardown are logged rather than
-    /// propagated, so a stale or already-stopped service does not error.
+    /// killing a `run` process already removes it). The process/compose teardown
+    /// itself is best-effort and logged rather than propagated, so a stale or
+    /// already-stopped service does not error.
+    ///
+    /// When `skip_hooks` is true, the `pre-stop` hooks are not run -- the escape
+    /// hatch for a broken hook that would otherwise wedge teardown.
     ///
     /// # Errors
     ///
-    /// Returns an error if a Docker stop or remove call fails for an
-    /// `image`/`dockerfile` service.
+    /// Returns an error if a `pre-stop` hook fails (the service is left running
+    /// so the hook can be retried), or if a Docker stop or remove call fails for
+    /// an `image`/`dockerfile` service.
     pub async fn stop_service(
         &mut self,
         name: &str,
         service: &Service,
         remove: bool,
+        eph: &EphFile,
+        running: &HashMap<String, RunningService>,
+        skip_hooks: bool,
     ) -> Result<()> {
-        // Run pre-stop hooks
-        if !service.pre_stop.is_empty() {
+        // Run pre-stop hooks with the resolved environment, the same way
+        // post-start hooks receive it. A failing hook aborts the teardown
+        // (before the service is stopped), mirroring how a failing post-start
+        // aborts `eph up`: if the pre-stop backup/drain did not succeed, you
+        // almost certainly do not want the data to go away underneath it.
+        //
+        // Only run them for a service that is actually running: `stop_all`
+        // iterates every service in the `.eph` file, so without this gate a
+        // never-started or already-stopped service's pre-stop hook would run
+        // (and, being fatal, could break `eph down` for an unrelated service).
+        if !skip_hooks && running.contains_key(name) && !service.pre_stop.is_empty() {
             info!("Running pre-stop hooks for {}", name);
+            let env = self.hook_env(eph, running, service);
             for cmd in &service.pre_stop {
-                if let Err(e) = self.run_hook(cmd).await {
-                    warn!("Pre-stop hook failed: {}", e);
-                }
+                self.run_hook(cmd, &env)
+                    .await
+                    .with_context(|| format!("pre-stop hook failed for service '{}'", name))?;
             }
         }
 
@@ -1182,16 +1369,25 @@ impl ServiceManager {
     ///
     /// Returns a [`CleanSummary`] describing what was removed.
     ///
+    /// When `skip_hooks` is true, `pre-stop` hooks are not run, so a broken hook
+    /// cannot block the reset.
+    ///
     /// # Errors
     ///
-    /// Returns an error if stopping a service, removing a named volume, or
-    /// deleting the state directory fails.
-    pub async fn clean(&mut self, eph: &EphFile) -> Result<CleanSummary> {
+    /// Returns an error if a `pre-stop` hook fails (unless `skip_hooks`), if
+    /// stopping a service, removing a named volume, or deleting the state
+    /// directory fails.
+    pub async fn clean(&mut self, eph: &EphFile, skip_hooks: bool) -> Result<CleanSummary> {
         let mut summary = CleanSummary::default();
+
+        // Snapshot running services once so pre-stop hooks see the full
+        // environment as it was before teardown began.
+        let running = self.status().await?;
 
         for (name, service) in &eph.services {
             // Stop and remove the underlying resource for this service.
-            self.stop_service(name, service, true).await?;
+            self.stop_service(name, service, true, eph, &running, skip_hooks)
+                .await?;
             summary.services_removed += 1;
 
             // Remove per-workspace named volumes. A volume entry is a named
@@ -1319,12 +1515,52 @@ impl ServiceManager {
         Ok(result)
     }
 
-    /// Run a hook command in the workspace directory
-    async fn run_hook(&self, cmd: &str) -> Result<()> {
+    /// The environment a non-service command (`eph run`) inherits from eph: the
+    /// resolved top-level `.eph` variables plus the `EPH_*` metadata variables.
+    ///
+    /// This is the same connection environment `eph env` emits, augmented with
+    /// metadata, so an arbitrary command can reach the running services exactly
+    /// as a developer's shell would after `eval "$(eph env)"`.
+    #[must_use]
+    pub fn command_env(
+        &self,
+        eph: &EphFile,
+        running: &HashMap<String, RunningService>,
+    ) -> Vec<(String, String)> {
+        let mut env = resolve_env_vars(eph, running);
+        env.extend(eph_metadata_env(&self.workspace, running));
+        env
+    }
+
+    /// The environment overlaid on a lifecycle hook (`post-start` / `pre-stop`).
+    ///
+    /// This is [`command_env`](Self::command_env) plus the owning service's own
+    /// `env.X` values, which take precedence. A `post-start` hook for a database
+    /// therefore sees both the resolved `DATABASE_URL` and the container-side
+    /// `POSTGRES_USER` / `POSTGRES_DB` it was created with.
+    fn hook_env(
+        &self,
+        eph: &EphFile,
+        running: &HashMap<String, RunningService>,
+        service: &Service,
+    ) -> Vec<(String, String)> {
+        let mut env = self.command_env(eph, running);
+        env.extend(service.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        env
+    }
+
+    /// Run a hook command in the workspace directory with `env` overlaid on
+    /// eph's own environment.
+    ///
+    /// The child inherits eph's process environment; the `env` pairs are set on
+    /// top of it, so later entries (the owning service's `env.X`) win over the
+    /// resolved top-level variables they may shadow.
+    async fn run_hook(&self, cmd: &str, env: &[(String, String)]) -> Result<()> {
         let output = TokioCommand::new("sh")
             .arg("-c")
             .arg(cmd)
             .current_dir(&self.workspace.path)
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .output()
             .await
             .with_context(|| format!("failed to execute hook: {}", cmd))?;

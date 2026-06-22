@@ -381,6 +381,402 @@ REDIS_URL=redis://localhost:${redis.port}
     ws.eph_ok(&["down"]).await;
 }
 
+/// A post-start hook should see eph's own resolved environment: the top-level
+/// `.eph` variables (with `${service.port}` filled in) and the `EPH_*` metadata
+/// variables.
+#[tokio::test]
+async fn post_start_hook_receives_resolved_env() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+post-start=printf '%s\n%s\n%s\n' "$REDIS_URL" "$EPH_REDIS_PORT" "$EPH_WORKSPACE_ID" > hook-env
+
+REDIS_URL=redis://localhost:${redis.port}
+"#,
+    );
+
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let captured = std::fs::read_to_string(ws.path().join("hook-env"))
+        .expect("post-start hook did not write hook-env");
+    let lines: Vec<&str> = captured.lines().collect();
+
+    // The hook's REDIS_URL must match what `eph env` resolves, fully expanded.
+    let env_map = ws.env_json().await;
+    let redis_url = env_map.get("REDIS_URL").expect("REDIS_URL not found");
+    assert!(!redis_url.contains("${"), "REDIS_URL not resolved in env");
+    assert_eq!(lines[0], redis_url, "hook saw a different REDIS_URL");
+
+    // EPH_REDIS_PORT must equal the assigned host port inside REDIS_URL.
+    let port = extract_port(redis_url).expect("no port in REDIS_URL");
+    assert_eq!(lines[1], port.to_string(), "EPH_REDIS_PORT mismatch");
+
+    // EPH_WORKSPACE_ID is always populated.
+    assert!(!lines[2].is_empty(), "EPH_WORKSPACE_ID was empty");
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// Because post-start hooks run only after every service is healthy (not at the
+/// moment each service is created), a hook can reference a sibling service whose
+/// port is interpolated into a top-level variable -- regardless of the order in
+/// which the two services happened to start.
+#[tokio::test]
+async fn post_start_resolves_cross_service_refs() {
+    // `worker`'s post-start reads REDIS_URL, which interpolates `redis`'s port.
+    // Service iteration order is not deterministic, so under per-service hook
+    // timing this would intermittently see an unresolved `${redis.port}`.
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+
+[worker]
+image=redis:7-alpine
+port=6379
+post-start=printf '%s' "$REDIS_URL" > worker-saw
+
+REDIS_URL=redis://localhost:${redis.port}
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let captured = std::fs::read_to_string(ws.path().join("worker-saw"))
+        .expect("worker post-start did not run");
+    assert!(
+        !captured.contains("${"),
+        "cross-service ref not resolved in post-start: {captured}"
+    );
+
+    let env_map = ws.env_json().await;
+    let redis_url = env_map.get("REDIS_URL").expect("REDIS_URL not found");
+    assert_eq!(
+        &captured, redis_url,
+        "worker hook saw a stale or unresolved REDIS_URL"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// post-start hooks run on every `eph up`, including when a stopped container is
+/// restarted -- not only on fresh creation.
+#[tokio::test]
+async fn post_start_reruns_on_restart() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+post-start=printf 'x' >> ran-count
+"#,
+    );
+
+    // Fresh create -> post-start runs once.
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    // Stop but keep the container, then bring it back up (the restart path).
+    ws.eph_ok(&["down"]).await;
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let count = std::fs::read_to_string(ws.path().join("ran-count")).unwrap_or_default();
+    assert_eq!(
+        count.len(),
+        2,
+        "post-start should run on both create and restart, got {count:?}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// `eph up --skip-hooks` brings services up healthy but does not run their
+/// post-start hooks.
+#[tokio::test]
+async fn up_skip_hooks_does_not_run_post_start() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+post-start=touch post-start-ran
+"#,
+    );
+
+    ws.eph_ok(&["up", "--skip-hooks", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    // Service is up...
+    let status = ws.eph_ok(&["status"]).await;
+    assert!(status.contains("redis") && status.contains("localhost:"));
+
+    // ...but the hook did not run.
+    assert!(
+        !ws.path().join("post-start-ran").exists(),
+        "post-start should be skipped with --skip-hooks"
+    );
+
+    ws.eph_ok(&["down", "redis"]).await;
+}
+
+/// `--skip-hooks` lets teardown bypass a failing pre-stop hook.
+#[tokio::test]
+async fn down_skip_hooks_bypasses_failing_pre_stop() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+pre-stop=exit 1
+"#,
+    );
+
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    // A plain down fails on the hook...
+    let failed = ws.eph(&["down"]).await;
+    assert!(!failed.status.success(), "down should fail on the bad hook");
+
+    // ...but --skip-hooks tears it down anyway.
+    ws.eph_ok(&["down", "--skip-hooks"]).await;
+    let status = ws.eph_ok(&["status"]).await;
+    assert!(
+        status.contains("stopped") || status.contains("No services running"),
+        "service should be stopped after --skip-hooks down: {status}"
+    );
+}
+
+/// A failing pre-stop hook aborts `eph down` and leaves the service running so
+/// the hook can be retried.
+#[tokio::test]
+async fn pre_stop_failure_aborts_down() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+pre-stop=exit 1
+"#,
+    );
+
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    // down must fail because the pre-stop hook fails.
+    let out = ws.eph(&["down"]).await;
+    assert!(
+        !out.status.success(),
+        "down should fail when a pre-stop hook fails"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("pre-stop hook failed"),
+        "expected a pre-stop failure message, got: {stderr}"
+    );
+
+    // The service is left running so the operator can fix and retry.
+    let status = ws.eph_ok(&["status"]).await;
+    assert!(
+        status.contains("redis") && status.contains("localhost:"),
+        "service should still be running after a failed down: {status}"
+    );
+
+    // Fix the hook, then tear down cleanly (also lets Drop's `eph down` succeed
+    // rather than leaking the container).
+    ws.write_file(
+        ".eph",
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+pre-stop=true
+"#,
+    );
+    ws.eph_ok(&["down"]).await;
+}
+
+/// A failing `pre-stop` hook on a service that is **not running** must not break
+/// `eph down`. `stop_all` iterates every service in the `.eph` file, so the hook
+/// of a never-started service must be skipped rather than run (and fail).
+#[tokio::test]
+async fn pre_stop_skipped_for_non_running_service() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+
+[never_started]
+image=redis:7-alpine
+port=6379
+pre-stop=exit 1
+"#,
+    );
+
+    // Bring up only redis; `never_started` stays down with its failing hook.
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    // A full `eph down` iterates every service but must not run the stopped
+    // service's pre-stop hook, so it succeeds.
+    let out = ws.eph(&["down"]).await;
+    assert!(
+        out.status.success(),
+        "down should not run pre-stop for a non-running service: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A targeted `eph down <service>` persists state, so the stopped service is
+/// dropped from `state.json` immediately rather than lingering until the next
+/// `eph status` reconciles it.
+#[tokio::test]
+async fn targeted_down_persists_state() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+
+[cache]
+image=redis:7-alpine
+port=6379
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    // Locate state.json via `eph info`.
+    let info = ws.eph_ok(&["info"]).await;
+    let state_dir = info
+        .lines()
+        .find_map(|l| l.strip_prefix("State directory: "))
+        .expect("info should print the state directory");
+    let state_path = std::path::Path::new(state_dir.trim()).join("state.json");
+
+    let before = std::fs::read_to_string(&state_path).expect("state.json should exist after up");
+    assert!(before.contains("redis") && before.contains("cache"));
+
+    // Stop just one service.
+    ws.eph_ok(&["down", "redis"]).await;
+
+    let after = std::fs::read_to_string(&state_path).expect("state.json should still exist");
+    assert!(
+        !after.contains("redis"),
+        "redis should be gone from state.json after a targeted down: {after}"
+    );
+    assert!(
+        after.contains("cache"),
+        "cache should remain in state.json: {after}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// A pre-stop hook should receive the same resolved environment as post-start.
+#[tokio::test]
+async fn pre_stop_hook_receives_resolved_env() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+pre-stop=printf '%s' "$REDIS_URL" > pre-stop-env
+
+REDIS_URL=redis://localhost:${redis.port}
+"#,
+    );
+
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let redis_url = ws
+        .env_json()
+        .await
+        .get("REDIS_URL")
+        .expect("REDIS_URL not found")
+        .clone();
+
+    // Stopping triggers the pre-stop hook.
+    ws.eph_ok(&["down"]).await;
+
+    let captured = std::fs::read_to_string(ws.path().join("pre-stop-env"))
+        .expect("pre-stop hook did not write pre-stop-env");
+    assert_eq!(
+        captured, redis_url,
+        "pre-stop hook saw a different REDIS_URL"
+    );
+}
+
+// ============================================================================
+// eph run
+// ============================================================================
+
+/// `eph run` runs a command with the resolved environment overlaid, so a
+/// top-level variable and `EPH_*` metadata are visible to the child.
+#[tokio::test]
+async fn eph_run_injects_resolved_env() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+
+REDIS_URL=redis://localhost:${redis.port}
+"#,
+    );
+
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let redis_url = ws
+        .env_json()
+        .await
+        .get("REDIS_URL")
+        .expect("REDIS_URL not found")
+        .clone();
+
+    // The command is executed directly (no shell), so use `printenv` to read a
+    // single variable rather than relying on shell expansion.
+    let out = ws.eph_ok(&["run", "printenv", "REDIS_URL"]).await;
+    assert_eq!(out.trim(), redis_url, "eph run did not inject REDIS_URL");
+
+    let port_out = ws.eph_ok(&["run", "printenv", "EPH_REDIS_PORT"]).await;
+    let port = extract_port(&redis_url).expect("no port in REDIS_URL");
+    assert_eq!(port_out.trim(), port.to_string(), "EPH_REDIS_PORT mismatch");
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// `eph run` propagates the child command's exit code.
+#[tokio::test]
+async fn eph_run_propagates_exit_code() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+"#,
+    );
+
+    // No `up` needed: `eph run` resolves whatever is running (nothing here) and
+    // still execs the command. `sh -c 'exit 7'` must surface as exit code 7.
+    let output = ws.eph(&["run", "sh", "-c", "exit 7"]).await;
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "eph run did not propagate the child exit code"
+    );
+}
+
 // ============================================================================
 // Health Check Tests
 // ============================================================================

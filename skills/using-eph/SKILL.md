@@ -68,7 +68,7 @@ Three deliberately distinct levels, from lightest to heaviest:
 | Command | Effect |
 | --- | --- |
 | `eph down` | Stop services; keep containers and volume data for a fast restart. |
-| `eph down --rm` (alias `-r`) | Also remove the containers; named-volume data is kept. The next `up` recreates them and re-runs `post-start`. |
+| `eph down --rm` (alias `-r`) | Also remove the containers; named-volume data is kept. The next `up` recreates them. |
 | `eph clean` | Full reset: remove containers, remove per-workspace named volumes (**deletes that data**), and delete saved state. |
 
 `compose` services are always fully torn down (`--rm` is a no-op for them);
@@ -100,16 +100,77 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 - `env.X=` is set inside the container; the trailing `DATABASE_URL=` is a shell
   env var emitted by `eph env`.
 - `volume=name:/path` is a per-workspace named volume; `healthcheck` for an image
-  service runs with no shell (whitespace-split, `docker exec`); `post-start` runs
-  on the host via `sh -c` after the service is healthy.
+  service runs with no shell (whitespace-split, `docker exec`); `post-start` and
+  `pre-stop` run on the host via `sh -c` (after the service is healthy / before
+  it is stopped) with eph's resolved environment injected (see below).
+
+## Lifecycle hooks see eph's environment
+
+`post-start` and `pre-stop` hooks run with the same variables `eph env` emits
+already in their environment, so a database migration just works:
+
+```ini
+[postgres]
+image=postgres:16-alpine
+port=5432
+env.POSTGRES_USER=dev
+healthcheck=pg_isready -U dev
+post-start=psql "$DATABASE_URL" -f schema.sql   # DATABASE_URL is already set
+
+DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
+```
+
+Each hook receives, layered in this order (later wins):
+
+1. the resolved top-level `.eph` variables (exactly what `eph env` prints),
+2. `EPH_*` metadata: `EPH_WORKSPACE_ID`, `EPH_WORKSPACE_ROOT`,
+   `EPH_CONTAINER_PREFIX`, and per service `EPH_<SERVICE>_HOST`,
+   `EPH_<SERVICE>_PORT`, `EPH_<SERVICE>_PORT_<NAME>` (for named ports),
+   `EPH_<SERVICE>_CONTAINER` (service names upper-cased, `-` -> `_`),
+3. the owning service's own `env.X=` values.
+
+`post-start` hooks run only after **every** service in the `up` is healthy, so a
+hook may reference any other service's port (`${redis.port}` resolves even if
+redis started after the service whose hook needs it).
+
+`post-start` runs on **every** `eph up` (fresh create *or* restart), and a
+failing `post-start` aborts the `up`; a failing `pre-stop` aborts the `down` /
+`clean` and leaves the service running so you can fix and retry. Write hooks to
+be idempotent (a migration that no-ops when already applied, an
+`INSERT ... ON CONFLICT` seed). For one-off, non-idempotent work, use `eph run`
+instead.
+
+Pass `--skip-hooks` to skip hooks for one invocation: `eph up --skip-hooks`
+starts services without `post-start`; `eph down --skip-hooks` /
+`eph clean --skip-hooks` tear down without `pre-stop` (the escape hatch when a
+broken `pre-stop` hook is wedging teardown).
+
+## Running one-off commands with the environment: `eph run`
+
+`eph run <cmd>...` runs a command in the workspace root with the resolved
+environment (the `eph env` variables plus the `EPH_*` metadata) already set, so
+you do not have to `eval "$(eph env)"` first:
+
+```sh
+eph run psql "$DATABASE_URL"        # NOTE: $DATABASE_URL is expanded by YOUR shell
+eph run ./scripts/seed.sh           # the script sees DATABASE_URL, EPH_* itself
+eph run sh -c 'psql "$DATABASE_URL" < dump.sql'   # use sh -c for shell features
+```
+
+The command is executed directly, not through a shell, so eph does not expand
+`$VAR` in the arguments; wrap it in `sh -c '...'` when you need shell expansion
+of eph's injected variables, piping, or globbing. `eph run` exits with the
+command's own exit code. Use it for repeatable operations (seeding, resets,
+ad-hoc queries) -- unlike `post-start`, it runs every time you invoke it.
 
 ## Behaviors that matter
 
 - **Ports are random and change per create.** Never hardcode a host port; always
   go through `eph env`.
-- **Idempotent up.** For `image`/`dockerfile` services, `post-start` runs only on
-  a fresh create, not on a restart, so migrations are not re-run on every `up`.
-  To force them: `eph down --rm && eph up`, or `eph clean && eph up`.
+- **Idempotent up.** A running service is reused and a stopped one restarted, but
+  `post-start` hooks run on **every** `eph up` regardless. Write them to be
+  idempotent (migrations that no-op when applied), or move one-off work to
+  `eph run`. A failing `post-start` aborts the `up`.
 - **Image health checks have no shell**: one whitespace-split command, no pipes,
   `&&`, `$VAR`, or quoted spaces, and the binary must exist in the image.
 - **A service with no health check** is given a fixed short wait, so it may need a

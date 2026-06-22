@@ -82,8 +82,8 @@ expose.zookeeper=2181
   Compose project and detects whether it is running by its
   `com.docker.compose.project` label (its containers are not named
   `eph-<short_id>-...`, so they are found by label, not by name).
-- `ready-timeout` defaults to **60s** for compose services, and `post-start`
-  hooks run on **every** `eph up` (not just the first).
+- `ready-timeout` defaults to **60s** for compose services. (As with every
+  source type, `post-start` hooks run on **every** `eph up`.)
 
 > Requires the `docker compose` CLI plugin.
 

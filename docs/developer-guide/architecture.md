@@ -131,8 +131,8 @@ operations are awkward to reproduce over the API.
 
 ## Health checks
 
-`eph up` waits for a service to be healthy before running `post-start` hooks and
-returning. The mechanism differs by service type, deliberately:
+`eph up` waits for every service to be healthy before running any `post-start`
+hooks and returning. The mechanism differs by service type, deliberately:
 
 - **image/dockerfile**: the command runs inside the container via `docker exec`,
   split on whitespace - **no shell**. This avoids depending on a shell being
@@ -145,14 +145,19 @@ With no health check, `eph` waits a fixed 500 ms and proceeds.
 
 ## Lifecycle hooks
 
-- `post-start` runs after a service is healthy, on the host via `sh -c`, in the
-  workspace directory. For `image`/`dockerfile` services it runs only on **fresh
-  container creation**, not when a stopped container is restarted (so migrations
-  are not re-run on every `up`); `run` services re-run it whenever the tracked
-  PID is not alive, and `compose` services re-run it on every `up` (they are
-  excluded from the existing-container guard). A failing hook aborts `up`.
-- `pre-stop` runs before a service stops; failures are logged, not propagated, so
-  a stale service does not block teardown.
+- `post-start` runs on the host via `sh -c`, in the workspace directory, in a
+  **second phase** of `eph up`: every targeted service is first brought to a
+  healthy state, then every service's `post-start` hooks run. Deferring hooks
+  this way lets a hook reference any other service's resolved port. Hooks run on
+  **every** `eph up` regardless of source type or start path (fresh create,
+  restart, reused), so they are expected to be idempotent. A failing hook aborts
+  `up`.
+- `pre-stop` runs before a service stops; a failing hook is propagated and aborts
+  `eph down` / `eph clean`, leaving the service running so the hook can be fixed
+  and retried (the process/Compose teardown that follows is still best-effort).
+- Both hooks receive eph's resolved environment (the `eph env` variables, `EPH_*`
+  metadata, and the service's own `env.X`); the same environment is exposed to
+  arbitrary commands by `eph run`.
 
 ## Teardown levels
 
@@ -161,7 +166,8 @@ Three deliberately distinct levels:
 - `eph down` - stop services, leave containers and volumes in place for a fast
   restart. Clears in-memory/persisted state entries.
 - `eph down --rm` - additionally remove the stopped containers. Named-volume data
-  is preserved; the next `up` recreates containers (and re-runs `post-start`).
+  is preserved; the next `up` recreates containers. (`post-start` runs on every
+  `up` regardless; `--rm` only changes whether the container is reused or rebuilt.)
 - `eph clean` - full reset: remove containers (and Compose projects / processes),
   remove per-workspace **named volumes** (data loss), and delete the state
   directory. Bind mounts are never removed.
@@ -176,6 +182,7 @@ eph down [--rm] [services...]   # stop (optionally remove containers)
 eph clean                       # full reset
 eph status                      # show state
 eph env [-f format]             # export resolved environment
+eph run <cmd>...                # run a command with the resolved environment
 eph check                       # validate the .eph file
 eph info                        # workspace metadata
 eph skills <install|check|list> # manage the bundled agent skills

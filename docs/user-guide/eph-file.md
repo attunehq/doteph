@@ -222,24 +222,51 @@ repeatable and run in order:
 ```ini
 [postgres]
 image=postgres:16-alpine
+env.POSTGRES_USER=dev
 healthcheck=pg_isready -U dev
-post-start=npm run db:migrate
-post-start=npm run db:seed
+post-start=psql "$DATABASE_URL" -f schema.sql
 pre-stop=./scripts/backup.sh
+
+DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 ```
+
+### Hook environment
+
+Hooks run with eph's resolved environment injected, layered in this order (later
+entries win where names collide):
+
+1. the resolved top-level `.eph` variables -- exactly what `eph env` prints, with
+   `${service.port}` filled in (so `$DATABASE_URL` above is already set);
+2. `EPH_*` metadata variables:
+   - `EPH_WORKSPACE_ID`, `EPH_WORKSPACE_ROOT`, `EPH_CONTAINER_PREFIX`;
+   - per service `EPH_<SERVICE>_HOST`, `EPH_<SERVICE>_PORT`,
+     `EPH_<SERVICE>_PORT_<NAME>` (for named ports), and `EPH_<SERVICE>_CONTAINER`.
+     Service names are upper-cased with `-` replaced by `_`, so `auth-db` becomes
+     `EPH_AUTH_DB_PORT`;
+3. the owning service's own `env.X=` values.
+
+The same environment is available outside hooks via [`eph run`](command-reference.md#eph-run-cmd),
+which runs an arbitrary command with these variables set.
 
 Important behavior:
 
-- For `image`/`dockerfile` services, `post-start` runs only when a container is
-  **created fresh**, not when a stopped container is restarted by a later `eph
-  up`. For `run` services it runs whenever the process is not already alive, and
-  for `compose` services it runs on **every** `eph up`. (See
-  [Core Concepts](concepts.md#the-service-lifecycle).) A failing `post-start`
+- `post-start` runs on **every** `eph up`, for every service, regardless of
+  whether the container was freshly created or an existing one was restarted.
+  Write hooks to be idempotent (a migration that no-ops when applied, an
+  `INSERT ... ON CONFLICT` seed); for one-off or destructive work use
+  [`eph run`](command-reference.md#eph-run-cmd) instead. A failing `post-start`
   aborts `eph up`.
-- `pre-stop` failures are logged but do not stop the teardown.
+- `post-start` hooks run only after **every** service in the same `eph up` is
+  healthy, so a hook may reference any other service's assigned port through a
+  top-level variable (for example a `DATABASE_URL` that interpolates
+  `${postgres.port}`).
+- A failing `pre-stop` hook aborts the `eph down` / `eph clean` and leaves the
+  service running, so a backup or drain that fails is not silently skipped. Fix
+  the hook and retry, or pass `--skip-hooks` to tear down without running it.
+- `eph up --skip-hooks` likewise brings services up without running their
+  `post-start` hooks.
 
-See [Core Concepts](concepts.md#the-service-lifecycle) for exactly when each
-path is taken.
+See [Core Concepts](concepts.md#the-service-lifecycle) for the full lifecycle.
 
 ## Interpolation
 
