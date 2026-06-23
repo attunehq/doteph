@@ -38,9 +38,11 @@ Causes, in rough order of likelihood:
    `pg_isready`, `curl` must exist inside the container. Slim images may omit
    them.
 3. **The service genuinely needs longer.** Raise `ready-timeout=` (seconds).
-4. **The service crashed on startup.** Inspect the container directly:
-   `docker logs eph-<short_id>-<service>` (get the name from `eph info` +
-   service name, or `docker ps -a`).
+4. **The service crashed on startup.** Inspect its logs with
+   `eph logs <service>` (works for every service type, and shows a `run=`
+   service's output even after it exited). For Docker-backed services you can
+   also go straight to the daemon: `docker logs eph-<short_id>-<service>` (get
+   the name from `eph info` + service name, or `docker ps -a`).
 
 Run `eph -v up` to watch each health-check attempt and its exit code.
 
@@ -147,11 +149,12 @@ Windows build.
 
 ## Getting more detail
 
-`eph -v <command>` enables debug logging (to stderr). For Docker-level issues,
+`eph -v <command>` enables debug logging (to stderr). For a service's own
+output, use `eph logs <service>` (add `-f` to follow). For Docker-level issues,
 drop to the `docker` CLI using the names from `eph info`:
 
 ```sh
 docker ps -a | grep eph-<short_id>          # containers for this workspace
-docker logs eph-<short_id>-<service>        # a service's logs
+docker logs eph-<short_id>-<service>        # a service's logs (or: eph logs <service>)
 docker volume ls | grep eph-<short_id>      # named volumes for this workspace
 ```

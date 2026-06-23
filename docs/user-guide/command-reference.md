@@ -179,6 +179,41 @@ eph run sh -c 'psql "$DATABASE_URL" < dump.sql'   # use sh -c for shell features
 - Unlike `post-start`, `eph run` executes every time you invoke it -- use it for
   repeatable operations (seeding, resets, ad-hoc queries).
 
+## `eph logs [SERVICE] [-f] [-n N]`
+
+Show a service's logs. Works across every service type from one command: `run`
+services read from the log file eph captures their output to; `image` /
+`dockerfile` services proxy `docker logs`; `compose` services proxy
+`docker compose logs`.
+
+| Flag | Description |
+|------|-------------|
+| `-f`, `--follow` | Stream new output as it is produced (like `tail -f`); Ctrl-C to stop. Works with or without a `SERVICE`. |
+| `-n`, `--tail N` | Show only the last `N` lines before printing/streaming. |
+
+```sh
+eph logs                      # every service interleaved, each line tagged [name]
+eph logs -f                   # follow all services at once (Ctrl-C to stop)
+eph logs worker               # just the worker service (untagged, raw)
+eph logs -f worker            # follow worker
+eph logs -n 50 postgres       # last 50 lines
+```
+
+- Logs are shown **even for a stopped service**, so a `run` service that died on
+  startup still leaves an inspectable trace. (Its output is captured to
+  `<state-dir>/logs/<service>.log`; see [`eph info`](#eph-info) for the state
+  directory.)
+- A `run` service's log file is truncated each time the service is freshly
+  started, so it reflects the current run.
+- With no `SERVICE`, every service is streamed concurrently and **interleaved**
+  in arrival order (like `docker compose logs`), with each line prefixed by a
+  right-aligned, color-coded `[name]` tag. Lines are emitted whole, so two
+  services never interleave mid-line. A single `eph logs <service>` is untagged
+  and passes the raw stream through. Colors are emitted only to a terminal and
+  suppressed when `NO_COLOR` is set or output is piped.
+- `eph clean` removes the captured log files along with the rest of the
+  workspace state.
+
 ## `eph check`
 
 Parse and validate the `.eph` file without touching Docker. Reports the
@@ -283,10 +318,8 @@ eph skills list
 
 ## Commands that do not exist (by design)
 
-The list above is the complete command set. A couple of things people look for
-are deliberately delegated elsewhere:
+The list above is the complete command set. One thing people look for is
+deliberately delegated elsewhere:
 
-- **There is no `eph logs`.** Inspect a service's logs with the `docker` CLI
-  using the name from `eph info`: `docker logs eph-<short_id>-<service>`.
 - **There is no `eph init` or scaffolder.** Create the `.eph` file by hand (see
   [Getting Started](getting-started.md)) and validate it with `eph check`.

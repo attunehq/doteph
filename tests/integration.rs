@@ -820,6 +820,273 @@ DATABASE_URL=postgres://test:test@localhost:${postgres.port}/test
 }
 
 // ============================================================================
+// Logs Tests
+// ============================================================================
+
+// `run=` shell services are spawned by eph and tracked/killed via POSIX tools,
+// so they are Unix-only (Windows requires WSL); gate the capture test to match.
+#[cfg(unix)]
+#[tokio::test]
+async fn logs_captures_run_service_output() {
+    // The command prints a known marker, then sleeps so the process stays alive
+    // long enough for `eph logs` to read its captured output.
+    let ws = TestWorkspace::new(
+        r#"
+[worker]
+run=echo hello-from-run-logs && sleep 300
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+
+    // The captured stdout should be visible via `eph logs`.
+    let logs = ws.eph_ok(&["logs", "worker"]).await;
+    assert!(
+        logs.contains("hello-from-run-logs"),
+        "expected captured run= output in logs, got:\n{}",
+        logs
+    );
+
+    // --tail 1 should still include the single emitted line.
+    let tailed = ws.eph_ok(&["logs", "-n", "1", "worker"]).await;
+    assert!(
+        tailed.contains("hello-from-run-logs"),
+        "expected tailed run= output, got:\n{}",
+        tailed
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// Even after a `run=` service dies, its captured log should remain readable --
+// the core motivation for capturing it (a service that dies on startup must
+// leave a trace).
+#[cfg(unix)]
+#[tokio::test]
+async fn logs_persist_after_run_service_exits() {
+    let ws = TestWorkspace::new(
+        r#"
+[doomed]
+run=echo about-to-die && exit 1
+"#,
+    );
+
+    // The process exits immediately; `eph up` still returns (no healthcheck).
+    ws.eph_ok(&["up"]).await;
+
+    let logs = ws.eph_ok(&["logs", "doomed"]).await;
+    assert!(
+        logs.contains("about-to-die"),
+        "expected the dead service's trace to survive, got:\n{}",
+        logs
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// `eph logs` for an image-backed service proxies `docker logs`.
+#[tokio::test]
+async fn logs_proxies_docker_for_image_service() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+
+    let logs = ws.eph_ok(&["logs", "redis"]).await;
+    // redis announces its readiness on startup; any non-empty proxied output
+    // confirms the docker-logs path works without coupling to an exact string.
+    assert!(
+        !logs.trim().is_empty(),
+        "expected docker logs output for redis, got empty"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// `eph logs` with no SERVICE prefixes every line with a `[name]` tag.
+#[cfg(unix)]
+#[tokio::test]
+async fn logs_all_services_tags_each_line() {
+    let ws = TestWorkspace::new(
+        r#"
+[alpha]
+run=echo alpha-marker && sleep 300
+
+[beta]
+run=echo beta-marker && sleep 300
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+
+    // Output is captured (not a TTY), so tags are uncolored. Each service's
+    // output line is prefixed in place by its `[name]` tag. `[alpha]` is the
+    // widest tag, so its lines carry no left padding; `[beta]` is right-aligned
+    // under it, so the substring "[beta] beta-marker" still appears verbatim.
+    let logs = ws.eph_ok(&["logs"]).await;
+    assert!(
+        logs.contains("[alpha] alpha-marker"),
+        "alpha line not tagged in place:\n{logs}"
+    );
+    assert!(
+        logs.contains("[beta] beta-marker"),
+        "beta line not tagged in place:\n{logs}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// `eph logs` with no SERVICE must exit non-zero when a Docker-backed source
+// fails (here: an image service whose container does not exist because it was
+// never started), matching the single-service path. Regression test for the
+// all-services path silently swallowing per-task `docker logs` failures.
+#[tokio::test]
+async fn logs_all_services_fails_when_a_docker_source_fails() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+"#,
+    );
+
+    // Note: no `eph up`, so no container exists -- `docker logs <container>`
+    // exits non-zero, and that failure must surface as a non-zero exit.
+    let single = ws.eph(&["logs", "redis"]).await;
+    assert!(
+        !single.status.success(),
+        "single-service logs should fail for a missing container"
+    );
+
+    let all = ws.eph(&["logs"]).await;
+    assert!(
+        !all.status.success(),
+        "all-services logs should fail when a docker source fails:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&all.stdout),
+        String::from_utf8_lossy(&all.stderr),
+    );
+}
+
+// `eph logs -f` with no SERVICE follows every service at once, interleaving
+// their tagged lines as they arrive.
+#[cfg(unix)]
+#[tokio::test]
+async fn logs_follow_all_services_interleaves() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // Two services that each emit a tagged line roughly every 200ms, so a
+    // follow-all stream sees output from both within a couple of seconds.
+    let ws = TestWorkspace::new(
+        r#"
+[alpha]
+run=i=0; while [ $i -lt 100 ]; do echo alpha-$i; i=$((i+1)); sleep 0.2; done
+
+[beta]
+run=i=0; while [ $i -lt 100 ]; do echo beta-$i; i=$((i+1)); sleep 0.2; done
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+
+    let eph_binary = env!("CARGO_BIN_EXE_eph");
+    let mut child = tokio::process::Command::new(eph_binary)
+        .args(["logs", "-f"])
+        .current_dir(ws.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn `eph logs -f`");
+
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut reader = BufReader::new(stdout).lines();
+    let mut saw_alpha = false;
+    let mut saw_beta = false;
+
+    // Read until both services' tagged lines have appeared, or time out.
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Ok(Some(line)) = reader.next_line().await {
+            // Output is piped (not a TTY), so tags are uncolored plain text.
+            if line.contains("[alpha] alpha-") {
+                saw_alpha = true;
+            }
+            if line.contains("[beta] beta-") {
+                saw_beta = true;
+            }
+            if saw_alpha && saw_beta {
+                return;
+            }
+        }
+    })
+    .await;
+
+    let _ = child.kill().await;
+    ws.eph_ok(&["down"]).await;
+
+    assert!(
+        result.is_ok(),
+        "timed out before seeing both services (alpha={saw_alpha}, beta={saw_beta})"
+    );
+}
+
+// `eph logs -n N` returns exactly the last N lines of a `run=` service's log.
+#[cfg(unix)]
+#[tokio::test]
+async fn logs_tail_returns_last_n_lines() {
+    let ws = TestWorkspace::new(
+        r#"
+[svc]
+run=for i in 1 2 3 4 5; do echo tailline-$i; done; sleep 300
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+
+    let tail = ws.eph_ok(&["logs", "-n", "2", "svc"]).await;
+    let lines: Vec<&str> = tail.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["tailline-4", "tailline-5"],
+        "expected only the last 2 lines, got:\n{tail}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// Captured `run=` logs can contain secrets, so the log file and its directory
+// are created owner-only (0600/0700).
+#[cfg(unix)]
+#[tokio::test]
+async fn logs_run_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let ws = TestWorkspace::new("[svc]\nrun=echo hi && sleep 300\n");
+    ws.eph_ok(&["up"]).await;
+
+    let info = ws.eph_ok(&["info"]).await;
+    let state_dir = info
+        .lines()
+        .find_map(|l| l.strip_prefix("State directory: "))
+        .expect("`eph info` should report the state directory")
+        .trim();
+    let logs_dir = std::path::Path::new(state_dir).join("logs");
+    let log_file = logs_dir.join("svc.log");
+
+    let file_mode = std::fs::metadata(&log_file).unwrap().permissions().mode() & 0o777;
+    let dir_mode = std::fs::metadata(&logs_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(file_mode, 0o600, "log file should be owner read/write only");
+    assert_eq!(dir_mode, 0o700, "logs dir should be owner-only");
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// ============================================================================
 // Error Handling Tests
 // ============================================================================
 
