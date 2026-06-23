@@ -163,6 +163,23 @@ of eph's injected variables, piping, or globbing. `eph run` exits with the
 command's own exit code. Use it for repeatable operations (seeding, resets,
 ad-hoc queries) -- unlike `post-start`, it runs every time you invoke it.
 
+## Inspecting logs: `eph logs`
+
+```sh
+eph logs                 # every service, each line tagged with [name]
+eph logs <service>       # one service, raw (untagged)
+eph logs -f <service>    # follow (tail -f); Ctrl-C to stop
+eph logs -n 50 <service> # last 50 lines
+```
+
+Works for every service type: `run=` services read from a captured log file,
+while `image=` / `dockerfile=` / `compose=` services proxy `docker logs` /
+`docker compose logs`. With no service, every line is prefixed by a color-coded
+`[name]` tag (compose-style); a single `eph logs <service>` is untagged and
+pipe-friendly. Logs show even for a stopped service, so a `run=` service that
+died on startup still leaves a trace -- check `eph logs <service>` when a service
+is missing from `eph status`. `--follow` needs a single service.
+
 ## Behaviors that matter
 
 - **Ports are random and change per create.** Never hardcode a host port; always
@@ -176,8 +193,7 @@ ad-hoc queries) -- unlike `post-start`, it runs every time you invoke it.
 - **A service with no health check** is given a fixed short wait, so it may need a
   moment to accept connections after `eph up` returns; retry your first connect.
 - **Isolation by path**: two checkouts are different containers, volumes, and
-  ports. There is no `eph logs` (use `docker logs eph-<short_id>-<service>`) and
-  no `eph init` (author `.eph` by hand).
+  ports. There is no `eph init` (author `.eph` by hand).
 - **Output is on stdout; logs go to stderr.** `eph env` output is clean for
   `eval` and piping. Add `-v` / `--verbose` for debug logging on stderr.
 

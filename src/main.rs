@@ -12,11 +12,11 @@
 #![warn(clippy::complexity)]
 #![warn(clippy::perf)]
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use eph::parser::{self, EphFile, ServiceSource};
-use eph::{ServiceManager, Workspace, skills};
-use std::io::{self, Write};
+use eph::{LogOptions, ServiceManager, Workspace, skills};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitCode};
 use tracing_subscriber::EnvFilter;
@@ -98,6 +98,28 @@ enum Commands {
         command: Vec<String>,
     },
 
+    /// Show logs for services.
+    ///
+    /// With a SERVICE, shows that service's logs; without one, shows every
+    /// defined service's logs in turn (each under a `==> name <==` header).
+    /// `run=` services read from their captured log file; `image=` /
+    /// `dockerfile=` / `compose=` services proxy `docker logs` /
+    /// `docker compose logs`. Logs are shown even for a stopped service, so a
+    /// `run=` service that died on startup still leaves a trace.
+    Logs {
+        /// Service to show logs for (defaults to every defined service).
+        #[arg(value_name = "SERVICE")]
+        service: Option<String>,
+
+        /// Follow log output, like `tail -f` (requires a single SERVICE).
+        #[arg(short = 'f', long)]
+        follow: bool,
+
+        /// Show only the last N lines.
+        #[arg(short = 'n', long, value_name = "N")]
+        tail: Option<usize>,
+    },
+
     /// Parse and validate .eph file
     Check,
 
@@ -176,6 +198,13 @@ async fn main() -> Result<ExitCode> {
         Commands::Status => cmd_status().await.map(|()| ExitCode::SUCCESS),
         Commands::Env { format } => cmd_env(&format).await.map(|()| ExitCode::SUCCESS),
         Commands::Run { command } => cmd_run(command).await,
+        Commands::Logs {
+            service,
+            follow,
+            tail,
+        } => cmd_logs(service, follow, tail)
+            .await
+            .map(|()| ExitCode::SUCCESS),
         Commands::Check => cmd_check().await.map(|()| ExitCode::SUCCESS),
         Commands::Info => cmd_info().await.map(|()| ExitCode::SUCCESS),
         // Skills commands are synchronous filesystem work; they do not touch
@@ -377,6 +406,98 @@ async fn cmd_run(command: Vec<String>) -> Result<ExitCode> {
     // code; report the conventional 128 + signal-style failure as 1.
     let code = status.code().unwrap_or(1);
     Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
+}
+
+/// Show logs for one service, or for every defined service in turn.
+async fn cmd_logs(service: Option<String>, follow: bool, tail: Option<usize>) -> Result<()> {
+    let workspace = Workspace::find_from_cwd()?;
+    let eph = load_eph_file(&workspace)?;
+    let manager = ServiceManager::new(workspace).await?;
+    let opts = LogOptions { follow, tail };
+
+    if let Some(name) = service {
+        return manager.logs(&eph, &name, &opts).await;
+    }
+
+    // Following only makes sense for a single stream; interleaving several
+    // proxied `docker logs -f` and file tails is out of scope, so ask the user
+    // to pick one rather than silently following just the first.
+    if follow {
+        bail!("specify a single SERVICE to follow, e.g. `eph logs -f <service>`");
+    }
+
+    // No service given: print every service's logs with each line prefixed by a
+    // `[name]` tag, the way `docker compose logs` does. Sort by name so the
+    // output is stable across runs regardless of the underlying map order. A
+    // failure for one service is reported but does not abort the rest (e.g. one
+    // container was removed but others still have logs).
+    let mut names: Vec<&String> = eph.services.keys().collect();
+    names.sort();
+
+    // Right-align every tag to the widest one so the log text lines up in a
+    // column. Color the tag per service (deterministically from its name) when
+    // writing to a terminal, matching the compose-logs look.
+    let tag_width = names
+        .iter()
+        .map(|n| n.chars().count() + 2) // +2 for the surrounding brackets
+        .max()
+        .unwrap_or(0);
+    let colorize = should_colorize();
+
+    for name in &names {
+        let text = match manager.collect_logs(&eph, name, tail).await {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("eph: {:#}", e);
+                continue;
+            }
+        };
+
+        let tag = format!("[{}]", name);
+        let pad = " ".repeat(tag_width.saturating_sub(tag.chars().count()));
+        let tag = if colorize {
+            format!("\x1b[{}m{}\x1b[0m", tag_color(name), tag)
+        } else {
+            tag
+        };
+
+        // Lock stdout per service (not across the await above, which would make
+        // this future non-Send). A write error means the reader hung up -- e.g.
+        // `eph logs | head` -- so stop quietly rather than panicking as the
+        // `println!` macro would.
+        let stdout = io::stdout();
+        let mut out = stdout.lock();
+        for line in text.lines() {
+            if writeln!(out, "{pad}{tag} {line}").is_err() {
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// ANSI SGR foreground codes used to color `eph logs` service tags. Theme-aware
+/// terminal palette colors (rather than fixed RGB) so they stay legible on both
+/// light and dark backgrounds. Red is omitted to avoid an error connotation.
+const TAG_COLORS: &[u8] = &[36, 33, 32, 35, 34, 96, 93, 92, 95, 94];
+
+/// Pick a stable color for a service tag by hashing its name (FNV-1a) into
+/// [`TAG_COLORS`], so a given service always gets the same color.
+fn tag_color(name: &str) -> u8 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in name.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    TAG_COLORS[(hash as usize) % TAG_COLORS.len()]
+}
+
+/// Whether to emit ANSI color: only when stdout is a terminal and the caller has
+/// not opted out via the `NO_COLOR` convention. Keeps piped/redirected output
+/// (`eph logs | grep`, `eph logs > file`) clean.
+fn should_colorize() -> bool {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
 async fn cmd_check() -> Result<()> {

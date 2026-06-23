@@ -12,7 +12,8 @@ use bollard::query_parameters::{
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command as TokioCommand;
@@ -61,6 +62,15 @@ impl RunningService {
     pub fn named_port(&self, name: &str) -> Option<u16> {
         self.ports.get(name).copied()
     }
+}
+
+/// Options controlling how `eph logs` renders a service's output.
+#[derive(Debug, Clone, Default)]
+pub struct LogOptions {
+    /// Keep streaming new output as it is produced (like `tail -f`).
+    pub follow: bool,
+    /// Show only the last `N` lines before streaming/returning.
+    pub tail: Option<usize>,
 }
 
 /// Resolve the top-level `KEY=VALUE` environment variables declared in an
@@ -258,6 +268,53 @@ fn map_named_ports(declared: &[PortMapping], raw: &HashMap<String, u16>) -> Hash
         }
     }
     named
+}
+
+/// Run a `docker ...` command and return its combined output as text.
+///
+/// `docker logs` sends the container's stdout to our stdout and its stderr to
+/// our stderr, so both are captured and concatenated (stdout first). Ordering
+/// across the two streams is lost, but most services log to one of them, which
+/// is good enough for the tagged aggregate view.
+async fn capture_docker(args: &[String]) -> Result<String> {
+    let output = TokioCommand::new("docker")
+        .args(args)
+        .output()
+        .await
+        .context("failed to run docker (is docker on PATH?)")?;
+
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        text.push_str(&stderr);
+    }
+    Ok(text)
+}
+
+/// Read a log file, optionally trimming to the last `tail` lines.
+///
+/// Bytes are decoded lossily so a stray non-UTF-8 byte in a service's output
+/// does not abort `eph logs`. When `tail` is `Some(n)`, the last `n` lines are
+/// returned with a trailing newline (so the next follow chunk starts on its own
+/// line); when `None`, the file is returned verbatim. A request for more lines
+/// than the file holds returns the whole file.
+fn read_tail(path: &Path, tail: Option<usize>) -> Result<String> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read log file: {}", path.display()))?;
+    let content = String::from_utf8_lossy(&bytes);
+
+    match tail {
+        Some(n) => {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = lines.len().saturating_sub(n);
+            let mut tail_lines = lines[start..].join("\n");
+            if !tail_lines.is_empty() {
+                tail_lines.push('\n');
+            }
+            Ok(tail_lines)
+        }
+        None => Ok(content.into_owned()),
+    }
 }
 
 /// Docker client wrapper
@@ -1033,21 +1090,36 @@ impl ServiceManager {
             env_vars.insert(k.clone(), v.clone());
         }
 
-        // Start the process with detached stdio. A run= service is long-lived;
-        // if it inherited eph's stdout/stderr it would keep those pipe
-        // write-ends open after `eph up` returns, so any caller that captures
-        // eph's output (a test harness, `eph up | tee`, a CI step) would block
-        // forever waiting for EOF. Discard the child's output instead. (Logs are
-        // not captured today; a future enhancement could redirect to a
-        // per-service log file under the workspace state dir.)
+        // Capture the child's stdout/stderr to a per-service log file under the
+        // workspace state dir, readable via `eph logs <service>`. This also
+        // solves a pipe-inheritance hang: a run= service is long-lived, so if it
+        // inherited eph's stdout/stderr it would keep those pipe write-ends open
+        // after `eph up` returns, and any caller capturing eph's output (a test
+        // harness, `eph up | tee`, a CI step) would block forever waiting for
+        // EOF. A file write-end has no such reader, so redirecting to a file both
+        // preserves the output and avoids the hang. The file is truncated on each
+        // fresh spawn so the log reflects the current run; a still-running service
+        // is reused above and never reaches this point, so its log is preserved.
+        let log_path = self.workspace.log_file_path(name)?;
+        if let Some(parent) = log_path.parent() {
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
+                format!("failed to create logs directory: {}", parent.display())
+            })?;
+        }
+        let log_file = std::fs::File::create(&log_path)
+            .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
+        let log_file_err = log_file
+            .try_clone()
+            .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
+
         let child = TokioCommand::new("sh")
             .arg("-c")
             .arg(cmd)
             .current_dir(&self.workspace.path)
             .envs(&env_vars)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_err))
             .spawn()
             .with_context(|| format!("failed to start command: {}", cmd))?;
 
@@ -1515,6 +1587,245 @@ impl ServiceManager {
         Ok(result)
     }
 
+    /// Stream or print a service's logs to stdout.
+    ///
+    /// The log source depends on the service's backend, so a single command
+    /// works across all of them:
+    ///
+    /// - `run=` services are spawned by eph with their output captured to
+    ///   `<state_dir>/logs/<service>.log`; that file is read here.
+    /// - `image=` / `dockerfile=` services proxy `docker logs <container>`.
+    /// - `compose=` services proxy `docker compose ... logs`.
+    ///
+    /// Logs are shown regardless of whether the service is currently running, so
+    /// a `run=` service that died on startup still leaves an inspectable trace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is not a defined service, if a log file cannot
+    /// be read, or if a proxied `docker` invocation fails.
+    pub async fn logs(&self, eph: &EphFile, name: &str, opts: &LogOptions) -> Result<()> {
+        let service = eph
+            .services
+            .get(name)
+            .with_context(|| format!("unknown service: {}", name))?;
+
+        match &service.source {
+            ServiceSource::Command(_) => self.logs_from_file(name, opts).await,
+            ServiceSource::Compose(path) => self.logs_from_compose(name, path, opts).await,
+            ServiceSource::Image(_) | ServiceSource::Dockerfile(_) => {
+                let container_name = self.workspace.container_name(name);
+                self.logs_from_container(&container_name, opts).await
+            }
+        }
+    }
+
+    /// Collect a service's logs as plain text (no follow).
+    ///
+    /// Unlike [`logs`](Self::logs), which streams a single service's output
+    /// verbatim to stdout, this buffers the output and returns it so the caller
+    /// can prefix every line with a per-service tag. It is used by the
+    /// multi-service `eph logs` view (no `SERVICE` argument).
+    ///
+    /// The source matches [`logs`](Self::logs): `run=` reads the captured log
+    /// file, while Docker- and compose-backed services capture `docker logs` /
+    /// `docker compose logs`. For compose, the per-container prefix is stripped
+    /// (`--no-log-prefix`) since the caller adds eph's own `[service]` tag.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is not a defined service, if a log file cannot
+    /// be read, or if a proxied `docker` invocation fails.
+    pub async fn collect_logs(
+        &self,
+        eph: &EphFile,
+        name: &str,
+        tail: Option<usize>,
+    ) -> Result<String> {
+        let service = eph
+            .services
+            .get(name)
+            .with_context(|| format!("unknown service: {}", name))?;
+
+        match &service.source {
+            ServiceSource::Command(_) => {
+                let path = self.workspace.log_file_path(name)?;
+                if !path.exists() {
+                    // Not started yet (or already cleaned): no logs to show, but
+                    // not an error -- the aggregate view simply skips it.
+                    return Ok(String::new());
+                }
+                read_tail(&path, tail)
+            }
+            ServiceSource::Compose(path) => {
+                let compose_file = self.workspace.path.join(path);
+                let project_name = format!("eph-{}-{}", self.workspace.short_id, name);
+                let mut args = vec![
+                    "compose".to_string(),
+                    "-f".to_string(),
+                    compose_file.to_string_lossy().into_owned(),
+                    "-p".to_string(),
+                    project_name,
+                    "logs".to_string(),
+                    "--no-color".to_string(),
+                    "--no-log-prefix".to_string(),
+                ];
+                if let Some(n) = tail {
+                    args.push("--tail".to_string());
+                    args.push(n.to_string());
+                }
+                capture_docker(&args).await
+            }
+            ServiceSource::Image(_) | ServiceSource::Dockerfile(_) => {
+                let container_name = self.workspace.container_name(name);
+                let mut args = vec!["logs".to_string()];
+                if let Some(n) = tail {
+                    args.push("--tail".to_string());
+                    args.push(n.to_string());
+                }
+                args.push(container_name);
+                capture_docker(&args).await
+            }
+        }
+    }
+
+    /// Read (and optionally follow) a `run=` service's captured log file.
+    ///
+    /// A missing file is not an error: it just means the service has not been
+    /// started yet, so a hint is printed to stderr and the call returns `Ok`.
+    async fn logs_from_file(&self, name: &str, opts: &LogOptions) -> Result<()> {
+        let path = self.workspace.log_file_path(name)?;
+        if !path.exists() {
+            eprintln!(
+                "eph: no logs for '{}' yet (run= output is captured to {} once started)",
+                name,
+                path.display()
+            );
+            return Ok(());
+        }
+
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+
+        // Dump the existing contents (last N lines when --tail is set), then
+        // remember where the file ends so --follow only prints what is appended
+        // afterwards. The offset is the file length, independent of how many
+        // bytes we chose to print, so tail + follow line up.
+        let initial = read_tail(&path, opts.tail)?;
+        out.write_all(initial.as_bytes())
+            .context("failed to write logs to stdout")?;
+        out.flush().ok();
+
+        if !opts.follow {
+            return Ok(());
+        }
+
+        let mut offset = std::fs::metadata(&path)
+            .with_context(|| format!("failed to stat log file: {}", path.display()))?
+            .len();
+
+        loop {
+            // Wait a beat between polls, but break promptly on Ctrl-C so follow
+            // is interruptible like `tail -f` / `docker logs -f`.
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                () = sleep(Duration::from_millis(200)) => {}
+            }
+
+            let len = match std::fs::metadata(&path) {
+                Ok(meta) => meta.len(),
+                // The file can briefly vanish if the workspace is cleaned out
+                // from under a follow; treat that as nothing-new and keep polling.
+                Err(_) => continue,
+            };
+
+            // A shorter file means it was truncated or rotated (e.g. the service
+            // was restarted): reset to the new beginning rather than seeking past
+            // the end.
+            if len < offset {
+                offset = 0;
+            }
+            if len > offset {
+                let mut file = std::fs::File::open(&path)
+                    .with_context(|| format!("failed to open log file: {}", path.display()))?;
+                file.seek(SeekFrom::Start(offset))
+                    .context("failed to seek log file")?;
+                let mut buf = Vec::new();
+                let read = file
+                    .read_to_end(&mut buf)
+                    .context("failed to read log file")?;
+                offset += read as u64;
+                out.write_all(&buf)
+                    .context("failed to write logs to stdout")?;
+                out.flush().ok();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Proxy `docker logs` for an `image=` / `dockerfile=` service.
+    async fn logs_from_container(&self, container_name: &str, opts: &LogOptions) -> Result<()> {
+        let mut args = vec!["logs".to_string()];
+        if let Some(n) = opts.tail {
+            args.push("--tail".to_string());
+            args.push(n.to_string());
+        }
+        if opts.follow {
+            args.push("--follow".to_string());
+        }
+        args.push(container_name.to_string());
+
+        // Inherit eph's stdio so `docker logs` writes straight to the terminal
+        // and handles its own Ctrl-C while following.
+        let status = TokioCommand::new("docker")
+            .args(&args)
+            .status()
+            .await
+            .context("failed to run `docker logs` (is docker on PATH?)")?;
+        if !status.success() {
+            bail!("`docker logs {}` failed", container_name);
+        }
+        Ok(())
+    }
+
+    /// Proxy `docker compose ... logs` for a `compose=` service.
+    async fn logs_from_compose(
+        &self,
+        name: &str,
+        compose_path: &str,
+        opts: &LogOptions,
+    ) -> Result<()> {
+        let compose_file = self.workspace.path.join(compose_path);
+        let project_name = format!("eph-{}-{}", self.workspace.short_id, name);
+
+        let mut args = vec![
+            "compose".to_string(),
+            "-f".to_string(),
+            compose_file.to_string_lossy().into_owned(),
+            "-p".to_string(),
+            project_name,
+            "logs".to_string(),
+        ];
+        if let Some(n) = opts.tail {
+            args.push("--tail".to_string());
+            args.push(n.to_string());
+        }
+        if opts.follow {
+            args.push("--follow".to_string());
+        }
+
+        let status = TokioCommand::new("docker")
+            .args(&args)
+            .status()
+            .await
+            .context("failed to run `docker compose logs` (is docker on PATH?)")?;
+        if !status.success() {
+            bail!("`docker compose logs` failed for {}", name);
+        }
+        Ok(())
+    }
+
     /// The environment a non-service command (`eph run`) inherits from eph: the
     /// resolved top-level `.eph` variables plus the `EPH_*` metadata variables.
     ///
@@ -1614,6 +1925,54 @@ mod tests {
 
         assert_eq!(mapped.get("default"), Some(&49153));
         assert_eq!(mapped.len(), 1);
+    }
+
+    #[test]
+    fn read_tail_returns_whole_file_when_no_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.log");
+        std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
+
+        assert_eq!(read_tail(&path, None).unwrap(), "line1\nline2\nline3\n");
+    }
+
+    #[test]
+    fn read_tail_trims_to_last_n_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.log");
+        std::fs::write(&path, "a\nb\nc\nd\ne\n").unwrap();
+
+        assert_eq!(read_tail(&path, Some(2)).unwrap(), "d\ne\n");
+    }
+
+    #[test]
+    fn read_tail_more_lines_than_file_returns_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.log");
+        std::fs::write(&path, "only\ntwo\n").unwrap();
+
+        assert_eq!(read_tail(&path, Some(100)).unwrap(), "only\ntwo\n");
+    }
+
+    #[test]
+    fn read_tail_empty_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.log");
+        std::fs::write(&path, "").unwrap();
+
+        assert_eq!(read_tail(&path, None).unwrap(), "");
+        assert_eq!(read_tail(&path, Some(5)).unwrap(), "");
+    }
+
+    #[test]
+    fn read_tail_decodes_invalid_utf8_lossily() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.log");
+        // An invalid byte (0xFF) must not abort the read.
+        std::fs::write(&path, [b'o', b'k', 0xFF, b'\n']).unwrap();
+
+        let out = read_tail(&path, None).unwrap();
+        assert!(out.starts_with("ok"), "got {out:?}");
     }
 
     /// Regression for #14: re-keying the raw bindings reproduces the same map on

@@ -23,5 +23,5 @@ pub mod workspace;
 
 pub use env::{escape_bash, escape_fish, render, render_export, render_fish, render_json};
 pub use parser::{EphFile, Service, ServiceSource, parse, resolve_interpolations};
-pub use service::{RunningService, ServiceManager, resolve_env_vars};
+pub use service::{LogOptions, RunningService, ServiceManager, resolve_env_vars};
 pub use workspace::Workspace;

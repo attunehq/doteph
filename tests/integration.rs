@@ -820,6 +820,128 @@ DATABASE_URL=postgres://test:test@localhost:${postgres.port}/test
 }
 
 // ============================================================================
+// Logs Tests
+// ============================================================================
+
+// `run=` shell services are spawned by eph and tracked/killed via POSIX tools,
+// so they are Unix-only (Windows requires WSL); gate the capture test to match.
+#[cfg(unix)]
+#[tokio::test]
+async fn logs_captures_run_service_output() {
+    // The command prints a known marker, then sleeps so the process stays alive
+    // long enough for `eph logs` to read its captured output.
+    let ws = TestWorkspace::new(
+        r#"
+[worker]
+run=echo hello-from-run-logs && sleep 300
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+
+    // The captured stdout should be visible via `eph logs`.
+    let logs = ws.eph_ok(&["logs", "worker"]).await;
+    assert!(
+        logs.contains("hello-from-run-logs"),
+        "expected captured run= output in logs, got:\n{}",
+        logs
+    );
+
+    // --tail 1 should still include the single emitted line.
+    let tailed = ws.eph_ok(&["logs", "-n", "1", "worker"]).await;
+    assert!(
+        tailed.contains("hello-from-run-logs"),
+        "expected tailed run= output, got:\n{}",
+        tailed
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// Even after a `run=` service dies, its captured log should remain readable --
+// the core motivation for capturing it (a service that dies on startup must
+// leave a trace).
+#[cfg(unix)]
+#[tokio::test]
+async fn logs_persist_after_run_service_exits() {
+    let ws = TestWorkspace::new(
+        r#"
+[doomed]
+run=echo about-to-die && exit 1
+"#,
+    );
+
+    // The process exits immediately; `eph up` still returns (no healthcheck).
+    ws.eph_ok(&["up"]).await;
+
+    let logs = ws.eph_ok(&["logs", "doomed"]).await;
+    assert!(
+        logs.contains("about-to-die"),
+        "expected the dead service's trace to survive, got:\n{}",
+        logs
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// `eph logs` for an image-backed service proxies `docker logs`.
+#[tokio::test]
+async fn logs_proxies_docker_for_image_service() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+
+    let logs = ws.eph_ok(&["logs", "redis"]).await;
+    // redis announces its readiness on startup; any non-empty proxied output
+    // confirms the docker-logs path works without coupling to an exact string.
+    assert!(
+        !logs.trim().is_empty(),
+        "expected docker logs output for redis, got empty"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// `eph logs` with no SERVICE prefixes every line with a `[name]` tag.
+#[cfg(unix)]
+#[tokio::test]
+async fn logs_all_services_tags_each_line() {
+    let ws = TestWorkspace::new(
+        r#"
+[alpha]
+run=echo alpha-marker && sleep 300
+
+[beta]
+run=echo beta-marker && sleep 300
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+
+    // Output is captured (not a TTY), so tags are uncolored. Each service's
+    // output line is prefixed in place by its `[name]` tag. `[alpha]` is the
+    // widest tag, so its lines carry no left padding; `[beta]` is right-aligned
+    // under it, so the substring "[beta] beta-marker" still appears verbatim.
+    let logs = ws.eph_ok(&["logs"]).await;
+    assert!(
+        logs.contains("[alpha] alpha-marker"),
+        "alpha line not tagged in place:\n{logs}"
+    );
+    assert!(
+        logs.contains("[beta] beta-marker"),
+        "beta line not tagged in place:\n{logs}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// ============================================================================
 // Error Handling Tests
 // ============================================================================
 

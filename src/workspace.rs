@@ -159,6 +159,35 @@ impl Workspace {
             .join(&self.short_id);
         Ok(state_dir)
     }
+
+    /// Get the directory holding captured `run=` service logs.
+    ///
+    /// This is `<state_dir>/logs`. Because it lives under
+    /// [`state_dir`](Self::state_dir), `eph clean` removes it along with the
+    /// rest of the workspace's persisted state -- no separate cleanup path is
+    /// needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the platform's local data directory cannot be
+    /// determined (see [`state_dir`](Self::state_dir)).
+    pub fn logs_dir(&self) -> Result<PathBuf> {
+        Ok(self.state_dir()?.join("logs"))
+    }
+
+    /// Get the path to a `run=` service's captured log file.
+    ///
+    /// This is `<state_dir>/logs/<service>.log`. Docker- and compose-backed
+    /// services keep their logs in the daemon (read via `docker logs`); only
+    /// `run=` services, which eph spawns directly, are captured here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the platform's local data directory cannot be
+    /// determined (see [`state_dir`](Self::state_dir)).
+    pub fn log_file_path(&self, service: &str) -> Result<PathBuf> {
+        Ok(self.logs_dir()?.join(format!("{service}.log")))
+    }
 }
 
 /// Compute a unique ID for a workspace based on its path
