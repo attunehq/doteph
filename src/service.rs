@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -292,6 +292,10 @@ struct LogLine {
 /// Read a `run=` service's captured log file line by line, sending each whole
 /// line to `tx`. When `follow` is set, keeps tailing appended bytes (holding any
 /// partial trailing line until its newline arrives) until the task is aborted.
+///
+/// The file is never loaded whole: `--tail N` seeks to the start of the last `N`
+/// lines via a bounded backward scan, and the forward read is chunked, so memory
+/// stays bounded even for an unbounded long-running service's log.
 async fn stream_file_lines(
     name: String,
     path: PathBuf,
@@ -299,35 +303,50 @@ async fn stream_file_lines(
     tail: Option<usize>,
     tx: mpsc::Sender<LogLine>,
 ) -> Result<()> {
-    // Snapshot the current contents: emit the complete lines (after --tail), and
-    // when following, carry the unterminated trailing fragment forward so a line
-    // split across the snapshot boundary is not emitted in two halves.
-    let bytes = std::fs::read(&path).unwrap_or_default();
-    let mut offset = bytes.len() as u64;
-    let content = String::from_utf8_lossy(&bytes).into_owned();
-    let mut segments: Vec<String> = content
-        .split('\n')
-        .map(|s| s.trim_end_matches('\r').to_string())
-        .collect();
-    // `split('\n')` always yields a final element: the text after the last
-    // newline ("" when the file ends on a newline). That is the partial line.
-    let mut partial = segments.pop().unwrap_or_default();
+    // A missing file just means the service has not started yet -- not an error.
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return Ok(());
+    };
+    let len = file.seek(SeekFrom::End(0)).unwrap_or(0);
 
-    if !follow && !partial.is_empty() {
-        // Not following: a trailing line with no newline is still real output.
-        segments.push(std::mem::take(&mut partial));
+    // Start at the last `tail` lines, or the whole file. tail_start_offset scans
+    // backward in blocks, so we read about `tail` lines' worth, not the whole file.
+    let start = match tail {
+        Some(n) => tail_start_offset(&mut file, len, n).unwrap_or(0),
+        None => 0,
+    };
+    let mut offset = start;
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Ok(());
     }
 
-    for line in apply_tail(segments, tail) {
-        if tx.send(line_for(&name, line)).await.is_err() {
+    // Read forward in chunks, emitting complete lines as they appear. Bytes are
+    // buffered (not decoded) until a line completes, so a multi-byte UTF-8 char
+    // straddling a chunk boundary is never split into replacement characters.
+    let mut pending: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    // `while let Ok` treats a read error as EOF, ending the dump.
+    while let Ok(read) = file.read(&mut buf) {
+        if read == 0 {
+            break;
+        }
+        offset += read as u64;
+        pending.extend_from_slice(&buf[..read]);
+        if !drain_complete_lines(&name, &mut pending, &tx).await {
             return Ok(());
         }
     }
 
     if !follow {
+        // A trailing line with no newline is still real output.
+        if !pending.is_empty() {
+            let _ = tx.send(line_for(&name, decode_log_line(&pending))).await;
+        }
         return Ok(());
     }
 
+    // Follow: poll for appended bytes, carrying `pending` across polls so a
+    // partial line is only emitted once its newline arrives.
     loop {
         sleep(Duration::from_millis(200)).await;
 
@@ -340,7 +359,7 @@ async fn stream_file_lines(
         // start over from the new beginning.
         if len < offset {
             offset = 0;
-            partial.clear();
+            pending.clear();
         }
         if len <= offset {
             continue;
@@ -352,22 +371,13 @@ async fn stream_file_lines(
         if file.seek(SeekFrom::Start(offset)).is_err() {
             continue;
         }
-        let mut buf = Vec::new();
-        let Ok(read) = file.read_to_end(&mut buf) else {
-            continue;
-        };
-        offset += read as u64;
-        partial.push_str(&String::from_utf8_lossy(&buf));
-
-        // Emit only the complete lines now in the buffer; keep the rest until its
-        // newline shows up on a later poll.
-        while let Some(idx) = partial.find('\n') {
-            let mut line: String = partial.drain(..=idx).collect();
-            line.pop(); // the '\n'
-            if line.ends_with('\r') {
-                line.pop();
+        while let Ok(read) = file.read(&mut buf) {
+            if read == 0 {
+                break;
             }
-            if tx.send(line_for(&name, line)).await.is_err() {
+            offset += read as u64;
+            pending.extend_from_slice(&buf[..read]);
+            if !drain_complete_lines(&name, &mut pending, &tx).await {
                 return Ok(());
             }
         }
@@ -458,40 +468,113 @@ fn line_for(service: &str, line: String) -> LogLine {
     }
 }
 
-/// Keep only the last `tail` entries of `lines` (all of them when `tail` is
-/// `None` or larger than the list).
-fn apply_tail(mut lines: Vec<String>, tail: Option<usize>) -> Vec<String> {
-    if let Some(n) = tail {
-        let start = lines.len().saturating_sub(n);
-        lines.drain(..start);
+/// Create `dir` (and any missing parents) for captured logs, owner-only (0700)
+/// on Unix since the logs it holds can contain secrets. Idempotent: an existing
+/// directory is left as-is.
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
     }
-    lines
+    builder.create(dir)
 }
 
-/// Read a log file, optionally trimming to the last `tail` lines.
-///
-/// Bytes are decoded lossily so a stray non-UTF-8 byte in a service's output
-/// does not abort `eph logs`. When `tail` is `Some(n)`, the last `n` lines are
-/// returned with a trailing newline (so the next follow chunk starts on its own
-/// line); when `None`, the file is returned verbatim. A request for more lines
-/// than the file holds returns the whole file.
-fn read_tail(path: &Path, tail: Option<usize>) -> Result<String> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read log file: {}", path.display()))?;
-    let content = String::from_utf8_lossy(&bytes);
-
-    match tail {
-        Some(n) => {
-            let lines: Vec<&str> = content.lines().collect();
-            let start = lines.len().saturating_sub(n);
-            let mut tail_lines = lines[start..].join("\n");
-            if !tail_lines.is_empty() {
-                tail_lines.push('\n');
-            }
-            Ok(tail_lines)
-        }
-        None => Ok(content.into_owned()),
+/// Create (truncating) a captured-log file, owner-only (0600) on Unix since it
+/// can contain secrets. Mirrors `File::create` otherwise.
+fn create_private_log_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
+    opts.open(path)
+}
+
+/// Drain every complete (newline-terminated) line from `pending` and send it to
+/// `tx`, leaving any unterminated trailing bytes in the buffer for the next read.
+/// Returns `false` if the receiver has hung up.
+async fn drain_complete_lines(
+    name: &str,
+    pending: &mut Vec<u8>,
+    tx: &mpsc::Sender<LogLine>,
+) -> bool {
+    while let Some(idx) = pending.iter().position(|&b| b == b'\n') {
+        let line_bytes: Vec<u8> = pending.drain(..=idx).collect();
+        if tx
+            .send(line_for(name, decode_log_line(&line_bytes)))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Decode one log line's bytes, dropping a trailing `\n` (and a preceding `\r`
+/// for CRLF). Bytes are decoded lossily so a stray non-UTF-8 byte does not abort
+/// `eph logs`.
+fn decode_log_line(bytes: &[u8]) -> String {
+    let mut end = bytes.len();
+    if end > 0 && bytes[end - 1] == b'\n' {
+        end -= 1;
+        if end > 0 && bytes[end - 1] == b'\r' {
+            end -= 1;
+        }
+    }
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// Byte offset at which the last `n` lines of an open file begin.
+///
+/// Scans backward from `len` in fixed-size blocks, counting line breaks, so only
+/// about `n` lines' worth of data is read rather than the whole (possibly huge)
+/// file. A single trailing newline is treated as terminating the last line, not
+/// as starting an empty one. Returns 0 when the file has `n` or fewer lines, and
+/// `len` when `n` is 0.
+fn tail_start_offset(file: &mut std::fs::File, len: u64, n: usize) -> std::io::Result<u64> {
+    if n == 0 || len == 0 {
+        return if n == 0 { Ok(len) } else { Ok(0) };
+    }
+
+    const BLOCK: u64 = 8192;
+    let mut pos = len;
+    let mut newlines = 0usize;
+    // Until we have examined the file's final byte, a newline there ends the last
+    // line rather than introducing a new one, so it must not be counted.
+    let mut at_file_end = true;
+
+    while pos > 0 {
+        let read_size = BLOCK.min(pos);
+        pos -= read_size;
+        file.seek(SeekFrom::Start(pos))?;
+        let mut chunk = vec![0u8; read_size as usize];
+        file.read_exact(&mut chunk)?;
+
+        for i in (0..chunk.len()).rev() {
+            if chunk[i] != b'\n' {
+                at_file_end = false;
+                continue;
+            }
+            if at_file_end && pos + i as u64 == len - 1 {
+                // The file's trailing newline: skip it, don't count it.
+                at_file_end = false;
+                continue;
+            }
+            at_file_end = false;
+            newlines += 1;
+            if newlines == n {
+                // The last n lines begin just past this newline.
+                return Ok(pos + i as u64 + 1);
+            }
+        }
+    }
+    Ok(0)
 }
 
 /// Docker client wrapper
@@ -1277,13 +1360,16 @@ impl ServiceManager {
         // preserves the output and avoids the hang. The file is truncated on each
         // fresh spawn so the log reflects the current run; a still-running service
         // is reused above and never reaches this point, so its log is preserved.
+        //
+        // Captured stdout/stderr can contain secrets, so the directory and file
+        // are created owner-only (0700/0600) on Unix.
         let log_path = self.workspace.log_file_path(name)?;
         if let Some(parent) = log_path.parent() {
-            tokio::fs::create_dir_all(parent).await.with_context(|| {
+            create_private_dir(parent).with_context(|| {
                 format!("failed to create logs directory: {}", parent.display())
             })?;
         }
-        let log_file = std::fs::File::create(&log_path)
+        let log_file = create_private_log_file(&log_path)
             .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
         let log_file_err = log_file
             .try_clone()
@@ -1980,22 +2066,42 @@ impl ServiceManager {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
 
-        // Dump the existing contents (last N lines when --tail is set), then
-        // remember where the file ends so --follow only prints what is appended
-        // afterwards. The offset is the file length, independent of how many
-        // bytes we chose to print, so tail + follow line up.
-        let initial = read_tail(&path, opts.tail)?;
-        out.write_all(initial.as_bytes())
-            .context("failed to write logs to stdout")?;
+        // Dump the existing contents (the last N lines when --tail is set, else
+        // the whole file), then remember where the file ends so --follow prints
+        // only what is appended afterwards. Both the seek-to-tail and the dump
+        // are bounded: tail_start_offset scans backward without loading the file,
+        // and the dump streams raw bytes in chunks rather than buffering it all.
+        let mut file = std::fs::File::open(&path)
+            .with_context(|| format!("failed to open log file: {}", path.display()))?;
+        let len = file
+            .seek(SeekFrom::End(0))
+            .with_context(|| format!("failed to read log file: {}", path.display()))?;
+        let start = match opts.tail {
+            Some(n) => tail_start_offset(&mut file, len, n)
+                .with_context(|| format!("failed to read log file: {}", path.display()))?,
+            None => 0,
+        };
+        file.seek(SeekFrom::Start(start))
+            .context("failed to seek log file")?;
+
+        let mut buf = [0u8; 8192];
+        loop {
+            let read = file.read(&mut buf).context("failed to read log file")?;
+            if read == 0 {
+                break;
+            }
+            out.write_all(&buf[..read])
+                .context("failed to write logs to stdout")?;
+        }
         out.flush().ok();
 
         if !opts.follow {
             return Ok(());
         }
 
-        let mut offset = std::fs::metadata(&path)
-            .with_context(|| format!("failed to stat log file: {}", path.display()))?
-            .len();
+        let mut offset = file
+            .stream_position()
+            .with_context(|| format!("failed to read log file: {}", path.display()))?;
 
         loop {
             // Wait a beat between polls, but break promptly on Ctrl-C so follow
@@ -2200,61 +2306,67 @@ mod tests {
         assert_eq!(mapped.len(), 1);
     }
 
-    #[test]
-    fn read_tail_returns_whole_file_when_no_tail() {
+    /// The bytes `tail_start_offset` would have us begin streaming at, as a
+    /// string -- i.e. the raw tail of the file -- for terse assertions.
+    fn tail_of(contents: &[u8], n: usize) -> String {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("svc.log");
-        std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
+        std::fs::write(&path, contents).unwrap();
 
-        assert_eq!(read_tail(&path, None).unwrap(), "line1\nline2\nline3\n");
+        let mut file = std::fs::File::open(&path).unwrap();
+        let len = file.seek(SeekFrom::End(0)).unwrap();
+        let start = tail_start_offset(&mut file, len, n).unwrap();
+        file.seek(SeekFrom::Start(start)).unwrap();
+        let mut rest = Vec::new();
+        file.read_to_end(&mut rest).unwrap();
+        String::from_utf8_lossy(&rest).into_owned()
     }
 
     #[test]
-    fn read_tail_trims_to_last_n_lines() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("svc.log");
-        std::fs::write(&path, "a\nb\nc\nd\ne\n").unwrap();
-
-        assert_eq!(read_tail(&path, Some(2)).unwrap(), "d\ne\n");
+    fn tail_start_offset_trims_to_last_n_lines() {
+        assert_eq!(tail_of(b"a\nb\nc\nd\ne\n", 2), "d\ne\n");
+        // No trailing newline on the last line.
+        assert_eq!(tail_of(b"a\nb\nc\nd\ne", 2), "d\ne");
+        assert_eq!(tail_of(b"a\nb\nc\nd\ne\n", 1), "e\n");
     }
 
     #[test]
-    fn read_tail_more_lines_than_file_returns_all() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("svc.log");
-        std::fs::write(&path, "only\ntwo\n").unwrap();
-
-        assert_eq!(read_tail(&path, Some(100)).unwrap(), "only\ntwo\n");
+    fn tail_start_offset_more_lines_than_file_returns_all() {
+        assert_eq!(tail_of(b"only\ntwo\n", 100), "only\ntwo\n");
     }
 
     #[test]
-    fn read_tail_empty_file_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("svc.log");
-        std::fs::write(&path, "").unwrap();
-
-        assert_eq!(read_tail(&path, None).unwrap(), "");
-        assert_eq!(read_tail(&path, Some(5)).unwrap(), "");
+    fn tail_start_offset_handles_empty_and_zero() {
+        assert_eq!(tail_of(b"", 5), "");
+        // tail 0 means "no lines": start at end of file.
+        assert_eq!(tail_of(b"a\nb\n", 0), "");
     }
 
     #[test]
-    fn apply_tail_keeps_last_n_or_all() {
-        let lines = || vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        assert_eq!(apply_tail(lines(), None), vec!["a", "b", "c"]);
-        assert_eq!(apply_tail(lines(), Some(2)), vec!["b", "c"]);
-        assert_eq!(apply_tail(lines(), Some(0)), Vec::<String>::new());
-        // More than present returns all.
-        assert_eq!(apply_tail(lines(), Some(10)), vec!["a", "b", "c"]);
+    fn tail_start_offset_spans_blocks() {
+        // Force the backward scan across multiple 8 KiB blocks.
+        let mut contents = String::new();
+        for i in 0..5000 {
+            contents.push_str(&format!("line-{i}\n"));
+        }
+        let tail = tail_of(contents.as_bytes(), 3);
+        assert_eq!(tail, "line-4997\nline-4998\nline-4999\n");
     }
 
     #[test]
-    fn read_tail_decodes_invalid_utf8_lossily() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("svc.log");
-        // An invalid byte (0xFF) must not abort the read.
-        std::fs::write(&path, [b'o', b'k', 0xFF, b'\n']).unwrap();
+    fn decode_log_line_strips_line_endings() {
+        assert_eq!(decode_log_line(b"hello\n"), "hello");
+        assert_eq!(decode_log_line(b"hello\r\n"), "hello");
+        assert_eq!(decode_log_line(b"hello"), "hello");
+        assert_eq!(decode_log_line(b""), "");
+        // A bare \r that is not part of CRLF is preserved as content.
+        assert_eq!(decode_log_line(b"a\rb\n"), "a\rb");
+    }
 
-        let out = read_tail(&path, None).unwrap();
+    #[test]
+    fn decode_log_line_is_lossy_for_invalid_utf8() {
+        // An invalid byte (0xFF) must not panic; it is replaced.
+        let out = decode_log_line(&[b'o', b'k', 0xFF]);
         assert!(out.starts_with("ok"), "got {out:?}");
     }
 

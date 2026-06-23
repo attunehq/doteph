@@ -1035,6 +1035,57 @@ run=i=0; while [ $i -lt 100 ]; do echo beta-$i; i=$((i+1)); sleep 0.2; done
     );
 }
 
+// `eph logs -n N` returns exactly the last N lines of a `run=` service's log.
+#[cfg(unix)]
+#[tokio::test]
+async fn logs_tail_returns_last_n_lines() {
+    let ws = TestWorkspace::new(
+        r#"
+[svc]
+run=for i in 1 2 3 4 5; do echo tailline-$i; done; sleep 300
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+
+    let tail = ws.eph_ok(&["logs", "-n", "2", "svc"]).await;
+    let lines: Vec<&str> = tail.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["tailline-4", "tailline-5"],
+        "expected only the last 2 lines, got:\n{tail}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// Captured `run=` logs can contain secrets, so the log file and its directory
+// are created owner-only (0600/0700).
+#[cfg(unix)]
+#[tokio::test]
+async fn logs_run_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let ws = TestWorkspace::new("[svc]\nrun=echo hi && sleep 300\n");
+    ws.eph_ok(&["up"]).await;
+
+    let info = ws.eph_ok(&["info"]).await;
+    let state_dir = info
+        .lines()
+        .find_map(|l| l.strip_prefix("State directory: "))
+        .expect("`eph info` should report the state directory")
+        .trim();
+    let logs_dir = std::path::Path::new(state_dir).join("logs");
+    let log_file = logs_dir.join("svc.log");
+
+    let file_mode = std::fs::metadata(&log_file).unwrap().permissions().mode() & 0o777;
+    let dir_mode = std::fs::metadata(&logs_dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(file_mode, 0o600, "log file should be owner read/write only");
+    assert_eq!(dir_mode, 0o700, "logs dir should be owner-only");
+
+    ws.eph_ok(&["down"]).await;
+}
+
 // ============================================================================
 // Error Handling Tests
 // ============================================================================
