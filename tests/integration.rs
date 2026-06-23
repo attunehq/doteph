@@ -941,6 +941,37 @@ run=echo beta-marker && sleep 300
     ws.eph_ok(&["down"]).await;
 }
 
+// `eph logs` with no SERVICE must exit non-zero when a Docker-backed source
+// fails (here: an image service whose container does not exist because it was
+// never started), matching the single-service path. Regression test for the
+// all-services path silently swallowing per-task `docker logs` failures.
+#[tokio::test]
+async fn logs_all_services_fails_when_a_docker_source_fails() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+"#,
+    );
+
+    // Note: no `eph up`, so no container exists -- `docker logs <container>`
+    // exits non-zero, and that failure must surface as a non-zero exit.
+    let single = ws.eph(&["logs", "redis"]).await;
+    assert!(
+        !single.status.success(),
+        "single-service logs should fail for a missing container"
+    );
+
+    let all = ws.eph(&["logs"]).await;
+    assert!(
+        !all.status.success(),
+        "all-services logs should fail when a docker source fails:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&all.stdout),
+        String::from_utf8_lossy(&all.stderr),
+    );
+}
+
 // `eph logs -f` with no SERVICE follows every service at once, interleaving
 // their tagged lines as they arrive.
 #[cfg(unix)]

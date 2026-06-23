@@ -298,7 +298,7 @@ async fn stream_file_lines(
     follow: bool,
     tail: Option<usize>,
     tx: mpsc::Sender<LogLine>,
-) {
+) -> Result<()> {
     // Snapshot the current contents: emit the complete lines (after --tail), and
     // when following, carry the unterminated trailing fragment forward so a line
     // split across the snapshot boundary is not emitted in two halves.
@@ -320,12 +320,12 @@ async fn stream_file_lines(
 
     for line in apply_tail(segments, tail) {
         if tx.send(line_for(&name, line)).await.is_err() {
-            return;
+            return Ok(());
         }
     }
 
     if !follow {
-        return;
+        return Ok(());
     }
 
     loop {
@@ -368,7 +368,7 @@ async fn stream_file_lines(
                 line.pop();
             }
             if tx.send(line_for(&name, line)).await.is_err() {
-                return;
+                return Ok(());
             }
         }
     }
@@ -380,31 +380,37 @@ async fn stream_file_lines(
 /// servers log to stderr), so a line is sent the moment it completes on either.
 /// The child is spawned with `kill_on_drop` so aborting this task also kills the
 /// underlying `docker logs -f`.
-async fn stream_docker_lines(name: String, args: Vec<String>, tx: mpsc::Sender<LogLine>) {
-    let mut child = match TokioCommand::new("docker")
+///
+/// Returns an error if `docker` cannot be spawned or exits non-zero (a removed
+/// container, a daemon that is down, a malformed compose file), so the caller can
+/// fail the overall `eph logs` rather than masking it as ordinary output. Any
+/// error text `docker` printed to stderr is still streamed through `tx` first.
+async fn stream_docker_lines(
+    name: String,
+    args: Vec<String>,
+    tx: mpsc::Sender<LogLine>,
+) -> Result<()> {
+    let label = if args.first().map(String::as_str) == Some("compose") {
+        "docker compose logs"
+    } else {
+        "docker logs"
+    };
+
+    let mut child = TokioCommand::new("docker")
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            let _ = tx
-                .send(line_for(
-                    &name,
-                    format!("eph: failed to run docker logs: {e}"),
-                ))
-                .await;
-            return;
-        }
-    };
+        .with_context(|| {
+            format!("failed to run `{label}` for service '{name}' (is docker on PATH?)")
+        })?;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
-    let (name_out, name_err) = (name.clone(), name);
+    let (name_out, name_err) = (name.clone(), name.clone());
     let (tx_out, tx_err) = (tx.clone(), tx);
 
     let read_stdout = async move {
@@ -429,7 +435,19 @@ async fn stream_docker_lines(name: String, args: Vec<String>, tx: mpsc::Sender<L
     };
 
     tokio::join!(read_stdout, read_stderr);
-    let _ = child.wait().await;
+
+    let status = child
+        .wait()
+        .await
+        .with_context(|| format!("failed waiting on `{label}` for service '{name}'"))?;
+    if !status.success() {
+        let code = status.code().map_or_else(
+            || " (terminated by signal)".to_string(),
+            |c| format!(" (exit {c})"),
+        );
+        bail!("`{label}` for service '{name}' failed{code}");
+    }
+    Ok(())
 }
 
 /// Build a [`LogLine`] for `service` from an owned `line`.
@@ -1800,7 +1818,13 @@ impl ServiceManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if any `name` is not a defined service.
+    /// Returns an error if any `name` is not a defined service. When the stream
+    /// drains on its own (i.e. not interrupted by Ctrl-C or a closed pipe), it
+    /// also returns the first per-service failure -- a `docker logs` /
+    /// `docker compose logs` that could not be spawned or exited non-zero -- so
+    /// the all-services path fails just as a single `eph logs <service>` does.
+    /// All sources are still drained first, so the logs that did succeed are
+    /// emitted before the error is reported.
     pub async fn stream_logs(
         &self,
         eph: &EphFile,
@@ -1838,17 +1862,26 @@ impl ServiceManager {
         // which is how the non-follow consumer loop below terminates.
         drop(tx);
 
+        // Track *why* the loop ends: only a natural drain inspects task results.
+        // An interrupt (Ctrl-C) or a closed reader pipe is an expected, success
+        // exit and must not surface the spurious "killed" status of the docker
+        // children we are about to abort.
+        let mut aborted = false;
         loop {
             tokio::select! {
                 // Only arm Ctrl-C while following; without --follow the consumer
                 // ends naturally when the channel closes, and a stray Ctrl-C
                 // should terminate the process the usual way.
-                _ = tokio::signal::ctrl_c(), if opts.follow => break,
+                _ = tokio::signal::ctrl_c(), if opts.follow => {
+                    aborted = true;
+                    break;
+                }
                 recv = rx.recv() => match recv {
                     Some(LogLine { service, line }) => {
                         // A write error means the reader hung up (closed pipe);
                         // stop quietly rather than erroring.
                         if on_line(&service, &line).is_err() {
+                            aborted = true;
                             break;
                         }
                     }
@@ -1857,10 +1890,34 @@ impl ServiceManager {
             }
         }
 
-        // Abort any still-running tasks. The docker children are spawned with
-        // kill_on_drop, so aborting their task reaps the process too.
-        tasks.shutdown().await;
-        Ok(())
+        if aborted {
+            // Abort any still-running tasks. The docker children are spawned with
+            // kill_on_drop, so aborting their task reaps the process too. Their
+            // results are intentionally discarded -- the user asked to stop.
+            tasks.shutdown().await;
+            return Ok(());
+        }
+
+        // Drained naturally: every task has finished and dropped its sender.
+        // Join them and surface the first failure (e.g. `docker logs` against a
+        // removed container, or docker missing entirely) so the all-services
+        // path exits non-zero like the single-service path does.
+        let mut first_err: Option<anyhow::Error> = None;
+        while let Some(joined) = tasks.join_next().await {
+            let task_result = match joined {
+                Ok(result) => result,
+                Err(join_err) => Err(anyhow::anyhow!("log reader task failed: {join_err}")),
+            };
+            if let Err(err) = task_result
+                && first_err.is_none()
+            {
+                first_err = Some(err);
+            }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// Resolve a service to the owned [`LogSource`] used by [`stream_logs`].
