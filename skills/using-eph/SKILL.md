@@ -97,6 +97,12 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
   `compose=` (+ `expose.<name>=`), or `run=` (a host process via `sh -c`).
 - `port=` is a *container* port published on a random host port; `${svc.port}`
   in a top-level variable resolves to the assigned host port at `eph env` time.
+- For a `run=` service (a first-party app eph launches), `port=auto` /
+  `port.<name>=auto` make eph allocate a free host port and inject it into the
+  process; reference the service's own assigned port as `${svc.port}` in its
+  `env.X` (e.g. `env.PORT=${web.port}`). eph keeps the port stable across
+  restarts and re-launches the app on a fresh port if it dies on a port
+  conflict. Still never hardcode it — read it via `eph env` / `${svc.port}`.
 - `env.X=` is set inside the container; the trailing `DATABASE_URL=` is a shell
   env var emitted by `eph env`.
 - `volume=name:/path` is a per-workspace named volume; `healthcheck` for an image

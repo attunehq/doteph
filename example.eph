@@ -33,6 +33,15 @@ image=mailhog/mailhog
 port.smtp=1025
 port.web=8025
 
+# The app you are building. eph allocates a free host port (so two checkouts
+# never collide on 3000), injects it as PORT, and re-launches on a fresh port if
+# the process dies on a port conflict. Backing services above start first, so
+# DATABASE_URL etc. are already set in this process's environment.
+[web]
+run=npm run dev
+port=auto
+env.PORT=${web.port}
+
 # =============================================================================
 # Environment Variables
 # =============================================================================
@@ -47,5 +56,7 @@ S3_SECRET_KEY=minioadmin
 SMTP_HOST=localhost
 SMTP_PORT=${mailhog.port.smtp}
 MAIL_WEB_UI=http://localhost:${mailhog.port.web}
+
+APP_URL=http://localhost:${web.port}
 
 APP_ENV=development

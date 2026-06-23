@@ -117,8 +117,8 @@ The four source types are covered in detail in
 | `compose=` | no | Path to a Docker Compose file to delegate to. |
 | `run=` | no | Shell command for a non-Docker service. |
 | `command=` | no | Override the container's default command (`image`/`dockerfile` only). |
-| `port=` | yes | A container port to publish on a random host port. |
-| `port.<name>=` | yes | A **named** container port (for multi-port services). |
+| `port=` | yes | A container port to publish on a random host port. For `run=` services, `port=auto` lets eph allocate a free host port and inject it (see [`run=` first-party app ports](services.md#first-party-app-ports-portauto)). |
+| `port.<name>=` | yes | A **named** port (for multi-port services). `port.<name>=auto` is allowed for `run=` services. |
 | `env.<KEY>=` | yes | An environment variable passed into the container. |
 | `volume=` | yes | A volume mount: `name:/path` (named) or `./host:/path` (bind). |
 | `healthcheck=` | no | Command that must succeed before the service is "ready". |

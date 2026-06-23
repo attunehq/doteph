@@ -15,7 +15,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eph::parser::{self, EphFile, ServiceSource};
-use eph::{LogOptions, ServiceManager, Workspace, skills};
+use eph::{LogOptions, RunningService, ServiceManager, Workspace, skills};
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -242,11 +242,7 @@ async fn cmd_up(service_filter: Vec<String>, skip_hooks: bool) -> Result<()> {
     println!();
     println!("Services started:");
     for (name, svc) in &running {
-        if let Some(port) = svc.port() {
-            println!("  {} -> localhost:{}", name, port);
-        } else {
-            println!("  {} (no ports)", name);
-        }
+        print_service_ports(name, svc);
     }
 
     // Print environment hint
@@ -337,11 +333,7 @@ async fn cmd_status() -> Result<()> {
     } else {
         println!("Running services:");
         for (name, svc) in &running {
-            if let Some(port) = svc.port() {
-                println!("  {} -> localhost:{}", name, port);
-            } else {
-                println!("  {} (no ports)", name);
-            }
+            print_service_ports(name, svc);
         }
 
         let stopped: Vec<_> = eph
@@ -359,6 +351,26 @@ async fn cmd_status() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Print a running service and its assigned host ports for `eph up` / `eph
+/// status`. A single port is shown inline; multiple named ports (e.g. an app
+/// with both a frontend and an HMR port) are listed one per line. Names are
+/// sorted so the output is stable across runs regardless of map order.
+fn print_service_ports(name: &str, svc: &RunningService) {
+    let mut ports: Vec<(&String, &u16)> = svc.ports.iter().collect();
+    ports.sort_by(|a, b| a.0.cmp(b.0));
+
+    match ports.as_slice() {
+        [] => println!("  {} (no ports)", name),
+        [(_, port)] => println!("  {} -> localhost:{}", name, port),
+        many => {
+            println!("  {}:", name);
+            for (port_name, port) in many {
+                println!("    {} -> localhost:{}", port_name, port);
+            }
+        }
+    }
 }
 
 async fn cmd_env(format: &str) -> Result<()> {

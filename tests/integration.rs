@@ -884,6 +884,75 @@ run=echo about-to-die && exit 1
     ws.eph_ok(&["down"]).await;
 }
 
+// `port=auto` on a run= service: eph allocates a free host port, injects it into
+// the process environment, and resolves it for interpolation -- the core of
+// first-party app port creation.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_service_auto_port_is_allocated_and_injected() {
+    // The process echoes the PORT it was handed, then stays alive so its log can
+    // be read. `env.PORT=${web.port}` is how the assigned port reaches it.
+    let ws = TestWorkspace::new(
+        r#"
+[web]
+run=echo "BOUND_PORT=$PORT" && sleep 300
+port=auto
+env.PORT=${web.port}
+
+APP_URL=http://localhost:${web.port}
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+
+    // The allocated port is resolved into the top-level variable...
+    let env = ws.env_json().await;
+    let app_url = env.get("APP_URL").expect("APP_URL should be set");
+    let port = extract_port(app_url).expect("APP_URL should contain a real port");
+    assert!(port > 1024, "expected an ephemeral host port, got {port}");
+
+    // ...and the same port was injected into the process as PORT.
+    let logs = ws.eph_ok(&["logs", "web"]).await;
+    assert!(
+        logs.contains(&format!("BOUND_PORT={port}")),
+        "expected the process to receive PORT={port}, got:\n{logs}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// An eph-allocated auto port stays the same across `eph down` / `eph up`, so a
+// managed app's URL is stable for bookmarks and OAuth callbacks.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_service_auto_port_is_stable_across_restart() {
+    let ws = TestWorkspace::new(
+        r#"
+[web]
+run=sleep 300
+port=auto
+
+APP_URL=http://localhost:${web.port}
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+    let first = extract_port(ws.env_json().await.get("APP_URL").unwrap())
+        .expect("APP_URL should contain a port");
+
+    ws.eph_ok(&["down"]).await;
+    ws.eph_ok(&["up"]).await;
+    let second = extract_port(ws.env_json().await.get("APP_URL").unwrap())
+        .expect("APP_URL should contain a port");
+
+    assert_eq!(
+        first, second,
+        "auto port should be reused across down/up for a stable URL"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
 // `eph logs` for an image-backed service proxies `docker logs`.
 #[tokio::test]
 async fn logs_proxies_docker_for_image_service() {

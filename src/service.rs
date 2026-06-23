@@ -93,7 +93,23 @@ pub fn resolve_env_vars(
     eph: &EphFile,
     running: &HashMap<String, RunningService>,
 ) -> Vec<(String, String)> {
-    let resolver = |service: &str, property: &str| -> Option<String> {
+    eph.env_vars
+        .iter()
+        .map(|var| (var.name.clone(), resolve_against(&var.value, running)))
+        .collect()
+}
+
+/// Expand `${service.host}`, `${service.port}`, and `${service.port.NAME}`
+/// interpolations in `value` against the assigned host ports in `running`.
+///
+/// A reference to a service that is not in `running` (or a property it does not
+/// expose) is left as the literal `${...}` placeholder, matching
+/// [`resolve_interpolations`]. Shared by [`resolve_env_vars`] (top-level `eph
+/// env` variables) and by the managed-app environment so that a `run=` service
+/// can read its own assigned `${self.port}` the same way.
+#[must_use]
+pub fn resolve_against(value: &str, running: &HashMap<String, RunningService>) -> String {
+    resolve_interpolations(value, |service, property| {
         let svc = running.get(service)?;
         match property {
             "host" => Some(svc.host().to_string()),
@@ -101,17 +117,7 @@ pub fn resolve_env_vars(
             prop if prop.starts_with("port.") => svc.named_port(&prop[5..]).map(|p| p.to_string()),
             _ => None,
         }
-    };
-
-    eph.env_vars
-        .iter()
-        .map(|var| {
-            (
-                var.name.clone(),
-                resolve_interpolations(&var.value, resolver),
-            )
-        })
-        .collect()
+    })
 }
 
 /// Build the `EPH_*` metadata variables describing the workspace and the
@@ -183,6 +189,13 @@ pub(crate) struct ServiceState {
     /// Process IDs for shell command services
     #[serde(default)]
     pub(crate) processes: HashMap<String, u32>,
+    /// The host ports last assigned to each `run=` service's auto ports
+    /// (`port=auto`), keyed by service name then port name. Unlike
+    /// [`services`](Self::services), this is *not* cleared by `eph down`, so the
+    /// next `eph up` can reuse the same port and keep the app's URL stable across
+    /// restarts and reboots. `eph clean` resets it along with the rest of state.
+    #[serde(default)]
+    pub(crate) auto_ports: HashMap<String, HashMap<String, u16>>,
 }
 
 /// State entry for a single service
@@ -271,6 +284,121 @@ fn map_named_ports(declared: &[PortMapping], raw: &HashMap<String, u16>) -> Hash
         }
     }
     named
+}
+
+/// Outcome of waiting for a freshly-spawned `run=` process to become ready.
+///
+/// Distinguishes the case worth retrying (the process exited and its output
+/// names a port conflict) from a clean readiness and an unrelated crash, so
+/// [`ServiceManager::start_shell_command`] only re-launches on a fresh port when
+/// re-launching could actually help.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadyOutcome {
+    /// The process is up (healthcheck passed, or it survived the startup grace
+    /// period when no healthcheck is defined).
+    Ready,
+    /// The process exited during startup and its captured log looks like a port
+    /// conflict (an "address already in use"-style message).
+    PortConflict,
+    /// The process exited during startup for some other reason.
+    Exited,
+}
+
+/// Substrings (matched case-insensitively against a dead process's captured log)
+/// that indicate it failed because its port was already taken. Covers the common
+/// runtimes' phrasings: Node's `EADDRINUSE`, libc's "address already in use"
+/// (Rust/Python/Go/.NET), and the "port already in use" wording several dev
+/// servers print.
+const PORT_CONFLICT_MARKERS: &[&str] = &[
+    // Broadest phrasing -- covers "address already in use" (Go/Python/Rust/libc)
+    // and "port <N> is already in use" (Vite and friends).
+    "already in use",
+    // BSD/macOS sometimes drops "already".
+    "address in use",
+    // Node's error code, in case it prints the code without the prose.
+    "eaddrinuse",
+];
+
+/// Reserve a free TCP port on loopback for each declared mapping, returning the
+/// name -> host-port map to hand the spawned process.
+///
+/// Fixed ports (`port=3000`) are used verbatim. Auto ports (`port=auto`) reuse
+/// the previously-assigned port from `prev` when it is still free -- so a
+/// restart keeps the same URL -- and otherwise take a fresh OS-assigned port.
+/// Every reserved port is held (the listeners stay bound) until the whole map is
+/// built, so two mappings never collide on the same number; the listeners are
+/// then dropped together just before the caller spawns the process. That leaves
+/// a small window in which another process could steal the port, which the
+/// caller closes by re-launching on a fresh port if the process dies on a
+/// conflict.
+fn allocate_ports(
+    declared: &[PortMapping],
+    prev: Option<&HashMap<String, u16>>,
+) -> Result<HashMap<String, u16>> {
+    // Hold every reservation open until the map is fully built so the ports are
+    // distinct; dropped on return, just before the process is spawned.
+    let mut held: Vec<std::net::TcpListener> = Vec::new();
+    let mut assigned: HashMap<String, u16> = HashMap::new();
+
+    for mapping in declared {
+        let name = mapping
+            .name
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+
+        if !mapping.auto {
+            assigned.insert(name, mapping.container_port);
+            continue;
+        }
+
+        // Prefer the port this mapping had last time, if it is still bindable and
+        // not already taken by an earlier mapping in this same service, so URLs
+        // stay stable across `eph down` / `eph up`.
+        let reused = prev
+            .and_then(|p| p.get(&name))
+            .copied()
+            .filter(|p| !assigned.values().any(|a| a == p))
+            .and_then(|p| {
+                std::net::TcpListener::bind(("127.0.0.1", p))
+                    .ok()
+                    .map(|l| (p, l))
+            });
+
+        let port = match reused {
+            Some((p, listener)) => {
+                held.push(listener);
+                p
+            }
+            None => {
+                let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+                    .context("failed to allocate a free host port")?;
+                let p = listener
+                    .local_addr()
+                    .context("failed to read the allocated host port")?
+                    .port();
+                held.push(listener);
+                p
+            }
+        };
+        assigned.insert(name, port);
+    }
+
+    drop(held);
+    Ok(assigned)
+}
+
+/// Whether `declared` contains at least one auto-allocated port, i.e. the
+/// service is a managed app whose process eph may re-launch on a fresh port.
+fn has_auto_port(declared: &[PortMapping]) -> bool {
+    declared.iter().any(|p| p.auto)
+}
+
+/// Whether a dead process's captured `log` names a port conflict, matched
+/// case-insensitively against [`PORT_CONFLICT_MARKERS`]. Used to decide whether
+/// re-launching the service on a fresh port could help.
+fn log_indicates_port_conflict(log: &str) -> bool {
+    let lower = log.to_ascii_lowercase();
+    PORT_CONFLICT_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// Where a service's logs come from, in the owned form [`stream_logs`] hands to
@@ -1074,7 +1202,7 @@ impl ServiceManager {
         // the order requested). post-start hooks run in a second phase once all
         // of these are healthy, so the phase-1 start order does not affect
         // whether a hook's cross-service references resolve.
-        let targets: Vec<&String> = if filter.is_empty() {
+        let mut targets: Vec<&String> = if filter.is_empty() {
             eph.services.keys().collect()
         } else {
             for name in filter {
@@ -1085,11 +1213,17 @@ impl ServiceManager {
             filter.iter().collect()
         };
 
+        // Start backing services (image/dockerfile/compose) before run= apps, so
+        // a managed app's environment can reference the services it depends on
+        // (e.g. ${postgres.port}) at spawn time. sort_by_key is stable, so this
+        // only moves Command services to the end and otherwise preserves order.
+        targets.sort_by_key(|name| matches!(eph.services[*name].source, ServiceSource::Command(_)));
+
         // Phase 1: create or reuse every target, waiting for health.
         let mut running = HashMap::new();
         for name in &targets {
             let service = &eph.services[*name];
-            let result = self.create_service(name, service).await?;
+            let result = self.create_service(name, service, eph).await?;
             running.insert((*name).clone(), result);
         }
 
@@ -1142,7 +1276,12 @@ impl ServiceManager {
     /// This only brings the service to a healthy state; `post-start` hooks are
     /// run separately by [`start_services`](Self::start_services) once every
     /// service is up.
-    async fn create_service(&mut self, name: &str, service: &Service) -> Result<RunningService> {
+    async fn create_service(
+        &mut self,
+        name: &str,
+        service: &Service,
+        eph: &EphFile,
+    ) -> Result<RunningService> {
         let container_name = self.workspace.container_name(name);
 
         // Dedup run= (shell command) services: the Docker-based guard below
@@ -1262,7 +1401,9 @@ impl ServiceManager {
 
                 r
             }
-            ServiceSource::Command(cmd) => self.start_shell_command(name, cmd, service).await?,
+            ServiceSource::Command(cmd) => {
+                self.start_shell_command(name, cmd, service, eph).await?
+            }
             ServiceSource::Compose(path) => self.start_compose(name, path, service).await?,
         };
 
@@ -1335,34 +1476,165 @@ impl ServiceManager {
         }
     }
 
-    /// Start a shell command service
+    /// Start a `run=` (shell command) service: a host process eph launches and
+    /// manages.
+    ///
+    /// Auto-allocated ports (`port=auto`) are reserved here -- reusing the
+    /// service's previous ports when still free so URLs stay stable across
+    /// restarts -- and injected into the process environment so it binds the port
+    /// eph chose. Because eph owns launching the process, it closes the
+    /// unavoidable gap between reserving a port and the process binding it: it
+    /// watches for an early exit whose captured log names a port conflict and
+    /// re-launches on a fresh port, up to a few attempts. Fixed-port and
+    /// port-less commands keep the previous behavior -- spawned once, with an
+    /// early exit ignored -- so this is purely additive for them.
+    ///
+    /// The process inherits eph's resolved environment (the variables `eph env`
+    /// emits, plus `EPH_*` metadata and its own resolved `env.X`), so a managed
+    /// app can reach the workspace's other services without `eval "$(eph env)"`
+    /// first.
     async fn start_shell_command(
         &mut self,
         name: &str,
         cmd: &str,
         service: &Service,
+        eph: &EphFile,
     ) -> Result<RunningService> {
         info!("Starting shell command for {}: {}", name, cmd);
 
-        // Build environment
-        let mut env_vars: HashMap<String, String> = std::env::vars().collect();
-        for (k, v) in &service.env {
-            env_vars.insert(k.clone(), v.clone());
+        // The ports this service had on a previous `up`, reused for auto ports
+        // when still free so the assigned URL is stable across restarts. Read
+        // from `auto_ports`, which survives `eph down` (unlike `services`).
+        let prev_ports = self.state.auto_ports.get(name).cloned();
+
+        // Snapshot the other running services once so the app's environment can
+        // interpolate their connection details (e.g. ${postgres.port}). This
+        // service's own freshly-assigned ports are layered on per attempt below.
+        let others = self.status().await?;
+
+        // Only auto-port services are re-launchable: a fixed-port or port-less
+        // command that dies did not lose a port race, so retrying would just mask
+        // a real failure and (for fixed ports) we keep the historical behavior of
+        // not treating an early exit as a startup failure at all.
+        let has_auto = has_auto_port(&service.ports);
+        let max_attempts: u32 = if has_auto { 4 } else { 1 };
+
+        for attempt in 1..=max_attempts {
+            // Reuse the previous ports only on the first attempt; a retry exists
+            // precisely because a port collided, so it allocates fresh ones.
+            let reuse = if attempt == 1 {
+                prev_ports.as_ref()
+            } else {
+                None
+            };
+            let ports = allocate_ports(&service.ports, reuse)?;
+
+            // Build the environment with this service's assigned ports visible, so
+            // it can read its own ${<name>.port} alongside other services'.
+            let mut running = others.clone();
+            running.insert(
+                name.to_string(),
+                RunningService {
+                    name: name.to_string(),
+                    container_id: String::new(),
+                    ports: ports.clone(),
+                },
+            );
+            let env = self.app_env(eph, &running, service);
+
+            let (child, pid) = self.spawn_command(name, cmd, &env)?;
+            info!(
+                "Started {} with PID {} (attempt {}/{})",
+                name, pid, attempt, max_attempts
+            );
+
+            // Record PID and ports now so `eph status` / `eph env` reflect the
+            // service even while we wait for it to become ready.
+            self.state.processes.insert(name.to_string(), pid);
+            self.state.services.insert(
+                name.to_string(),
+                ServiceStateEntry {
+                    container_id: format!("pid:{}", pid),
+                    ports: ports.clone(),
+                },
+            );
+
+            match self
+                .await_command_ready(name, service, child, has_auto)
+                .await?
+            {
+                ReadyOutcome::Ready => {
+                    // Remember the auto ports so the next `up` reuses them for a
+                    // stable URL, even across `eph down`.
+                    if has_auto {
+                        self.state
+                            .auto_ports
+                            .insert(name.to_string(), ports.clone());
+                    }
+                    return Ok(RunningService {
+                        name: name.to_string(),
+                        container_id: format!("pid:{}", pid),
+                        ports,
+                    });
+                }
+                ReadyOutcome::PortConflict if attempt < max_attempts => {
+                    warn!(
+                        "Service {} exited on a port conflict; re-launching on a fresh port \
+                         (attempt {}/{})",
+                        name,
+                        attempt + 1,
+                        max_attempts
+                    );
+                    // Drop the dead PID so a stale entry is not left behind.
+                    self.state.processes.remove(name);
+                }
+                ReadyOutcome::PortConflict => {
+                    self.state.processes.remove(name);
+                    bail!(
+                        "service '{}' kept exiting on a port conflict after {} attempts; \
+                         see `eph logs {}`",
+                        name,
+                        max_attempts,
+                        name
+                    );
+                }
+                ReadyOutcome::Exited => {
+                    self.state.processes.remove(name);
+                    bail!(
+                        "service '{}' exited during startup; see `eph logs {}`",
+                        name,
+                        name
+                    );
+                }
+            }
         }
 
-        // Capture the child's stdout/stderr to a per-service log file under the
-        // workspace state dir, readable via `eph logs <service>`. This also
-        // solves a pipe-inheritance hang: a run= service is long-lived, so if it
-        // inherited eph's stdout/stderr it would keep those pipe write-ends open
-        // after `eph up` returns, and any caller capturing eph's output (a test
-        // harness, `eph up | tee`, a CI step) would block forever waiting for
-        // EOF. A file write-end has no such reader, so redirecting to a file both
-        // preserves the output and avoids the hang. The file is truncated on each
-        // fresh spawn so the log reflects the current run; a still-running service
-        // is reused above and never reaches this point, so its log is preserved.
-        //
-        // Captured stdout/stderr can contain secrets, so the directory and file
-        // are created owner-only (0700/0600) on Unix.
+        // Every loop iteration returns, bails, or (only on a retryable conflict)
+        // continues, and the final attempt's conflict bails, so this is
+        // unreachable; it satisfies the type checker without a panic.
+        bail!("service '{}' could not be started", name)
+    }
+
+    /// Spawn a `run=` command with `env` overlaid on eph's environment, capturing
+    /// its stdout/stderr to the service's per-run log file.
+    ///
+    /// Returns the live child -- so the caller can watch for an early exit -- and
+    /// its PID. The child is not killed on drop, so once it is ready the caller
+    /// drops the handle and the process keeps running detached.
+    ///
+    /// Output is captured to a file rather than inherited from eph for two
+    /// reasons: it is what `eph logs` reads, and it avoids a pipe-inheritance
+    /// hang where a long-lived service holding eph's stdout/stderr write-ends
+    /// would block anything capturing eph's output after `eph up` returns. The
+    /// file is truncated per spawn so it reflects the current run; captured
+    /// output can contain secrets, so the dir and file are owner-only (0700/0600)
+    /// on Unix.
+    fn spawn_command(
+        &self,
+        name: &str,
+        cmd: &str,
+        env: &[(String, String)],
+    ) -> Result<(tokio::process::Child, u32)> {
         let log_path = self.workspace.log_file_path(name)?;
         if let Some(parent) = log_path.parent() {
             create_private_dir(parent).with_context(|| {
@@ -1379,7 +1651,7 @@ impl ServiceManager {
             .arg("-c")
             .arg(cmd)
             .current_dir(&self.workspace.path)
-            .envs(&env_vars)
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_err))
@@ -1387,69 +1659,108 @@ impl ServiceManager {
             .with_context(|| format!("failed to start command: {}", cmd))?;
 
         let pid = child.id().unwrap_or(0);
-        info!("Started {} with PID {}", name, pid);
+        Ok((child, pid))
+    }
 
-        // Record PID
-        self.state.processes.insert(name.to_string(), pid);
-
-        // For shell commands, we don't have container ports
-        // The service should bind to ports specified in the config
-        let mut ports = HashMap::new();
-        for port_mapping in &service.ports {
-            let port_name = port_mapping
-                .name
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
-            // Shell commands use their declared ports directly
-            ports.insert(port_name, port_mapping.container_port);
-        }
-
-        // Wait a bit for the process to start
-        sleep(Duration::from_millis(500)).await;
-
-        // Run health check if specified
-        if let Some(ref healthcheck) = service.healthcheck {
-            let timeout_secs = service.ready_timeout_secs.unwrap_or(30);
-            info!(
-                "Waiting for {} to be healthy (timeout: {}s)",
-                name, timeout_secs
-            );
-
-            let result = timeout(Duration::from_secs(timeout_secs), async {
-                loop {
-                    let output = TokioCommand::new("sh")
-                        .arg("-c")
-                        .arg(healthcheck)
-                        .current_dir(&self.workspace.path)
-                        .output()
-                        .await?;
-
-                    if output.status.success() {
-                        info!("Service {} is healthy", name);
-                        return Ok::<_, anyhow::Error>(());
-                    }
-
-                    debug!("Health check for {} failed, retrying...", name);
-                    sleep(Duration::from_secs(1)).await;
-                }
-            })
-            .await;
-
-            match result {
-                Ok(inner) => inner?,
-                Err(_) => bail!(
-                    "Service {} failed to become healthy within {}s",
-                    name,
-                    timeout_secs
-                ),
+    /// Wait for a freshly-spawned `run=` process to become ready.
+    ///
+    /// With a healthcheck, polls it until it passes or the ready timeout elapses
+    /// (the timeout is a hard failure, as before). Without one, gives the process
+    /// a brief grace period. When `detect_exit` is set (an auto-port service that
+    /// may be re-launched), an exit during startup is reported as
+    /// [`ReadyOutcome::PortConflict`] or [`ReadyOutcome::Exited`] depending on
+    /// whether its log names a port conflict; when it is clear (fixed-port
+    /// services), an early exit is ignored, preserving the historical behavior.
+    async fn await_command_ready(
+        &self,
+        name: &str,
+        service: &Service,
+        mut child: tokio::process::Child,
+        detect_exit: bool,
+    ) -> Result<ReadyOutcome> {
+        let Some(ref healthcheck) = service.healthcheck else {
+            // Give the process a moment to start, then (if watching) classify an
+            // early exit.
+            sleep(Duration::from_millis(500)).await;
+            if detect_exit && matches!(child.try_wait(), Ok(Some(_))) {
+                return Ok(self.classify_exit(name).await);
             }
-        }
+            return Ok(ReadyOutcome::Ready);
+        };
 
-        Ok(RunningService {
-            name: name.to_string(),
-            container_id: format!("pid:{}", pid),
-            ports,
+        let timeout_secs = service.ready_timeout_secs.unwrap_or(30);
+        info!(
+            "Waiting for {} to be healthy (timeout: {}s)",
+            name, timeout_secs
+        );
+
+        let result = timeout(Duration::from_secs(timeout_secs), async {
+            loop {
+                if detect_exit && matches!(child.try_wait(), Ok(Some(_))) {
+                    return Ok::<ReadyOutcome, anyhow::Error>(self.classify_exit(name).await);
+                }
+
+                let output = TokioCommand::new("sh")
+                    .arg("-c")
+                    .arg(healthcheck)
+                    .current_dir(&self.workspace.path)
+                    .output()
+                    .await?;
+
+                if output.status.success() {
+                    info!("Service {} is healthy", name);
+                    return Ok(ReadyOutcome::Ready);
+                }
+
+                debug!("Health check for {} failed, retrying...", name);
+                sleep(Duration::from_secs(1)).await;
+            }
         })
+        .await;
+
+        match result {
+            Ok(inner) => inner,
+            Err(_) => bail!(
+                "service {} failed to become healthy within {}s",
+                name,
+                timeout_secs
+            ),
+        }
+    }
+
+    /// Classify why a freshly-spawned `run=` process exited by scanning its
+    /// captured log for a [port-conflict marker](PORT_CONFLICT_MARKERS). The log
+    /// is small here (the process only just started), so reading it whole is
+    /// cheap.
+    async fn classify_exit(&self, name: &str) -> ReadyOutcome {
+        if let Ok(path) = self.workspace.log_file_path(name)
+            && let Ok(contents) = tokio::fs::read_to_string(&path).await
+            && log_indicates_port_conflict(&contents)
+        {
+            return ReadyOutcome::PortConflict;
+        }
+        ReadyOutcome::Exited
+    }
+
+    /// The environment for a managed `run=` app eph launches.
+    ///
+    /// This is the connection environment `eph run` and lifecycle hooks see
+    /// (resolved top-level `.eph` variables + `EPH_*` metadata), plus the
+    /// service's own `env.X` values with their `${...}` interpolations resolved --
+    /// so an app can be handed its eph-assigned port via `env.PORT=${<name>.port}`
+    /// and reach other services via the usual variables. Later entries win, so the
+    /// service's own `env.X` shadow any top-level variable of the same name.
+    fn app_env(
+        &self,
+        eph: &EphFile,
+        running: &HashMap<String, RunningService>,
+        service: &Service,
+    ) -> Vec<(String, String)> {
+        let mut env = self.command_env(eph, running);
+        for (k, v) in &service.env {
+            env.push((k.clone(), resolve_against(v, running)));
+        }
+        env
     }
 
     /// Start a docker-compose service
@@ -1740,9 +2051,12 @@ impl ServiceManager {
             }
         }
 
-        // Clear in-memory state.
+        // Clear in-memory state. `clean` is a full reset, so unlike `down` it
+        // also drops the remembered auto-port assignments, letting the next `up`
+        // pick fresh ports.
         self.state.services.clear();
         self.state.processes.clear();
+        self.state.auto_ports.clear();
 
         // Remove the persisted state file (and its directory).
         let state_dir = self.workspace.state_dir()?;
@@ -2278,7 +2592,104 @@ mod tests {
         PortMapping {
             name: name.map(str::to_string),
             container_port,
+            auto: false,
         }
+    }
+
+    fn auto_port(name: Option<&str>) -> PortMapping {
+        PortMapping {
+            name: name.map(str::to_string),
+            container_port: 0,
+            auto: true,
+        }
+    }
+
+    #[test]
+    fn allocate_ports_uses_fixed_ports_verbatim() {
+        let declared = vec![port(None, 3000), port(Some("api"), 4000)];
+        let assigned = allocate_ports(&declared, None).unwrap();
+        assert_eq!(assigned.get("default"), Some(&3000));
+        assert_eq!(assigned.get("api"), Some(&4000));
+    }
+
+    #[test]
+    fn allocate_ports_assigns_distinct_free_ports_for_auto() {
+        let declared = vec![
+            auto_port(None),
+            auto_port(Some("hmr")),
+            auto_port(Some("api")),
+        ];
+        let assigned = allocate_ports(&declared, None).unwrap();
+        assert_eq!(assigned.len(), 3);
+
+        // Every assigned port is non-zero and they are all distinct.
+        let mut values: Vec<u16> = assigned.values().copied().collect();
+        assert!(values.iter().all(|&p| p != 0));
+        values.sort_unstable();
+        values.dedup();
+        assert_eq!(values.len(), 3, "auto ports must be distinct");
+    }
+
+    #[test]
+    fn allocate_ports_reuses_previous_free_port() {
+        // Pick a port the OS just told us is free, then ask for an auto port with
+        // that as the previous assignment: it should be reused for a stable URL.
+        let free = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let prev = HashMap::from([("default".to_string(), free)]);
+
+        let assigned = allocate_ports(&[auto_port(None)], Some(&prev)).unwrap();
+        assert_eq!(assigned.get("default"), Some(&free));
+    }
+
+    #[test]
+    fn allocate_ports_skips_busy_previous_port() {
+        // Hold a port so it is not bindable, then offer it as the previous
+        // assignment: allocation must fall back to a different, free port.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let busy = listener.local_addr().unwrap().port();
+        let prev = HashMap::from([("default".to_string(), busy)]);
+
+        let assigned = allocate_ports(&[auto_port(None)], Some(&prev)).unwrap();
+        assert_ne!(assigned.get("default"), Some(&busy));
+        assert!(assigned.get("default").is_some_and(|&p| p != 0));
+    }
+
+    #[test]
+    fn has_auto_port_detects_auto_mappings() {
+        assert!(has_auto_port(&[port(None, 3000), auto_port(Some("api"))]));
+        assert!(!has_auto_port(&[port(None, 3000), port(Some("api"), 4000)]));
+        assert!(!has_auto_port(&[]));
+    }
+
+    #[test]
+    fn log_indicates_port_conflict_matches_common_runtimes() {
+        // Node, Go, Python, Rust, .NET / generic libc phrasings.
+        assert!(log_indicates_port_conflict(
+            "Error: listen EADDRINUSE: address already in use :::3000"
+        ));
+        assert!(log_indicates_port_conflict(
+            "listen tcp 127.0.0.1:8080: bind: address already in use"
+        ));
+        assert!(log_indicates_port_conflict(
+            "OSError: [Errno 98] Address already in use"
+        ));
+        assert!(log_indicates_port_conflict(
+            "thread 'main' panicked: Address already in use (os error 98)"
+        ));
+        assert!(log_indicates_port_conflict("Port 5173 is already in use"));
+    }
+
+    #[test]
+    fn log_indicates_port_conflict_ignores_unrelated_crashes() {
+        assert!(!log_indicates_port_conflict(
+            "TypeError: cannot read properties of undefined"
+        ));
+        assert!(!log_indicates_port_conflict("command not found: vite"));
+        assert!(!log_indicates_port_conflict(""));
     }
 
     /// Raw bindings as produced by `get_container`: keyed by container-port
