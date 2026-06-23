@@ -2129,13 +2129,19 @@ impl ServiceManager {
                     .with_context(|| format!("failed to open log file: {}", path.display()))?;
                 file.seek(SeekFrom::Start(offset))
                     .context("failed to seek log file")?;
-                let mut buf = Vec::new();
-                let read = file
-                    .read_to_end(&mut buf)
-                    .context("failed to read log file")?;
-                offset += read as u64;
-                out.write_all(&buf)
-                    .context("failed to write logs to stdout")?;
+                // Stream the appended delta in chunks rather than buffering it
+                // whole: a burst of output between polls stays bounded to one
+                // chunk of memory.
+                let mut buf = [0u8; 8192];
+                loop {
+                    let read = file.read(&mut buf).context("failed to read log file")?;
+                    if read == 0 {
+                        break;
+                    }
+                    offset += read as u64;
+                    out.write_all(&buf[..read])
+                        .context("failed to write logs to stdout")?;
+                }
                 out.flush().ok();
             }
         }
