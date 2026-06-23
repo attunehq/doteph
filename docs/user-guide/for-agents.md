@@ -45,7 +45,7 @@ DATABASE_URL=$(eph env -f json | jq -r .DATABASE_URL)
 | `eph down [--rm \| -r] [svc...]` | Stop all / named. `--rm` (alias `-r`) also removes containers. Compose is always fully torn down. A failing `pre-stop` aborts the `down`; `--skip-hooks` bypasses `pre-stop`. |
 | `eph clean` | Full reset: remove containers + named volumes + state. Deletes data. A failing `pre-stop` aborts it; `--skip-hooks` bypasses `pre-stop`. |
 | `eph run <cmd>...` | Run a command in the workspace root with the resolved env + `EPH_*` metadata. Exits with the command's code. |
-| `eph logs [svc] [-f] [-n N]` | Show logs (all services, or one). `run=` reads a captured log file; Docker/compose proxy `docker logs`. Shows even for stopped services. `-f` follows (one service). |
+| `eph logs [svc] [-f] [-n N]` | Show logs. No svc: all services interleaved, each line tagged `[name]`. One svc: raw. `run=` reads a captured log file; Docker/compose proxy `docker logs`. Shows even for stopped services. `-f` follows (all or one). |
 | `eph status` | Running services and ports. |
 | `eph env [-f export\|fish\|json]` | Print resolved top-level env vars (stdout). |
 | `eph check` | Validate `.eph` (no Docker). |

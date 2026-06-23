@@ -12,10 +12,11 @@
 #![warn(clippy::complexity)]
 #![warn(clippy::perf)]
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eph::parser::{self, EphFile, ServiceSource};
 use eph::{LogOptions, ServiceManager, Workspace, skills};
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitCode};
@@ -100,10 +101,10 @@ enum Commands {
 
     /// Show logs for services.
     ///
-    /// With a SERVICE, shows that service's logs; without one, shows every
-    /// defined service's logs in turn (each under a `==> name <==` header).
-    /// `run=` services read from their captured log file; `image=` /
-    /// `dockerfile=` / `compose=` services proxy `docker logs` /
+    /// With a SERVICE, passes that service's logs through raw; without one,
+    /// streams every service interleaved with each line tagged `[name]` (like
+    /// `docker compose logs`). `run=` services read from their captured log file;
+    /// `image=` / `dockerfile=` / `compose=` services proxy `docker logs` /
     /// `docker compose logs`. Logs are shown even for a stopped service, so a
     /// `run=` service that died on startup still leaves a trace.
     Logs {
@@ -111,7 +112,7 @@ enum Commands {
         #[arg(value_name = "SERVICE")]
         service: Option<String>,
 
-        /// Follow log output, like `tail -f` (requires a single SERVICE).
+        /// Follow log output, like `tail -f` (Ctrl-C to stop).
         #[arg(short = 'f', long)]
         follow: bool,
 
@@ -408,73 +409,59 @@ async fn cmd_run(command: Vec<String>) -> Result<ExitCode> {
     Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
 }
 
-/// Show logs for one service, or for every defined service in turn.
+/// Show logs for one service (raw), or every service interleaved and tagged.
 async fn cmd_logs(service: Option<String>, follow: bool, tail: Option<usize>) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
     let manager = ServiceManager::new(workspace).await?;
     let opts = LogOptions { follow, tail };
 
+    // A single named service passes its raw stream straight through (untagged,
+    // pipe-friendly, follow-capable).
     if let Some(name) = service {
         return manager.logs(&eph, &name, &opts).await;
     }
 
-    // Following only makes sense for a single stream; interleaving several
-    // proxied `docker logs -f` and file tails is out of scope, so ask the user
-    // to pick one rather than silently following just the first.
-    if follow {
-        bail!("specify a single SERVICE to follow, e.g. `eph logs -f <service>`");
-    }
-
-    // No service given: print every service's logs with each line prefixed by a
-    // `[name]` tag, the way `docker compose logs` does. Sort by name so the
-    // output is stable across runs regardless of the underlying map order. A
-    // failure for one service is reported but does not abort the rest (e.g. one
-    // container was removed but others still have logs).
-    let mut names: Vec<&String> = eph.services.keys().collect();
+    // No service: stream every service interleaved, prefixing each line with a
+    // `[name]` tag the way `docker compose logs` does. Sort the names so tag
+    // colors and column width are stable across runs regardless of map order.
+    let mut names: Vec<String> = eph.services.keys().cloned().collect();
     names.sort();
 
-    // Right-align every tag to the widest one so the log text lines up in a
-    // column. Color the tag per service (deterministically from its name) when
-    // writing to a terminal, matching the compose-logs look.
+    // Right-align every tag to the widest one so the log text lines up, and color
+    // the tag per service (deterministically from its name) on a terminal.
     let tag_width = names
         .iter()
         .map(|n| n.chars().count() + 2) // +2 for the surrounding brackets
         .max()
         .unwrap_or(0);
     let colorize = should_colorize();
+    let prefixes: HashMap<String, String> = names
+        .iter()
+        .map(|name| {
+            let tag = format!("[{}]", name);
+            let pad = " ".repeat(tag_width.saturating_sub(tag.chars().count()));
+            let prefix = if colorize {
+                format!("{pad}\x1b[{}m{}\x1b[0m", tag_color(name), tag)
+            } else {
+                format!("{pad}{tag}")
+            };
+            (name.clone(), prefix)
+        })
+        .collect();
 
-    for name in &names {
-        let text = match manager.collect_logs(&eph, name, tail).await {
-            Ok(text) => text,
-            Err(e) => {
-                eprintln!("eph: {:#}", e);
-                continue;
-            }
-        };
-
-        let tag = format!("[{}]", name);
-        let pad = " ".repeat(tag_width.saturating_sub(tag.chars().count()));
-        let tag = if colorize {
-            format!("\x1b[{}m{}\x1b[0m", tag_color(name), tag)
-        } else {
-            tag
-        };
-
-        // Lock stdout per service (not across the await above, which would make
-        // this future non-Send). A write error means the reader hung up -- e.g.
-        // `eph logs | head` -- so stop quietly rather than panicking as the
-        // `println!` macro would.
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-        for line in text.lines() {
-            if writeln!(out, "{pad}{tag} {line}").is_err() {
-                return Ok(());
-            }
-        }
-    }
-
-    Ok(())
+    // Hold the stdout lock for the whole stream: lines arrive from concurrent
+    // tasks, but writing them here (one consumer) keeps each line atomic. A
+    // write error (closed pipe, e.g. `eph logs | head`) ends the stream quietly
+    // rather than panicking the way `println!` would.
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    manager
+        .stream_logs(&eph, &names, &opts, |service, line| {
+            let prefix = prefixes.get(service).map_or(service, String::as_str);
+            writeln!(out, "{prefix} {line}")
+        })
+        .await
 }
 
 /// ANSI SGR foreground codes used to color `eph logs` service tags. Theme-aware

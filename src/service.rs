@@ -16,7 +16,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
@@ -270,25 +273,181 @@ fn map_named_ports(declared: &[PortMapping], raw: &HashMap<String, u16>) -> Hash
     named
 }
 
-/// Run a `docker ...` command and return its combined output as text.
-///
-/// `docker logs` sends the container's stdout to our stdout and its stderr to
-/// our stderr, so both are captured and concatenated (stdout first). Ordering
-/// across the two streams is lost, but most services log to one of them, which
-/// is good enough for the tagged aggregate view.
-async fn capture_docker(args: &[String]) -> Result<String> {
-    let output = TokioCommand::new("docker")
-        .args(args)
-        .output()
-        .await
-        .context("failed to run docker (is docker on PATH?)")?;
+/// Where a service's logs come from, in the owned form [`stream_logs`] hands to
+/// each per-service task.
+enum LogSource {
+    /// A captured `run=` log file at this path.
+    File(PathBuf),
+    /// A `docker ...` invocation whose piped output is the log (the args after
+    /// the `docker` program, e.g. `["logs", "--follow", "<container>"]`).
+    Docker(Vec<String>),
+}
 
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.trim().is_empty() {
-        text.push_str(&stderr);
+/// One complete log line, tagged with the service it came from.
+struct LogLine {
+    service: String,
+    line: String,
+}
+
+/// Read a `run=` service's captured log file line by line, sending each whole
+/// line to `tx`. When `follow` is set, keeps tailing appended bytes (holding any
+/// partial trailing line until its newline arrives) until the task is aborted.
+async fn stream_file_lines(
+    name: String,
+    path: PathBuf,
+    follow: bool,
+    tail: Option<usize>,
+    tx: mpsc::Sender<LogLine>,
+) {
+    // Snapshot the current contents: emit the complete lines (after --tail), and
+    // when following, carry the unterminated trailing fragment forward so a line
+    // split across the snapshot boundary is not emitted in two halves.
+    let bytes = std::fs::read(&path).unwrap_or_default();
+    let mut offset = bytes.len() as u64;
+    let content = String::from_utf8_lossy(&bytes).into_owned();
+    let mut segments: Vec<String> = content
+        .split('\n')
+        .map(|s| s.trim_end_matches('\r').to_string())
+        .collect();
+    // `split('\n')` always yields a final element: the text after the last
+    // newline ("" when the file ends on a newline). That is the partial line.
+    let mut partial = segments.pop().unwrap_or_default();
+
+    if !follow && !partial.is_empty() {
+        // Not following: a trailing line with no newline is still real output.
+        segments.push(std::mem::take(&mut partial));
     }
-    Ok(text)
+
+    for line in apply_tail(segments, tail) {
+        if tx.send(line_for(&name, line)).await.is_err() {
+            return;
+        }
+    }
+
+    if !follow {
+        return;
+    }
+
+    loop {
+        sleep(Duration::from_millis(200)).await;
+
+        let len = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            // The file may briefly vanish if the workspace is cleaned mid-follow.
+            Err(_) => continue,
+        };
+        // A shorter file was truncated/rotated (e.g. the service restarted):
+        // start over from the new beginning.
+        if len < offset {
+            offset = 0;
+            partial.clear();
+        }
+        if len <= offset {
+            continue;
+        }
+
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            continue;
+        }
+        let mut buf = Vec::new();
+        let Ok(read) = file.read_to_end(&mut buf) else {
+            continue;
+        };
+        offset += read as u64;
+        partial.push_str(&String::from_utf8_lossy(&buf));
+
+        // Emit only the complete lines now in the buffer; keep the rest until its
+        // newline shows up on a later poll.
+        while let Some(idx) = partial.find('\n') {
+            let mut line: String = partial.drain(..=idx).collect();
+            line.pop(); // the '\n'
+            if line.ends_with('\r') {
+                line.pop();
+            }
+            if tx.send(line_for(&name, line)).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Run a `docker ...` command and stream its output line by line to `tx`.
+///
+/// stdout and stderr are read concurrently (both carry useful output, e.g. many
+/// servers log to stderr), so a line is sent the moment it completes on either.
+/// The child is spawned with `kill_on_drop` so aborting this task also kills the
+/// underlying `docker logs -f`.
+async fn stream_docker_lines(name: String, args: Vec<String>, tx: mpsc::Sender<LogLine>) {
+    let mut child = match TokioCommand::new("docker")
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = tx
+                .send(line_for(
+                    &name,
+                    format!("eph: failed to run docker logs: {e}"),
+                ))
+                .await;
+            return;
+        }
+    };
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let (name_out, name_err) = (name.clone(), name);
+    let (tx_out, tx_err) = (tx.clone(), tx);
+
+    let read_stdout = async move {
+        if let Some(stream) = stdout {
+            let mut lines = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if tx_out.send(line_for(&name_out, line)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    };
+    let read_stderr = async move {
+        if let Some(stream) = stderr {
+            let mut lines = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if tx_err.send(line_for(&name_err, line)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    };
+
+    tokio::join!(read_stdout, read_stderr);
+    let _ = child.wait().await;
+}
+
+/// Build a [`LogLine`] for `service` from an owned `line`.
+fn line_for(service: &str, line: String) -> LogLine {
+    LogLine {
+        service: service.to_string(),
+        line,
+    }
+}
+
+/// Keep only the last `tail` entries of `lines` (all of them when `tail` is
+/// `None` or larger than the list).
+fn apply_tail(mut lines: Vec<String>, tail: Option<usize>) -> Vec<String> {
+    if let Some(n) = tail {
+        let start = lines.len().saturating_sub(n);
+        lines.drain(..start);
+    }
+    lines
 }
 
 /// Read a log file, optionally trimming to the last `tail` lines.
@@ -1620,42 +1779,105 @@ impl ServiceManager {
         }
     }
 
-    /// Collect a service's logs as plain text (no follow).
+    /// Stream several services' logs as a single interleaved feed, invoking
+    /// `on_line` once per complete line with `(service_name, line)`.
     ///
-    /// Unlike [`logs`](Self::logs), which streams a single service's output
-    /// verbatim to stdout, this buffers the output and returns it so the caller
-    /// can prefix every line with a per-service tag. It is used by the
-    /// multi-service `eph logs` view (no `SERVICE` argument).
+    /// Each service is read concurrently in its own task and lines are merged
+    /// through a channel, so output is interleaved in arrival order the way
+    /// `docker compose logs` is -- but `on_line` is only ever called with a
+    /// whole line, so two services never interleave mid-line. At most one line
+    /// per service is buffered in flight; the full output is never collected.
     ///
-    /// The source matches [`logs`](Self::logs): `run=` reads the captured log
-    /// file, while Docker- and compose-backed services capture `docker logs` /
-    /// `docker compose logs`. For compose, the per-container prefix is stripped
-    /// (`--no-log-prefix`) since the caller adds eph's own `[service]` tag.
+    /// Sources match [`logs`](Self::logs): `run=` services read their captured
+    /// log file, while Docker- and compose-backed services read the piped output
+    /// of `docker logs` / `docker compose logs`. Compose's own per-container
+    /// prefix is stripped (`--no-log-prefix`) since the caller adds eph's
+    /// `[service]` tag.
+    ///
+    /// When `opts.follow` is set this runs until interrupted (Ctrl-C); otherwise
+    /// it returns once every source is exhausted. It also returns early if
+    /// `on_line` reports a write error (e.g. a closed pipe from `eph logs | head`).
     ///
     /// # Errors
     ///
-    /// Returns an error if `name` is not a defined service, if a log file cannot
-    /// be read, or if a proxied `docker` invocation fails.
-    pub async fn collect_logs(
+    /// Returns an error if any `name` is not a defined service.
+    pub async fn stream_logs(
         &self,
         eph: &EphFile,
-        name: &str,
-        tail: Option<usize>,
-    ) -> Result<String> {
-        let service = eph
-            .services
-            .get(name)
-            .with_context(|| format!("unknown service: {}", name))?;
+        names: &[String],
+        opts: &LogOptions,
+        mut on_line: impl FnMut(&str, &str) -> std::io::Result<()>,
+    ) -> Result<()> {
+        // Resolve each service to a fully-owned source up front, so the per-source
+        // tasks below can move their work in without borrowing `self` or `eph`.
+        let mut sources: Vec<(String, LogSource)> = Vec::with_capacity(names.len());
+        for name in names {
+            let service = eph
+                .services
+                .get(name)
+                .with_context(|| format!("unknown service: {}", name))?;
+            sources.push((name.clone(), self.log_source(name, service, opts)?));
+        }
 
-        match &service.source {
-            ServiceSource::Command(_) => {
-                let path = self.workspace.log_file_path(name)?;
-                if !path.exists() {
-                    // Not started yet (or already cleaned): no logs to show, but
-                    // not an error -- the aggregate view simply skips it.
-                    return Ok(String::new());
+        // A small bounded channel applies natural backpressure: a noisy service
+        // cannot run arbitrarily far ahead of the (single) consumer that writes.
+        let (tx, mut rx) = mpsc::channel::<LogLine>(256);
+        let mut tasks = JoinSet::new();
+        for (name, source) in sources {
+            let tx = tx.clone();
+            let follow = opts.follow;
+            let tail = opts.tail;
+            tasks.spawn(async move {
+                match source {
+                    LogSource::File(path) => stream_file_lines(name, path, follow, tail, tx).await,
+                    LogSource::Docker(args) => stream_docker_lines(name, args, tx).await,
                 }
-                read_tail(&path, tail)
+            });
+        }
+        // Drop our own sender so the channel closes once every task is done,
+        // which is how the non-follow consumer loop below terminates.
+        drop(tx);
+
+        loop {
+            tokio::select! {
+                // Only arm Ctrl-C while following; without --follow the consumer
+                // ends naturally when the channel closes, and a stray Ctrl-C
+                // should terminate the process the usual way.
+                _ = tokio::signal::ctrl_c(), if opts.follow => break,
+                recv = rx.recv() => match recv {
+                    Some(LogLine { service, line }) => {
+                        // A write error means the reader hung up (closed pipe);
+                        // stop quietly rather than erroring.
+                        if on_line(&service, &line).is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+            }
+        }
+
+        // Abort any still-running tasks. The docker children are spawned with
+        // kill_on_drop, so aborting their task reaps the process too.
+        tasks.shutdown().await;
+        Ok(())
+    }
+
+    /// Resolve a service to the owned [`LogSource`] used by [`stream_logs`].
+    fn log_source(&self, name: &str, service: &Service, opts: &LogOptions) -> Result<LogSource> {
+        let source = match &service.source {
+            ServiceSource::Command(_) => LogSource::File(self.workspace.log_file_path(name)?),
+            ServiceSource::Image(_) | ServiceSource::Dockerfile(_) => {
+                let mut args = vec!["logs".to_string()];
+                if let Some(n) = opts.tail {
+                    args.push("--tail".to_string());
+                    args.push(n.to_string());
+                }
+                if opts.follow {
+                    args.push("--follow".to_string());
+                }
+                args.push(self.workspace.container_name(name));
+                LogSource::Docker(args)
             }
             ServiceSource::Compose(path) => {
                 let compose_file = self.workspace.path.join(path);
@@ -1670,23 +1892,17 @@ impl ServiceManager {
                     "--no-color".to_string(),
                     "--no-log-prefix".to_string(),
                 ];
-                if let Some(n) = tail {
+                if let Some(n) = opts.tail {
                     args.push("--tail".to_string());
                     args.push(n.to_string());
                 }
-                capture_docker(&args).await
-            }
-            ServiceSource::Image(_) | ServiceSource::Dockerfile(_) => {
-                let container_name = self.workspace.container_name(name);
-                let mut args = vec!["logs".to_string()];
-                if let Some(n) = tail {
-                    args.push("--tail".to_string());
-                    args.push(n.to_string());
+                if opts.follow {
+                    args.push("--follow".to_string());
                 }
-                args.push(container_name);
-                capture_docker(&args).await
+                LogSource::Docker(args)
             }
-        }
+        };
+        Ok(source)
     }
 
     /// Read (and optionally follow) a `run=` service's captured log file.
@@ -1962,6 +2178,16 @@ mod tests {
 
         assert_eq!(read_tail(&path, None).unwrap(), "");
         assert_eq!(read_tail(&path, Some(5)).unwrap(), "");
+    }
+
+    #[test]
+    fn apply_tail_keeps_last_n_or_all() {
+        let lines = || vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(apply_tail(lines(), None), vec!["a", "b", "c"]);
+        assert_eq!(apply_tail(lines(), Some(2)), vec!["b", "c"]);
+        assert_eq!(apply_tail(lines(), Some(0)), Vec::<String>::new());
+        // More than present returns all.
+        assert_eq!(apply_tail(lines(), Some(10)), vec!["a", "b", "c"]);
     }
 
     #[test]

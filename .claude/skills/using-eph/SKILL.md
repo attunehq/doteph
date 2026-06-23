@@ -166,19 +166,20 @@ ad-hoc queries) -- unlike `post-start`, it runs every time you invoke it.
 ## Inspecting logs: `eph logs`
 
 ```sh
-eph logs                 # every service, each line tagged with [name]
+eph logs                 # all services interleaved, each line tagged [name]
+eph logs -f              # follow all services at once; Ctrl-C to stop
 eph logs <service>       # one service, raw (untagged)
-eph logs -f <service>    # follow (tail -f); Ctrl-C to stop
+eph logs -f <service>    # follow one service
 eph logs -n 50 <service> # last 50 lines
 ```
 
 Works for every service type: `run=` services read from a captured log file,
 while `image=` / `dockerfile=` / `compose=` services proxy `docker logs` /
-`docker compose logs`. With no service, every line is prefixed by a color-coded
-`[name]` tag (compose-style); a single `eph logs <service>` is untagged and
-pipe-friendly. Logs show even for a stopped service, so a `run=` service that
-died on startup still leaves a trace -- check `eph logs <service>` when a service
-is missing from `eph status`. `--follow` needs a single service.
+`docker compose logs`. With no service, every service is streamed concurrently
+and interleaved (compose-style), each line prefixed by a color-coded `[name]`
+tag; a single `eph logs <service>` is untagged and pipe-friendly. Logs show even
+for a stopped service, so a `run=` service that died on startup still leaves a
+trace -- check `eph logs <service>` when a service is missing from `eph status`.
 
 ## Behaviors that matter
 

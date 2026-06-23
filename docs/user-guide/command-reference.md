@@ -188,13 +188,14 @@ services read from the log file eph captures their output to; `image` /
 
 | Flag | Description |
 |------|-------------|
-| `-f`, `--follow` | Stream new output as it is produced (like `tail -f`). Requires a single `SERVICE`. |
+| `-f`, `--follow` | Stream new output as it is produced (like `tail -f`); Ctrl-C to stop. Works with or without a `SERVICE`. |
 | `-n`, `--tail N` | Show only the last `N` lines before printing/streaming. |
 
 ```sh
-eph logs                      # every service, each line tagged with [name]
+eph logs                      # every service interleaved, each line tagged [name]
+eph logs -f                   # follow all services at once (Ctrl-C to stop)
 eph logs worker               # just the worker service (untagged, raw)
-eph logs -f worker            # follow worker (Ctrl-C to stop)
+eph logs -f worker            # follow worker
 eph logs -n 50 postgres       # last 50 lines
 ```
 
@@ -204,12 +205,12 @@ eph logs -n 50 postgres       # last 50 lines
   directory.)
 - A `run` service's log file is truncated each time the service is freshly
   started, so it reflects the current run.
-- With no `SERVICE`, every defined service is printed in turn, with each line
-  prefixed by a right-aligned, color-coded `[name]` tag (like
-  `docker compose logs`). A single `eph logs <service>` is untagged and passes
-  the raw stream through. Colors are emitted only to a terminal and suppressed
-  when `NO_COLOR` is set or output is piped. Combining no `SERVICE` with
-  `--follow` is an error (pick one stream to follow).
+- With no `SERVICE`, every service is streamed concurrently and **interleaved**
+  in arrival order (like `docker compose logs`), with each line prefixed by a
+  right-aligned, color-coded `[name]` tag. Lines are emitted whole, so two
+  services never interleave mid-line. A single `eph logs <service>` is untagged
+  and passes the raw stream through. Colors are emitted only to a terminal and
+  suppressed when `NO_COLOR` is set or output is piped.
 - `eph clean` removes the captured log files along with the rest of the
   workspace state.
 

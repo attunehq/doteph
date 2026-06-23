@@ -941,6 +941,69 @@ run=echo beta-marker && sleep 300
     ws.eph_ok(&["down"]).await;
 }
 
+// `eph logs -f` with no SERVICE follows every service at once, interleaving
+// their tagged lines as they arrive.
+#[cfg(unix)]
+#[tokio::test]
+async fn logs_follow_all_services_interleaves() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    // Two services that each emit a tagged line roughly every 200ms, so a
+    // follow-all stream sees output from both within a couple of seconds.
+    let ws = TestWorkspace::new(
+        r#"
+[alpha]
+run=i=0; while [ $i -lt 100 ]; do echo alpha-$i; i=$((i+1)); sleep 0.2; done
+
+[beta]
+run=i=0; while [ $i -lt 100 ]; do echo beta-$i; i=$((i+1)); sleep 0.2; done
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+
+    let eph_binary = env!("CARGO_BIN_EXE_eph");
+    let mut child = tokio::process::Command::new(eph_binary)
+        .args(["logs", "-f"])
+        .current_dir(ws.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn `eph logs -f`");
+
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut reader = BufReader::new(stdout).lines();
+    let mut saw_alpha = false;
+    let mut saw_beta = false;
+
+    // Read until both services' tagged lines have appeared, or time out.
+    let result = tokio::time::timeout(Duration::from_secs(20), async {
+        while let Ok(Some(line)) = reader.next_line().await {
+            // Output is piped (not a TTY), so tags are uncolored plain text.
+            if line.contains("[alpha] alpha-") {
+                saw_alpha = true;
+            }
+            if line.contains("[beta] beta-") {
+                saw_beta = true;
+            }
+            if saw_alpha && saw_beta {
+                return;
+            }
+        }
+    })
+    .await;
+
+    let _ = child.kill().await;
+    ws.eph_ok(&["down"]).await;
+
+    assert!(
+        result.is_ok(),
+        "timed out before seeing both services (alpha={saw_alpha}, beta={saw_beta})"
+    );
+}
+
 // ============================================================================
 // Error Handling Tests
 // ============================================================================
