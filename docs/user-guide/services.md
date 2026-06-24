@@ -114,17 +114,81 @@ env.SERVICES=s3,sqs,dynamodb
 healthcheck=curl -sf http://localhost:4566/_localstack/health
 ```
 
-- The command runs via `sh -c` in the workspace root, with your `env.*` added to
-  the inherited environment. Its PID is tracked in state.
-- **Ports are not remapped.** Unlike container services, a `run=` service binds
-  whatever port its process binds; `eph` reports the **declared** `port=`
-  value as-is for interpolation. Pick a port your process will actually use.
-- The `healthcheck` (if any) runs on the host through `sh -c`, so full shell
-  syntax works.
+- The command runs via `sh -c` in the workspace root. Because eph launches it,
+  the process inherits eph's **resolved** environment: the variables `eph env`
+  emits (e.g. `DATABASE_URL`), the `EPH_*` metadata, and the service's own
+  `env.*` with `${...}` interpolations resolved. So a managed app can reach the
+  rest of the workspace without `eval "$(eph env)"` first. Its PID is tracked in
+  state.
+- **Fixed ports are not remapped.** With a numeric `port=`, a `run=` service
+  binds whatever port its process binds; `eph` reports the **declared** value
+  as-is for interpolation. Pick a port your process will actually use.
+- **`port=auto` lets eph allocate the port** (see [First-party app
+  ports](#first-party-app-ports-portauto) below).
+- The `healthcheck` (if any) runs on the host through `sh -c` with the **same
+  resolved environment** the process gets (and its `${...}` resolved), so a
+  readiness check can reach an auto-allocated port:
+  `healthcheck=curl -sf http://localhost:$PORT/health` (or `${web.port}`).
 - `eph down` sends `SIGTERM`, waits, then `SIGKILL`. Starting an already-running
   `run` service again is a no-op (its PID is checked first).
 
 > `run=` services need `sh` and `kill`, so on Windows they require WSL.
+
+### First-party app ports (`port=auto`)
+
+The one service eph does not start a container for is usually the app you are
+building. Give it a `run=` service with `port=auto` and eph allocates a free
+host port, hands it to the process through its environment, and reports it for
+interpolation just like a container's port. Two checkouts of the same project no
+longer fight over port 3000:
+
+```ini
+[web]
+run=npm run dev
+port=auto
+env.PORT=${web.port}              # tell your framework which port to bind
+
+APP_URL=http://localhost:${web.port}
+```
+
+How it works and what to know:
+
+- **eph picks the port and injects it.** Reference the service's own assigned
+  port as `${web.port}` (or `${web.port.<name>}`) in its `env.*` — that is how
+  the value reaches the process (most frameworks read `PORT`). The same port is
+  available to other services and to `eph env` / `${web.port}` everywhere.
+- **Stable across restarts.** eph reuses the previously-assigned port on the
+  next `eph up` when it is still free, so bookmarks and OAuth callback URLs keep
+  working; it only moves to a new port if the old one is taken.
+- **Self-healing on conflict (no TOCTOU gap).** There is an unavoidable instant
+  between eph reserving a port and your process binding it. Because eph owns
+  launching the process, it watches for an early exit whose log looks like a
+  port conflict (an "address already in use" message) and **re-launches on a
+  fresh port** automatically, a few times before giving up. For this to trigger,
+  your dev server must *exit* on a busy port rather than silently picking the
+  next one — prefer a "strict port" mode if your framework offers one (e.g.
+  Vite's `--strictPort`).
+- **Backing services start first.** Within one `eph up`, container/compose
+  services are started before `run=` apps, so an app's environment can reference
+  them (`${postgres.port}`) at launch.
+- `port=auto` is only valid for `run=` services; container services already get
+  a random host port from Docker.
+
+Multiple auto ports work too (a frontend plus its HMR socket, an embedded API):
+
+```ini
+[web]
+run=npm run dev
+port.app=auto
+port.hmr=auto
+env.PORT=${web.port.app}
+env.VITE_HMR_PORT=${web.port.hmr}
+```
+
+> A framework that *ignores* its injected port and picks its own (rather than
+> exiting on a conflict) is outside what the self-heal can see; eph reports the
+> port it assigned. Use the framework's strict-port option so the assigned port
+> is the one actually bound.
 
 ## Multi-port services
 
