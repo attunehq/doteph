@@ -114,7 +114,8 @@ env.SERVICES=s3,sqs,dynamodb
 healthcheck=curl -sf http://localhost:4566/_localstack/health
 ```
 
-- The command runs via `sh -c` in the workspace root. Because eph launches it,
+- The command runs via the platform shell (`sh -c` on Unix, `cmd /C` on Windows)
+  in the workspace root. Because eph launches it,
   the process inherits eph's **resolved** environment: the variables `eph env`
   emits (e.g. `DATABASE_URL`), the `EPH_*` metadata, and the service's own
   `env.*` with `${...}` interpolations resolved. So a managed app can reach the
@@ -125,14 +126,20 @@ healthcheck=curl -sf http://localhost:4566/_localstack/health
   as-is for interpolation. Pick a port your process will actually use.
 - **`port=auto` lets eph allocate the port** (see [First-party app
   ports](#first-party-app-ports-portauto) below).
-- The `healthcheck` (if any) runs on the host through `sh -c` with the **same
-  resolved environment** the process gets (and its `${...}` resolved), so a
-  readiness check can reach an auto-allocated port:
+- The `healthcheck` (if any) runs on the host through the platform shell with the
+  **same resolved environment** the process gets (and its `${...}` resolved), so
+  a readiness check can reach an auto-allocated port:
   `healthcheck=curl -sf http://localhost:$PORT/health` (or `${web.port}`).
-- `eph down` sends `SIGTERM`, waits, then `SIGKILL`. Starting an already-running
-  `run` service again is a no-op (its PID is checked first).
+- `eph down` stops the process gracefully, waits, then force-kills it. On Unix
+  that is `SIGTERM` then `SIGKILL`; on Windows, which has no `SIGTERM`, both steps
+  are a forced terminate. The stop targets the whole process tree, so a command
+  that launches a child (or, on Windows, the `cmd` wrapper that runs it) is torn
+  down completely rather than leaving the real service orphaned. Starting an
+  already-running `run` service again is a no-op (its PID is checked first).
 
-> `run=` services need `sh` and `kill`, so on Windows they require WSL.
+> `run=` services work natively on Linux, macOS, and Windows. On Windows the
+> command runs through `cmd`, so a command string written for `sh` may need a
+> `cmd`-compatible form (or run eph inside WSL to keep using POSIX commands).
 
 ### First-party app ports (`port=auto`)
 

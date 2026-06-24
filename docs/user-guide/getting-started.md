@@ -6,12 +6,12 @@ This page takes you from nothing to a running Postgres in about five minutes.
 
 - **Docker**, installed and running. `eph` talks to your local Docker daemon to
   start containers. Check it with `docker ps`.
-- **A POSIX shell** (`sh`) and `kill` for non-container features (`run=`
-  services, `post-start`/`pre-stop` hooks, and shell health checks).
-  - Linux and macOS have these natively.
-  - On **Windows**, run `eph` inside **WSL**. Plain Docker-image services are
-    the cross-platform path; the shell-based features above require WSL. See
-    [Troubleshooting](troubleshooting.md#windows-and-wsl).
+- **A shell** for the non-container features (`run=` services,
+  `post-start`/`pre-stop` hooks, and shell health checks). eph uses `sh -c` on
+  Linux and macOS and `cmd /C` on Windows, so these run natively everywhere; no
+  external `kill` is needed. A command string written for `sh` may need a
+  `cmd`-compatible form on Windows (or run eph inside **WSL** to keep using
+  POSIX commands). See [Troubleshooting](troubleshooting.md#windows).
 
 ## Install
 

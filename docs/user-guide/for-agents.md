@@ -83,7 +83,8 @@ Line by line: `image=` is the source (one of image/dockerfile/compose/run);
 `port=` is a container port published on a random host port; `env.X` is set
 **inside the container**; `volume=name:/path` is a per-workspace named volume;
 `healthcheck` for an image service runs without a shell (whitespace-split,
-`docker exec`); `post-start` runs on the host via `sh -c` after the service is
+`docker exec`); `post-start` runs on the host via the platform shell (`sh -c` on
+Unix, `cmd /C` on Windows) after the service is
 healthy; the trailing `DATABASE_URL=` is a **shell** env var emitted by `eph
 env`, with `${postgres.port}` filled in at runtime.
 
@@ -94,7 +95,7 @@ env`, with `${postgres.port}` filled in at runtime.
 | `image=` | Run a Docker image. |
 | `dockerfile=` (+ `context=`) | Build a local image (paths from workspace root). |
 | `compose=` (+ `expose.<name>=`) | Delegate to a Compose file. |
-| `run=` | Host process via `sh -c`. Ports are NOT remapped (declared port used as-is). |
+| `run=` | Host process via the platform shell (`sh -c` on Unix, `cmd /C` on Windows). Ports are NOT remapped (declared port used as-is). |
 
 ### Properties
 
@@ -104,9 +105,9 @@ env`, with `${postgres.port}` filled in at runtime.
 | `env.<KEY>=` | Container env (not shell env). |
 | `volume=` | `name:/path` = named volume; `./host:/path` or `/abs:/path` = bind mount. |
 | `command=` | Override container CMD (shell-word split, no shell). |
-| `healthcheck=` | image/dockerfile: no shell. run/compose: `sh -c`. |
+| `healthcheck=` | image/dockerfile: no shell. run/compose: platform shell (`sh -c` / `cmd /C`). |
 | `ready-timeout=` | Seconds (default 30; compose 60). |
-| `post-start=` / `pre-stop=` | Host `sh -c` in workspace root; repeatable. Run with the resolved env + `EPH_*` metadata + the service's `env.X` injected. `post-start` runs on every `up` (after all services healthy); failure aborts `up`. `pre-stop` failure aborts `down`/`clean`. |
+| `post-start=` / `pre-stop=` | Host platform shell (`sh -c` / `cmd /C`) in workspace root; repeatable. Run with the resolved env + `EPH_*` metadata + the service's `env.X` injected. `post-start` runs on every `up` (after all services healthy); failure aborts `up`. `pre-stop` failure aborts `down`/`clean`. |
 
 ### Interpolation (resolved by `eph env`, running services only)
 
@@ -136,7 +137,9 @@ reference a compose service's `expose.<name>=` port as `${svc.port.<name>}`.
   fully tear it down (`--rm` is a no-op for it); `clean` removes only `.eph`
   `volume=` named volumes, not Compose-internal ones.
 - **No `eph init`**: author `.eph` by hand.
-- **Windows needs WSL** for `run=`, hooks, and shell health checks.
+- **Windows runs natively**: `run=`, hooks, and shell health checks go through
+  `cmd /C` (vs `sh -c` on Unix), so command strings may need a `cmd`-compatible
+  form. Use WSL to keep writing POSIX command strings.
 
 ## Safe defaults for automation
 

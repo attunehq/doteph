@@ -33,7 +33,8 @@ Causes, in rough order of likelihood:
    on whitespace and exec'd directly. Pipes (`|`), `&&`, redirects, `$VAR`, and
    quoted arguments containing spaces do **not** work. Use one plain command,
    e.g. `pg_isready -U dev`, `redis-cli ping`. (For `run`/`compose` services the
-   check does run through `sh -c`, so shell syntax is fine there.)
+   check runs through the platform shell (`sh -c` on Unix, `cmd /C` on Windows),
+   so shell syntax is fine there.)
 2. **The check binary is not in the image.** `mysqladmin`, `mongosh`,
    `pg_isready`, `curl` must exist inside the container. Slim images may omit
    them.
@@ -132,16 +133,27 @@ ever looks wrong, `eph clean` resets the workspace completely (removing
 containers, named volumes, and the state file), after which `eph up` rebuilds
 from scratch.
 
-## Windows and WSL
+## Windows
 
-`eph` runs natively on Linux and macOS. On Windows, the Docker-backed services
-run natively, but the shell-based features below require **WSL**.
+`eph` runs natively on Linux, macOS, and Windows. The Docker-backed services
+(`image=`, `dockerfile=`, `compose=`) behave identically everywhere.
 
-Plain `image=`/`dockerfile=` services with container (`docker exec`) health
-checks and no hooks are the cross-platform path. But `run=` services,
-`post-start`/`pre-stop` hooks, and `run`/`compose` health checks all shell out to
-`sh`, and process management uses `kill` - which are POSIX. Run inside WSL to use
-those features on Windows.
+The shell-based features (`run=` services, `post-start`/`pre-stop` hooks, and
+`run`/`compose` health checks) run through the platform shell: `sh -c` on Unix
+and `cmd /C` on Windows. Process liveness and teardown go through the `sysinfo`
+crate rather than a POSIX `kill`, so on Windows (which has no `SIGTERM`) a stop
+is a forced terminate. The *features* therefore work natively on Windows with no
+WSL.
+
+What does not cross over automatically is the command string itself: a `run=`,
+hook, or health-check command written for `sh` (pipes, `$VAR`, `&&`, and POSIX
+tools like `curl`/`pg_isready`) may need a `cmd`-compatible rewrite on Windows
+(`%VAR%`, different builtins). Two ways to handle it:
+
+- Write the command for `cmd`, or call a cross-platform binary directly (many,
+  like `pg_isready` or `redis-cli`, take the same arguments on both platforms).
+- Keep your POSIX command strings and run `eph` inside **WSL**, where it is a
+  Linux process and `sh` is the shell.
 
 When you run under WSL, `eph` is a Linux process, so its state directory is the
 **Linux** path (`~/.local/share/eph/<short_id>/`), not the Windows
