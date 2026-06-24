@@ -1023,6 +1023,72 @@ APP_URL=http://localhost:${web.port}
     ws.eph_ok(&["down"]).await;
 }
 
+// A compound `run=` command makes the shell fork children; `eph down` must kill
+// that whole tree, not just the wrapper, or the children are orphaned and survive
+// teardown. The command spawns a long-lived *grandchild* (a `sleep` two levels
+// below the wrapper shell) that records its own PID into the workspace, then the
+// test asserts that PID is gone after `eph down`.
+//
+// `#[cfg(unix)]`: the command string is POSIX `sh`, liveness is probed with
+// `kill -0`, and this exercises the Unix process-group teardown. The Docker-backed
+// CI job that runs this suite is Linux, where the assertion is meaningful.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_service_compound_command_kills_child_tree_on_down() {
+    // Both shell levels are compound (`... & wait`) so neither `sh` exec-optimizes
+    // itself away: the outer shell stays as the wrapper eph records (and groups),
+    // and the inner shell forks the real `sleep` grandchild rather than becoming
+    // it.
+    let ws = TestWorkspace::new(
+        "[web]\nrun=sh -c 'sleep 300 & echo $! > grandchild.pid; wait' & wait\n",
+    );
+
+    ws.eph_ok(&["up"]).await;
+
+    // The grandchild writes its PID into the workspace; wait for the file to land
+    // and parse a PID out of it.
+    let pid_path = ws.path().join("grandchild.pid");
+    let pid: u32 = common::retry_until(Duration::from_secs(10), || async {
+        let raw = tokio::fs::read_to_string(&pid_path)
+            .await
+            .map_err(|e| e.to_string())?;
+        raw.trim().parse::<u32>().map_err(|e| e.to_string())
+    })
+    .await
+    .expect("the grandchild should have recorded its PID");
+
+    assert!(
+        process_alive(pid),
+        "the grandchild (PID {pid}) should be alive while the service is up"
+    );
+
+    ws.eph_ok(&["down"]).await;
+
+    // After teardown the grandchild must be gone. Poll: SIGKILL reaping is
+    // asynchronous, so a just-killed process can linger for a moment.
+    let gone = common::retry_until(Duration::from_secs(10), || async {
+        if process_alive(pid) { Err(()) } else { Ok(()) }
+    })
+    .await
+    .is_ok();
+    assert!(
+        gone,
+        "the orphaned grandchild (PID {pid}) survived `eph down`"
+    );
+}
+
+/// Whether `pid` is a live process, via a POSIX `kill -0` probe (no signal sent,
+/// just an existence/permission check). Used to assert a `run=` service's child
+/// tree is torn down. Returns `false` once the process is gone.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 // `eph logs` for an image-backed service proxies `docker logs`.
 #[tokio::test]
 async fn logs_proxies_docker_for_image_service() {

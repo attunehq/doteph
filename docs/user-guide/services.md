@@ -130,12 +130,14 @@ healthcheck=curl -sf http://localhost:4566/_localstack/health
   **same resolved environment** the process gets (and its `${...}` resolved), so
   a readiness check can reach an auto-allocated port:
   `healthcheck=curl -sf http://localhost:$PORT/health` (or `${web.port}`).
-- `eph down` stops the process gracefully, waits, then force-kills it. On Unix
-  that is `SIGTERM` then `SIGKILL`; on Windows, which has no `SIGTERM`, both steps
-  are a forced terminate. The stop targets the whole process tree, so a command
-  that launches a child (or, on Windows, the `cmd` wrapper that runs it) is torn
-  down completely rather than leaving the real service orphaned. Starting an
-  already-running `run` service again is a no-op (its PID is checked first).
+- `eph down` stops the process gracefully, waits, then force-kills it, and it
+  targets the whole process tree the command spawned, so a compound command
+  (`run=build && serve`, a pipeline, a backgrounded child) is torn down completely
+  rather than leaving children orphaned. On Unix the command runs in its own
+  process group and the stop signals the group (`SIGTERM` then `SIGKILL`); on
+  Windows, which has no `SIGTERM`, eph force-terminates the `cmd` wrapper and
+  every process descended from it. Starting an already-running `run` service again
+  is a no-op (its PID is checked first).
 
 > `run=` services work natively on Linux, macOS, and Windows. On Windows the
 > command runs through `cmd`, so a command string written for `sh` may need a

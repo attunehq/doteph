@@ -35,6 +35,14 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Unix-only: tearing down a `run=` service signals the shell's whole process
+# group (`killpg`), which sysinfo cannot express. libc is already in the tree
+# transitively (sysinfo pulls it on Unix); this makes the direct use explicit.
+# Windows needs nothing extra: it tears down by walking the descendant process
+# tree via sysinfo, which is already a dependency.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 # Heavyweight stress tests (tests/stress.rs) open a real SQL connection to the
