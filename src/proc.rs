@@ -10,10 +10,11 @@
 //! - Shell: `sh -c <cmd>` on Unix (unchanged), `cmd /C <cmd>` on Windows. `cmd`
 //!   is the closest analog to `sh -c`: it takes a single command string, the
 //!   child inherits the environment, and it returns the command's own exit code.
-//! - Liveness and termination: done natively via [`sysinfo`], so neither a POSIX
-//!   `kill` nor a Windows `taskkill` binary is required. On Unix the signals map
-//!   to the historical behavior (`SIGTERM` then `SIGKILL`); on Windows, where
-//!   POSIX signals do not exist, both fall back to `TerminateProcess`.
+//! - Liveness and termination: handled through [`sysinfo`] rather than eph
+//!   shelling out to a POSIX `kill`. On Unix the signals map to the historical
+//!   behavior (`SIGTERM` then `SIGKILL`); on Windows, where POSIX signals do not
+//!   exist, both graceful and forced stops become a hard terminate (sysinfo uses
+//!   the built-in `taskkill /F` for that, so no extra setup or WSL is needed).
 
 use std::num::NonZeroU32;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
@@ -70,9 +71,9 @@ pub fn is_alive(pid: NonZeroU32) -> bool {
 ///
 /// On Unix this sends `SIGTERM` (matching the old `kill <pid>`); on Windows,
 /// where POSIX signals do not exist, [`Signal::Term`] is unsupported and
-/// `kill_with` returns `None`, so it falls back to a hard terminate
-/// (`TerminateProcess`). Best-effort: a process that has already exited is a
-/// no-op, mirroring the ignored error from the old `kill`.
+/// `kill_with` returns `None`, so it falls back to a hard terminate (the same
+/// forced stop as [`force_kill`]). Best-effort: a process that has already
+/// exited is a no-op, mirroring the ignored error from the old `kill`.
 pub fn terminate(pid: NonZeroU32) {
     let (system, pid) = snapshot(pid);
     if let Some(process) = system.process(pid)
@@ -83,7 +84,7 @@ pub fn terminate(pid: NonZeroU32) {
     }
 }
 
-/// Forcibly kill the process with `pid` (`SIGKILL` on Unix, `TerminateProcess`
+/// Forcibly kill the process with `pid` (`SIGKILL` on Unix, a forced terminate
 /// on Windows). Best-effort, mirroring the old `kill -9 <pid>`: a process that
 /// is already gone is a no-op.
 pub fn force_kill(pid: NonZeroU32) {
@@ -128,43 +129,47 @@ mod tests {
         assert_eq!(status.code(), Some(3));
     }
 
-    #[tokio::test]
-    async fn is_alive_then_force_kill_ends_the_process() {
-        let child = spawn_sleeper();
+    /// Assert that `kill` ended `child` promptly, then that its PID is gone.
+    ///
+    /// The kill is delivered out of band (through `sysinfo`, not the `Child`
+    /// handle), so this reaps the child afterward. That reap matters on Unix: a
+    /// killed-but-unwaited child lingers as a zombie, which still occupies a slot
+    /// in the process table and so reads as "alive". In real eph usage there is
+    /// no zombie (the short-lived CLI exits and `init` reaps the detached child);
+    /// the test process, being the long-lived parent, must reap explicitly.
+    ///
+    /// The timeout is the real assertion that the kill *worked*: the sleeper
+    /// would exit on its own in ~30s, so reaping within a few seconds proves the
+    /// kill ended it rather than it simply running to completion.
+    async fn assert_kill_ends(mut child: tokio::process::Child, kill: impl FnOnce(NonZeroU32)) {
         let pid = NonZeroU32::new(child.id().expect("freshly spawned child has a PID")).unwrap();
-
         assert!(is_alive(pid), "a just-spawned sleeper should be alive");
 
-        force_kill(pid);
+        kill(pid);
 
-        // Killing is asynchronous from our perspective; poll briefly for the OS
-        // to reap before asserting the process is gone.
-        let mut gone = false;
-        for _ in 0..100 {
-            if !is_alive(pid) {
-                gone = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(gone, "force_kill should have ended the process");
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("kill should let the child be reaped well before it exits on its own")
+            .expect("waiting on the killed child failed");
+        assert!(
+            !status.success(),
+            "a killed process should not report a successful exit"
+        );
+
+        // Once reaped, the PID leaves the table.
+        assert!(
+            !is_alive(pid),
+            "the killed process should no longer be alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_kill_ends_the_process() {
+        assert_kill_ends(spawn_sleeper(), force_kill).await;
     }
 
     #[tokio::test]
     async fn terminate_ends_the_process() {
-        let child = spawn_sleeper();
-        let pid = NonZeroU32::new(child.id().expect("freshly spawned child has a PID")).unwrap();
-
-        terminate(pid);
-
-        let mut gone = false;
-        for _ in 0..100 {
-            if !is_alive(pid) {
-                gone = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(gone, "terminate should have ended the process");
+        assert_kill_ends(spawn_sleeper(), terminate).await;
     }
 }

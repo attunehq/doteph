@@ -131,9 +131,9 @@ healthcheck=curl -sf http://localhost:4566/_localstack/health
   a readiness check can reach an auto-allocated port:
   `healthcheck=curl -sf http://localhost:$PORT/health` (or `${web.port}`).
 - `eph down` stops the process gracefully, waits, then force-kills it. On Unix
-  that is `SIGTERM` then `SIGKILL`; on Windows it is `TerminateProcess` (there is
-  no `SIGTERM`). Starting an already-running `run` service again is a no-op (its
-  PID is checked first).
+  that is `SIGTERM` then `SIGKILL`; on Windows, which has no `SIGTERM`, both steps
+  are a forced terminate. Starting an already-running `run` service again is a
+  no-op (its PID is checked first).
 
 > `run=` services work natively on Linux, macOS, and Windows. On Windows the
 > command runs through `cmd`, so a command string written for `sh` may need a

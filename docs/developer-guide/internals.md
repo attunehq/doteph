@@ -137,7 +137,8 @@ engine.
   aborting teardown, unless `skip_hooks` / CLI `--skip-hooks`), then stops by
   source type: Docker (stop, optionally remove), `run` (graceful terminate via
   `proc::terminate`, wait, then `proc::force_kill`: `SIGTERM`/`SIGKILL` on Unix,
-  `TerminateProcess` on Windows), or compose (`docker compose down`). `stop_all` and `clean` snapshot running
+  a forced terminate on Windows since it has no `SIGTERM`), or compose
+  (`docker compose down`). `stop_all` and `clean` snapshot running
   services once up front and thread `skip_hooks` through; `stop_all` clears state.
 - `resolve_env_vars` / `command_env` / `hook_env` build the resolved environment
   shared by `eph env`, `eph run`, and the lifecycle hooks.

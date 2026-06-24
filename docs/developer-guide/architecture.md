@@ -121,9 +121,10 @@ operations are awkward to reproduce over the API.
 The host-side bits of the `run=` path (the shell, plus PID liveness and
 teardown) are platform-abstracted in [`src/proc.rs`](../../src/proc.rs): the
 shell is `sh -c` on Unix and `cmd /C` on Windows, and liveness/termination go
-through the `sysinfo` crate (so no external `kill`/`taskkill` binary is needed).
-On Unix the kill path sends `SIGTERM` then `SIGKILL`; on Windows, which has no
-POSIX signals, both map to `TerminateProcess`.
+through the `sysinfo` crate instead of eph shelling out to a POSIX `kill`. On
+Unix the kill path sends `SIGTERM` then `SIGKILL`; on Windows, which has no POSIX
+signals, both the graceful and forced stops become a hard terminate (sysinfo
+uses the built-in `taskkill /F`, so no extra setup or WSL is needed).
 
 > **Reconciling compose services.** `ServiceManager::status` reconciles state by
 > looking up a container named `eph-<short_id>-<service>`, which exists for

@@ -140,9 +140,10 @@ from scratch.
 
 The shell-based features (`run=` services, `post-start`/`pre-stop` hooks, and
 `run`/`compose` health checks) run through the platform shell: `sh -c` on Unix
-and `cmd /C` on Windows. Process liveness and teardown are done natively (no
-external `kill`), so on Windows a graceful stop maps to `TerminateProcess` rather
-than `SIGTERM`. The *features* therefore work natively on Windows with no WSL.
+and `cmd /C` on Windows. Process liveness and teardown go through the `sysinfo`
+crate rather than a POSIX `kill`, so on Windows (which has no `SIGTERM`) a stop
+is a forced terminate. The *features* therefore work natively on Windows with no
+WSL.
 
 What does not cross over automatically is the command string itself: a `run=`,
 hook, or health-check command written for `sh` (pipes, `$VAR`, `&&`, and POSIX
