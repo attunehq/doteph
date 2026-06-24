@@ -238,11 +238,14 @@ async fn cmd_up(service_filter: Vec<String>, skip_hooks: bool) -> Result<()> {
         .start_services(&eph, &service_filter, skip_hooks)
         .await?;
 
-    // Print summary
+    // Print summary in declaration order (iterate the .eph definitions rather
+    // than the unordered `running` map) so the output is reproducible.
     println!();
     println!("Services started:");
-    for (name, svc) in &running {
-        print_service_ports(name, svc);
+    for name in eph.services.keys() {
+        if let Some(svc) = running.get(name) {
+            print_service_ports(name, svc);
+        }
     }
 
     // Print environment hint
@@ -332,8 +335,26 @@ async fn cmd_status() -> Result<()> {
         }
     } else {
         println!("Running services:");
-        for (name, svc) in &running {
-            print_service_ports(name, svc);
+        // Declared services first, in declaration order, so the listing is
+        // reproducible across runs.
+        for name in eph.services.keys() {
+            if let Some(svc) = running.get(name) {
+                print_service_ports(name, svc);
+            }
+        }
+        // Then any service that is running in persisted state but no longer
+        // declared in the `.eph` file (renamed or removed). These are still
+        // surfaced so they remain visible and tearable, sorted by name to stay
+        // deterministic.
+        let mut undeclared: Vec<&String> = running
+            .keys()
+            .filter(|n| !eph.services.contains_key(*n))
+            .collect();
+        undeclared.sort();
+        for name in undeclared {
+            if let Some(svc) = running.get(name) {
+                print_service_ports(name, svc);
+            }
         }
 
         let stopped: Vec<_> = eph
