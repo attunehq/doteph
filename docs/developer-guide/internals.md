@@ -136,11 +136,16 @@ engine.
   runs `pre-stop` with the resolved environment (a failure is **propagated**,
   aborting teardown, unless `skip_hooks` / CLI `--skip-hooks`), then stops by
   source type: Docker (stop, optionally remove), `run` (graceful terminate via
-  `proc::terminate`, wait, then `proc::force_kill`: `SIGTERM`/`SIGKILL` on Unix,
-  a forced terminate on Windows since it has no `SIGTERM`; both signal the whole
-  process tree rooted at the tracked PID so a `cmd`/`sh` wrapper does not orphan
-  the real service), or compose (`docker compose down`). `stop_all` and `clean` snapshot running
-  services once up front and thread `skip_hooks` through; `stop_all` clears state.
+  `proc::terminate`, wait, then `proc::force_kill`), or compose (`docker compose
+  down`). For `run`, teardown targets the whole process tree the shell spawned,
+  not just the wrapper PID, so a compound command's children are not orphaned: on
+  Unix the shell is spawned in its own process group (`process_group(0)`) and
+  `proc::terminate`/`force_kill` signal the group with `killpg` (`SIGTERM` then
+  `SIGKILL`, race-free), falling back to a `sysinfo` descendant walk only for
+  legacy non-grouped state; on Windows, which has no signals and no reattachable
+  process group, they walk and hard-terminate the descendant tree. `stop_all` and
+  `clean` snapshot running services once up front and thread `skip_hooks` through;
+  `stop_all` clears state.
 - `resolve_env_vars` / `command_env` / `hook_env` build the resolved environment
   shared by `eph env`, `eph run`, and the lifecycle hooks.
 - `clean` stops+removes everything, removes per-workspace named volumes (skipping

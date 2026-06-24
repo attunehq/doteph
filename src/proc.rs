@@ -10,23 +10,36 @@
 //! - Shell: `sh -c <cmd>` on Unix (unchanged), `cmd /C <cmd>` on Windows. `cmd`
 //!   is the closest analog to `sh -c`: it takes a single command string, the
 //!   child inherits the environment, and it returns the command's own exit code.
-//! - Liveness and termination: handled through [`sysinfo`] rather than eph
-//!   shelling out to a POSIX `kill`. On Unix the signals map to the historical
-//!   behavior (`SIGTERM` then `SIGKILL`); on Windows, where POSIX signals do not
-//!   exist, both graceful and forced stops become a hard terminate (sysinfo uses
-//!   the built-in `taskkill /F` for that, so no extra setup or WSL is needed).
+//! - Liveness: native, via the process group (Unix) or [`sysinfo`] (Windows), so
+//!   no POSIX `kill` or Windows `taskkill` binary is needed.
 //!
-//! Teardown kills the whole process tree rooted at the tracked PID, not just
-//! that one process. This matters most on Windows, where the tracked PID is the
-//! `cmd /C` wrapper and the real service runs as its child: killing only the
-//! wrapper would orphan the service. On Unix it also covers a `sh -c` that
-//! stayed alive as the parent of a backgrounded or compound command. The tree is
-//! discovered by walking parent links in a process snapshot (`sysinfo`), so it
-//! works across separate `eph` invocations (an `eph down` reads the PID from
-//! state and reconstructs the tree); a process spawned after the snapshot can
-//! still escape, which is an accepted limitation of snapshot-based teardown.
+//! Teardown kills the **whole process tree** a `run=` shell spawns, not just the
+//! tracked wrapper PID. A compound command (`a && b`, a pipeline, a backgrounded
+//! child) makes the shell fork children; signaling only the wrapper would orphan
+//! them, and they would survive `eph down` / `eph clean`. eph is a daemonless
+//! CLI (the `eph up` that spawns a service exits, and a separate `eph down`
+//! reads the PID from state and tears it down), so the teardown mechanism has to
+//! be addressable across processes by something already in state, the PID:
+//!
+//! - Unix: the shell is spawned as the leader of a new process group (see
+//!   [`prepare_detached`]) whose PGID equals its PID. Teardown signals the group
+//!   (`SIGTERM` then `SIGKILL`, the historical sequence), reaching every
+//!   descendant in one **race-free** call. `killpg` works from any process, so a
+//!   later `eph down` needs nothing but the PID.
+//! - Windows: there is no equivalent an unrelated `eph down` can address. A Job
+//!   Object would be the natural fit, but a named job cannot be reattached after
+//!   the `eph up` that created it exits: closing the last handle releases the
+//!   object's name immediately (even while its processes run), so a later
+//!   `OpenJobObject` by name fails. Keeping the name alive needs a persistent
+//!   handle holder, which a daemonless CLI does not have. Teardown therefore
+//!   walks the live process table and terminates the wrapper together with every
+//!   process that descends from it. A child spawned after that snapshot can
+//!   escape, the accepted limitation of snapshot-based teardown.
+//!
+//! On Unix the same descendant walk is the fallback for a service recorded
+//! before eph grouped its shells (legacy on-disk state, where the wrapper leads
+//! no group).
 
-use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
 use tokio::process::Command as TokioCommand;
@@ -53,11 +66,31 @@ pub fn shell_command(cmd: &str) -> TokioCommand {
     command
 }
 
+/// Configure `command` so a detached `run=` shell heads its own process group
+/// (Unix), letting teardown signal the whole tree it forks instead of just the
+/// wrapper.
+///
+/// On Unix the child becomes the leader of a new process group whose PGID equals
+/// its PID (`process_group(0)`); [`terminate`]/[`force_kill`] then signal that
+/// group. This is set **only** on the detached service spawn, not on hooks or
+/// health checks: those are awaited in the foreground, and putting them in their
+/// own group would stop the terminal's Ctrl-C (`SIGINT`) from reaching them.
+///
+/// On Windows there is no pre-spawn step (teardown walks the descendant tree, see
+/// the module docs), so this is a no-op.
+pub fn prepare_detached(command: &mut TokioCommand) {
+    // A PGID of 0 makes the child its own group leader (PGID == PID).
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
 /// Refresh a fresh [`System`] so it knows only about `pid`, returning it
 /// alongside the `sysinfo` [`Pid`]. Nothing beyond bare existence is collected
-/// (`ProcessRefreshKind::nothing()`), since callers only ask "is it there?" and
-/// "kill it"; `remove_dead_processes` is `true` so a process that has exited is
-/// dropped and therefore reads as not-present.
+/// (`ProcessRefreshKind::nothing()`), since callers only ask "is it there?";
+/// `remove_dead_processes` is `true` so a process that has exited is dropped and
+/// therefore reads as not-present.
 fn snapshot(pid: NonZeroU32) -> (System, Pid) {
     let pid = Pid::from_u32(pid.get());
     let mut system = System::new();
@@ -69,13 +102,45 @@ fn snapshot(pid: NonZeroU32) -> (System, Pid) {
     (system, pid)
 }
 
-/// Whether a process with `pid` is currently alive.
-///
-/// Replaces the historical `kill -0 <pid>` probe with a native lookup, so it
-/// needs no external binary and behaves the same on Unix and Windows.
-pub fn is_alive(pid: NonZeroU32) -> bool {
+/// Whether a process with `pid` is present in the OS process table (a native
+/// lookup that replaces the historical `kill -0 <pid>` probe).
+fn pid_in_table(pid: NonZeroU32) -> bool {
     let (system, pid) = snapshot(pid);
     system.process(pid).is_some()
+}
+
+/// Whether the `run=` service tracked as `pid` is still alive.
+///
+/// On Unix this probes the process **group** (`killpg(pid, 0)`), not just the
+/// leader PID, so a service whose shell exited but left a backgrounded child
+/// running in the group still reads as alive (otherwise `eph up` would spawn a
+/// duplicate). `EPERM` means the group exists but is not ours to signal (still
+/// alive); any other error (chiefly `ESRCH`, no such group) means the wrapper was
+/// recorded before eph grouped its shells (legacy state) or is truly gone, so we
+/// fall back to probing the bare PID. On Windows the `cmd /C` wrapper stays alive
+/// as the parent of its child, so the PID probe is sufficient.
+pub fn is_alive(pid: NonZeroU32) -> bool {
+    #[cfg(unix)]
+    {
+        let raw = pid.get() as libc::pid_t;
+        // SAFETY: `killpg` with signal 0 performs the permission/existence checks
+        // of signaling without delivering a signal; it takes plain integers and
+        // has no memory-safety preconditions.
+        if unsafe { libc::killpg(raw, 0) } == 0 {
+            return true;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            // Group exists but we may not signal it: still present.
+            Some(libc::EPERM) => true,
+            // No such group: legacy non-grouped wrapper (or truly gone). Probe the
+            // PID directly to tell those apart.
+            _ => pid_in_table(pid),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        pid_in_table(pid)
+    }
 }
 
 /// Collect `root` and all of its descendant PIDs from a process snapshot.
@@ -85,6 +150,8 @@ pub fn is_alive(pid: NonZeroU32) -> bool {
 /// reuse could otherwise fabricate. `root` is always included even if it is no
 /// longer present, so callers still attempt to signal it.
 fn process_tree(system: &System, root: Pid) -> Vec<Pid> {
+    use std::collections::{HashMap, HashSet};
+
     let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
     for (pid, process) in system.processes() {
         if let Some(parent) = process.parent() {
@@ -107,13 +174,17 @@ fn process_tree(system: &System, root: Pid) -> Vec<Pid> {
     tree
 }
 
-/// Send `signal` to every process in the tree rooted at `pid` (the tracked
-/// process plus all of its descendants).
+/// Signal every process in the `sysinfo` descendant tree rooted at `pid`.
 ///
-/// Each process is signaled with `signal`; where the platform does not support
-/// it (Windows has no `SIGTERM`), `kill_with` returns `None` and we fall back to
-/// a hard kill. Best-effort throughout: a process that has already exited is a
-/// no-op, mirroring the ignored error from the old `kill`.
+/// This is Windows's primary teardown and Unix's fallback for a wrapper recorded
+/// before eph grouped its shells (legacy state). Where the platform does not
+/// support `signal` (Windows has no `SIGTERM`), `kill_with` returns `None` and we
+/// fall back to a hard kill. Best-effort throughout: a process that has already
+/// exited is a no-op.
+///
+/// A child spawned after the snapshot can still escape this walk, the accepted
+/// limitation of snapshot-based teardown (the Unix process-group path does not
+/// have it).
 fn signal_tree(pid: NonZeroU32, signal: Signal) {
     // A full snapshot is needed (not just `pid`): the parent links of every
     // process are what let us find the descendants to signal.
@@ -131,20 +202,50 @@ fn signal_tree(pid: NonZeroU32, signal: Signal) {
 
 /// Ask the process tree rooted at `pid` to terminate gracefully.
 ///
-/// On Unix this sends `SIGTERM` (matching the old `kill <pid>`) to every process
-/// in the tree; on Windows, where POSIX signals do not exist, it is a hard
-/// terminate (the same forced stop as [`force_kill`]). Killing the whole tree
-/// rather than just `pid` is what keeps a `cmd /C` (Windows) or backgrounded
-/// `sh -c` (Unix) wrapper from orphaning the real service.
+/// On Unix this sends `SIGTERM` to the wrapper's process group (matching the old
+/// `kill <pid>` but reaching every descendant). On Windows, where POSIX signals
+/// do not exist, it is a hard terminate of the whole tree (the same forced stop
+/// as [`force_kill`]). Best-effort: a tree that has already exited is a no-op,
+/// mirroring the ignored error from the old `kill`.
 pub fn terminate(pid: NonZeroU32) {
-    signal_tree(pid, Signal::Term);
+    stop_tree(pid, Signal::Term);
 }
 
-/// Forcibly kill the process tree rooted at `pid` (`SIGKILL` on Unix, a forced
-/// terminate on Windows). Best-effort, mirroring the old `kill -9 <pid>`: a
-/// process that is already gone is a no-op.
+/// Forcibly kill the process tree rooted at `pid` (`SIGKILL` to the process group
+/// on Unix, a forced terminate of the descendant tree on Windows). Best-effort,
+/// mirroring the old `kill -9 <pid>`: a process that is already gone is a no-op.
 pub fn force_kill(pid: NonZeroU32) {
-    signal_tree(pid, Signal::Kill);
+    stop_tree(pid, Signal::Kill);
+}
+
+/// Tear down the whole tree rooted at `pid`. On Unix this signals the wrapper's
+/// process group (`signal` selects graceful `SIGTERM` vs forced `SIGKILL`),
+/// falling back to the descendant walk only for legacy non-grouped state. On
+/// Windows every stop is the descendant walk.
+fn stop_tree(pid: NonZeroU32, signal: Signal) {
+    #[cfg(unix)]
+    {
+        let sig = if matches!(signal, Signal::Kill) {
+            libc::SIGKILL
+        } else {
+            libc::SIGTERM
+        };
+        let raw = pid.get() as libc::pid_t;
+        // SAFETY: `killpg` takes plain integers and has no memory-safety
+        // preconditions. It signals the process group led by the wrapper, which
+        // reaches every process the shell forked.
+        if unsafe { libc::killpg(raw, sig) } == 0 {
+            return;
+        }
+        // No such group: a wrapper recorded before eph grouped its shells (legacy
+        // on-disk state) leads no group, so fall back to the descendant walk to
+        // still catch its children.
+        signal_tree(pid, signal);
+    }
+    #[cfg(not(unix))]
+    {
+        signal_tree(pid, signal);
+    }
 }
 
 #[cfg(test)]
@@ -184,16 +285,16 @@ mod tests {
 
     /// Assert that `kill` ended `child` promptly, then that its PID is gone.
     ///
-    /// The kill is delivered out of band (through `sysinfo`, not the `Child`
-    /// handle), so this reaps the child afterward. That reap matters on Unix: a
-    /// killed-but-unwaited child lingers as a zombie, which still occupies a slot
-    /// in the process table and so reads as "alive". In real eph usage there is
-    /// no zombie (the short-lived CLI exits and `init` reaps the detached child);
-    /// the test process, being the long-lived parent, must reap explicitly.
+    /// The kill is delivered out of band (not through the `Child` handle), so this
+    /// reaps the child afterward. That reap matters on Unix: a killed-but-unwaited
+    /// child lingers as a zombie, which still occupies a slot in the process table
+    /// and so reads as "alive". In real eph usage there is no zombie (the
+    /// short-lived CLI exits and `init` reaps the detached child); the test
+    /// process, being the long-lived parent, must reap explicitly.
     ///
-    /// The timeout is the real assertion that the kill *worked*: the sleeper
-    /// would exit on its own in ~30s, so reaping within a few seconds proves the
-    /// kill ended it rather than it simply running to completion.
+    /// The timeout is the real assertion that the kill *worked*: the sleeper would
+    /// exit on its own in ~30s, so reaping within a few seconds proves the kill
+    /// ended it rather than it simply running to completion.
     async fn assert_kill_ends(mut child: tokio::process::Child, kill: impl FnOnce(NonZeroU32)) {
         let pid = NonZeroU32::new(child.id().expect("freshly spawned child has a PID")).unwrap();
         assert!(is_alive(pid), "a just-spawned sleeper should be alive");
@@ -256,24 +357,29 @@ mod tests {
         false
     }
 
-    /// Regression for the orphaned-child bug: a command run through the platform
-    /// shell (as `run=` does) that itself launches a long-lived child. The
-    /// tracked PID is the shell wrapper (`cmd` on Windows, `sh` on Unix), not the
-    /// child, so a single-PID kill would leave the child running. Tearing down
-    /// through the real path (`force_kill`) must take the whole tree.
-    #[tokio::test]
-    async fn force_kill_reaps_the_whole_shell_tree() {
-        // The inner command spawns a child that outlives a single-PID kill. On
-        // Windows `cmd /C` runs (and waits on) `ping` as a child process; on Unix
-        // backgrounding plus `wait` keeps `sh` alive as the child's parent
-        // instead of exec-replacing itself.
+    /// Spawn a wrapper through the platform shell (as `run=` does) that itself
+    /// launches a long-lived child, run `tear_down` against its PID, and assert
+    /// the whole tree (every descendant, not just the wrapper) is gone. `detached`
+    /// selects whether the wrapper is spawned through [`prepare_detached`], i.e.
+    /// the primary path (Unix process group) versus the unsupervised path that a
+    /// legacy state file or Windows exercises (the descendant walk).
+    async fn assert_tree_torn_down(detached: bool) {
+        // The inner command keeps a child alive that outlives a single-PID kill.
+        // On Windows `cmd /C` runs (and waits on) `ping` as a child; on Unix
+        // backgrounding plus `wait` keeps `sh` alive as the child's parent rather
+        // than exec-replacing itself.
         let inner = if cfg!(windows) {
             "ping -n 300 127.0.0.1 >NUL"
         } else {
             "sleep 300 & wait"
         };
 
-        let mut wrapper = shell_command(inner).spawn().unwrap();
+        let mut command = shell_command(inner);
+        command.stdin(std::process::Stdio::null());
+        if detached {
+            prepare_detached(&mut command);
+        }
+        let mut wrapper = command.spawn().unwrap();
         let wrapper_pid =
             NonZeroU32::new(wrapper.id().expect("freshly spawned wrapper has a PID")).unwrap();
 
@@ -293,5 +399,23 @@ mod tests {
                 "descendant {pid} should have been killed along with the tree"
             );
         }
+    }
+
+    /// The primary teardown path: a `run=` service spawned through the real
+    /// detached path. The tracked PID is the wrapper (`cmd`/`sh`), not the child,
+    /// so a single-PID kill would orphan the child. On Unix this exercises the
+    /// process group; on Windows the descendant walk.
+    #[tokio::test]
+    async fn force_kill_reaps_a_detached_shell_tree() {
+        assert_tree_torn_down(true).await;
+    }
+
+    /// The fallback teardown path: a wrapper spawned WITHOUT the detached setup,
+    /// standing in for legacy on-disk state recorded before eph grouped `run=`
+    /// shells. Teardown must still reap the whole tree via the `sysinfo`
+    /// descendant walk.
+    #[tokio::test]
+    async fn force_kill_reaps_an_unsupervised_shell_tree() {
+        assert_tree_torn_down(false).await;
     }
 }

@@ -1818,12 +1818,20 @@ impl ServiceManager {
             .try_clone()
             .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
 
-        let child = proc::shell_command(cmd)
+        let mut command = proc::shell_command(cmd);
+        command
             .current_dir(&self.workspace.path)
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_file_err))
+            .stderr(Stdio::from(log_file_err));
+        // Head the shell in its own process group (Unix) so teardown can signal
+        // the whole tree it forks, not just this wrapper PID. A compound `run=`
+        // command (`a && b`, a pipeline, a backgrounded child) otherwise leaves
+        // orphans behind on `eph down` / `eph clean`. No-op on Windows, where
+        // teardown walks the descendant tree instead (see `proc`).
+        proc::prepare_detached(&mut command);
+        let child = command
             .spawn()
             .with_context(|| format!("failed to start command: {}", cmd))?;
 

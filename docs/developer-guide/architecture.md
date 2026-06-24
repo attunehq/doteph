@@ -29,8 +29,9 @@ without going through the CLI, and the binary stays a dumb adapter.
 External dependencies of note: `clap` (CLI), `bollard` (async Docker API),
 `tokio` (runtime), `serde`/`serde_json` (state and JSON output), `sha2`/`hex`
 (workspace IDs), `dirs` (platform data directory), `shell-words` (command
-parsing), `sysinfo` (cross-platform PID liveness and termination), and `tracing`
-(logging to stderr).
+parsing), `sysinfo` (process-table liveness and the Windows descendant-tree
+teardown walk), `libc` (Unix-only: signaling a `run=` shell's process group via
+`killpg`), and `tracing` (logging to stderr).
 
 ## Core concepts
 
@@ -120,19 +121,38 @@ operations are awkward to reproduce over the API.
 
 The host-side bits of the `run=` path (the shell, plus PID liveness and
 teardown) are platform-abstracted in [`src/proc.rs`](../../src/proc.rs): the
-shell is `sh -c` on Unix and `cmd /C` on Windows, and liveness/termination go
-through the `sysinfo` crate instead of eph shelling out to a POSIX `kill`. On
-Unix the kill path sends `SIGTERM` then `SIGKILL`; on Windows, which has no POSIX
-signals, both the graceful and forced stops become a hard terminate (sysinfo
-uses the built-in `taskkill /F`, so no extra setup or WSL is needed).
+shell is `sh -c` on Unix and `cmd /C` on Windows. On Unix the kill path sends
+`SIGTERM` then `SIGKILL`; on Windows, which has no POSIX signals, both the
+graceful and forced stops become a hard terminate (`sysinfo` uses the built-in
+`taskkill /F`, so no extra setup or WSL is needed).
 
 Teardown kills the whole process tree rooted at the tracked PID, not just that
-one process. On Windows the tracked PID is the `cmd /C` wrapper and the real
-service is its child, so killing only the wrapper would orphan the service; the
-same applies to a `sh -c` that stayed alive as the parent of a backgrounded or
-compound command on Unix. The tree is found by walking parent links in a
-`sysinfo` snapshot, so it works across separate `eph` invocations (an `eph down`
-reads the PID from state and reconstructs the tree).
+one process. The tracked PID is the shell wrapper (`cmd /C` on Windows, `sh -c`
+on Unix), and the real service is its child, so killing only the wrapper would
+orphan the service (or, for a compound command or a pipeline, its children). eph
+is daemonless (a separate `eph down` reads the PID from state and tears the
+service down), so the mechanism has to be addressable across `eph` invocations by
+the PID alone, and that constraint splits the two platforms:
+
+- On Unix the shell is spawned as the leader of a new process group (PGID == PID,
+  via `process_group(0)`), and teardown signals the group with `killpg`. This is
+  **race-free**: every descendant is in the group, including one forked after any
+  snapshot would have been taken. `is_alive` likewise probes the group
+  (`killpg(pid, 0)`), so a service whose shell exited but left a backgrounded
+  child still reads as up.
+- On Windows there is no group an unrelated `eph down` can address. A Job Object
+  is the natural fit, but a named job cannot be reattached after the `eph up` that
+  created it exits: closing the last handle releases the object's name
+  immediately (even while its processes run), so a later `OpenJobObject` by name
+  fails, and keeping the name alive would need a persistent handle holder a
+  daemonless CLI lacks. Teardown therefore walks parent links in a `sysinfo`
+  snapshot from the tracked PID and terminates the whole descendant tree. A child
+  spawned after that snapshot can escape, the accepted limit of snapshot-based
+  teardown.
+
+The same `sysinfo` descendant walk is the Unix fallback for a service recorded
+before eph grouped its shells (legacy on-disk state, where the wrapper leads no
+group).
 
 > **Reconciling compose services.** `ServiceManager::status` reconciles state by
 > looking up a container named `eph-<short_id>-<service>`, which exists for
