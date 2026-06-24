@@ -13,6 +13,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -37,9 +38,6 @@ pub struct RunningService {
     /// Service name (matches the `.eph` section header).
     #[allow(dead_code)]
     pub name: String,
-    /// Backend identifier: a Docker container id, `pid:<n>` for `run` services,
-    /// or `compose:<project>` for compose services.
-    pub container_id: String,
     /// Map of port name (or `"default"`) to the assigned host port.
     pub ports: HashMap<String, u16>,
 }
@@ -181,14 +179,57 @@ pub struct CleanSummary {
 // Service State (Persistence)
 // ============================================================================
 
+/// Which backend is running a service, and the handle needed to manage it.
+///
+/// This replaces a stringly-typed id that previously encoded the backend by
+/// prefix (a bare Docker container id, `pid:<n>`, or `compose:<project>`) and
+/// hand-discriminated it with `strip_prefix` / `starts_with`. Making the three
+/// cases distinct variants keeps the parsing in one place and makes an illegal
+/// combination (e.g. a process backend with a container id) unrepresentable.
+///
+/// It is the single source of truth for a `run=` service's PID: there is no
+/// longer a parallel `processes` map to keep in sync.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Backend {
+    /// A Docker container (`image=` / `dockerfile=`), by container id.
+    Container { id: String },
+    /// A `run=` shell command, by process id. Non-zero because a real PID never
+    /// is, and `kill -0 0` would otherwise probe the calling process group.
+    Process { pid: NonZeroU32 },
+    /// A docker-compose project (`compose=`), by project name.
+    Compose { project: String },
+}
+
+impl Backend {
+    /// Parse a pre-typed-`Backend` state id back into a [`Backend`].
+    ///
+    /// Earlier versions stored a single `container_id` string that encoded the
+    /// backend by prefix: `compose:<project>`, `pid:<n>`, or a bare Docker
+    /// container id. This lets [`ServiceState::load`] migrate an on-disk state
+    /// file written by such a version, so an in-place upgrade does not orphan
+    /// running services or wedge `eph down` / `eph clean`.
+    fn from_legacy_id(id: &str) -> Result<Self> {
+        if let Some(project) = id.strip_prefix("compose:") {
+            Ok(Backend::Compose {
+                project: project.to_string(),
+            })
+        } else if let Some(pid) = id.strip_prefix("pid:") {
+            let pid: NonZeroU32 = pid
+                .parse()
+                .with_context(|| format!("invalid legacy process id in state: {id:?}"))?;
+            Ok(Backend::Process { pid })
+        } else {
+            Ok(Backend::Container { id: id.to_string() })
+        }
+    }
+}
+
 /// Persistent state for a workspace's services
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct ServiceState {
     /// Running services keyed by service name
     pub(crate) services: HashMap<String, ServiceStateEntry>,
-    /// Process IDs for shell command services
-    #[serde(default)]
-    pub(crate) processes: HashMap<String, u32>,
     /// The host ports last assigned to each `run=` service's auto ports
     /// (`port=auto`), keyed by service name then port name. Unlike
     /// [`services`](Self::services), this is *not* cleared by `eph down`, so the
@@ -199,10 +240,42 @@ pub(crate) struct ServiceState {
 }
 
 /// State entry for a single service
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ServiceStateEntry {
-    pub(crate) container_id: String,
+    pub(crate) backend: Backend,
     pub(crate) ports: HashMap<String, u16>,
+}
+
+/// Deserialize accepting either the current schema (`backend`) or the legacy
+/// one (a `container_id` string), so an on-disk state file written before the
+/// [`Backend`] enum landed still loads after an upgrade. New writes always use
+/// `backend` (see the derived [`Serialize`]); the legacy top-level `processes`
+/// map is ignored, since the PID it held is recovered from `pid:<n>`.
+impl<'de> Deserialize<'de> for ServiceStateEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Repr {
+            #[serde(default)]
+            backend: Option<Backend>,
+            #[serde(default)]
+            container_id: Option<String>,
+            ports: HashMap<String, u16>,
+        }
+
+        let repr = Repr::deserialize(deserializer)?;
+        let backend = match (repr.backend, repr.container_id) {
+            (Some(backend), _) => backend,
+            (None, Some(id)) => Backend::from_legacy_id(&id).map_err(serde::de::Error::custom)?,
+            (None, None) => return Err(serde::de::Error::missing_field("backend")),
+        };
+        Ok(ServiceStateEntry {
+            backend,
+            ports: repr.ports,
+        })
+    }
 }
 
 impl ServiceState {
@@ -913,14 +986,18 @@ impl DockerClient {
         Ok(inspect.exit_code.unwrap_or(-1))
     }
 
-    /// Pull an image and run it as a container
+    /// Pull an image and run it as a container.
+    ///
+    /// Returns the [`RunningService`] connection info plus the created
+    /// container's id, which the caller needs to probe health and to record the
+    /// [`Backend::Container`] in state.
     pub(crate) async fn run_image(
         &self,
         container_name: &str,
         image: &str,
         service: &Service,
         workspace: &Workspace,
-    ) -> Result<RunningService> {
+    ) -> Result<(RunningService, String)> {
         // Pull image if needed
         self.ensure_image(image).await?;
 
@@ -1035,11 +1112,13 @@ impl DockerClient {
         // Map port names
         let named_ports = map_named_ports(&service.ports, &info.ports);
 
-        Ok(RunningService {
-            name: service.name.clone(),
-            container_id: response.id,
-            ports: named_ports,
-        })
+        Ok((
+            RunningService {
+                name: service.name.clone(),
+                ports: named_ports,
+            },
+            response.id,
+        ))
     }
 
     /// Build from Dockerfile and run
@@ -1049,7 +1128,7 @@ impl DockerClient {
         dockerfile_path: &std::path::Path,
         service: &Service,
         workspace: &Workspace,
-    ) -> Result<RunningService> {
+    ) -> Result<(RunningService, String)> {
         let image_tag = format!("eph-{}-{}", workspace.short_id, service.name);
 
         // Determine build context
@@ -1289,7 +1368,8 @@ impl ServiceManager {
         // `eph up` twice would spawn a second process and orphan the first.
         // Probe the tracked PID the same way status() does (`kill -0 <pid>`).
         if matches!(service.source, ServiceSource::Command(_))
-            && let Some(&pid) = self.state.processes.get(name)
+            && let Some(entry) = self.state.services.get(name)
+            && let Backend::Process { pid } = &entry.backend
         {
             let alive = TokioCommand::new("kill")
                 .args(["-0", &pid.to_string()])
@@ -1298,16 +1378,9 @@ impl ServiceManager {
                 .is_ok_and(|o| o.status.success());
             if alive {
                 info!("Service {} already running (PID {})", name, pid);
-                let ports = self
-                    .state
-                    .services
-                    .get(name)
-                    .map(|entry| entry.ports.clone())
-                    .unwrap_or_default();
                 return Ok(RunningService {
                     name: name.to_string(),
-                    container_id: format!("pid:{}", pid),
-                    ports,
+                    ports: entry.ports.clone(),
                 });
             }
         }
@@ -1328,13 +1401,12 @@ impl ServiceManager {
                 self.state.services.insert(
                     name.to_string(),
                     ServiceStateEntry {
-                        container_id: existing.id.clone(),
+                        backend: Backend::Container { id: existing.id },
                         ports: named_ports.clone(),
                     },
                 );
                 return Ok(RunningService {
                     name: name.to_string(),
-                    container_id: existing.id,
                     ports: named_ports,
                 });
             } else {
@@ -1360,14 +1432,13 @@ impl ServiceManager {
                 self.state.services.insert(
                     name.to_string(),
                     ServiceStateEntry {
-                        container_id: refreshed.id.clone(),
+                        backend: Backend::Container { id: refreshed.id },
                         ports: named_ports.clone(),
                     },
                 );
 
                 return Ok(RunningService {
                     name: name.to_string(),
-                    container_id: refreshed.id,
                     ports: named_ports,
                 });
             }
@@ -1375,31 +1446,29 @@ impl ServiceManager {
 
         // Create and start new service
         info!("Creating service {}", name);
-        let running = match &service.source {
+        let (running, backend) = match &service.source {
             ServiceSource::Image(image) => {
-                let r = self
+                let (r, id) = self
                     .docker
                     .run_image(&container_name, image, service, &self.workspace)
                     .await?;
 
                 // Wait for health check
-                self.wait_for_healthy(name, service, &r.container_id)
-                    .await?;
+                self.wait_for_healthy(name, service, &id).await?;
 
-                r
+                (r, Backend::Container { id })
             }
             ServiceSource::Dockerfile(path) => {
                 let dockerfile_path = self.workspace.path.join(path);
-                let r = self
+                let (r, id) = self
                     .docker
                     .build_and_run(&container_name, &dockerfile_path, service, &self.workspace)
                     .await?;
 
                 // Wait for health check
-                self.wait_for_healthy(name, service, &r.container_id)
-                    .await?;
+                self.wait_for_healthy(name, service, &id).await?;
 
-                r
+                (r, Backend::Container { id })
             }
             ServiceSource::Command(cmd) => {
                 self.start_shell_command(name, cmd, service, eph).await?
@@ -1411,7 +1480,7 @@ impl ServiceManager {
         self.state.services.insert(
             name.to_string(),
             ServiceStateEntry {
-                container_id: running.container_id.clone(),
+                backend,
                 ports: running.ports.clone(),
             },
         );
@@ -1499,7 +1568,7 @@ impl ServiceManager {
         cmd: &str,
         service: &Service,
         eph: &EphFile,
-    ) -> Result<RunningService> {
+    ) -> Result<(RunningService, Backend)> {
         info!("Starting shell command for {}: {}", name, cmd);
 
         // The ports this service had on a previous `up`, reused for auto ports
@@ -1536,7 +1605,6 @@ impl ServiceManager {
                 name.to_string(),
                 RunningService {
                     name: name.to_string(),
-                    container_id: String::new(),
                     ports: ports.clone(),
                 },
             );
@@ -1558,11 +1626,10 @@ impl ServiceManager {
 
             // Record PID and ports now so `eph status` / `eph env` reflect the
             // service even while we wait for it to become ready.
-            self.state.processes.insert(name.to_string(), pid);
             self.state.services.insert(
                 name.to_string(),
                 ServiceStateEntry {
-                    container_id: format!("pid:{}", pid),
+                    backend: Backend::Process { pid },
                     ports: ports.clone(),
                 },
             );
@@ -1586,11 +1653,13 @@ impl ServiceManager {
                             .auto_ports
                             .insert(name.to_string(), ports.clone());
                     }
-                    return Ok(RunningService {
-                        name: name.to_string(),
-                        container_id: format!("pid:{}", pid),
-                        ports,
-                    });
+                    return Ok((
+                        RunningService {
+                            name: name.to_string(),
+                            ports,
+                        },
+                        Backend::Process { pid },
+                    ));
                 }
                 ReadyOutcome::PortConflict if attempt < max_attempts => {
                     warn!(
@@ -1600,11 +1669,12 @@ impl ServiceManager {
                         attempt + 1,
                         max_attempts
                     );
-                    // Drop the dead PID so a stale entry is not left behind.
-                    self.state.processes.remove(name);
+                    // Drop the dead entry so a stale PID is not left behind; the
+                    // next attempt records a fresh one.
+                    self.state.services.remove(name);
                 }
                 ReadyOutcome::PortConflict => {
-                    self.state.processes.remove(name);
+                    self.state.services.remove(name);
                     bail!(
                         "service '{}' kept exiting on a port conflict after {} attempts; \
                          see `eph logs {}`",
@@ -1614,7 +1684,7 @@ impl ServiceManager {
                     );
                 }
                 ReadyOutcome::Exited => {
-                    self.state.processes.remove(name);
+                    self.state.services.remove(name);
                     bail!(
                         "service '{}' exited during startup; see `eph logs {}`",
                         name,
@@ -1649,7 +1719,7 @@ impl ServiceManager {
         name: &str,
         cmd: &str,
         env: &[(String, String)],
-    ) -> Result<(tokio::process::Child, u32)> {
+    ) -> Result<(tokio::process::Child, NonZeroU32)> {
         let log_path = self.workspace.log_file_path(name)?;
         if let Some(parent) = log_path.parent() {
             create_private_dir(parent).with_context(|| {
@@ -1673,7 +1743,13 @@ impl ServiceManager {
             .spawn()
             .with_context(|| format!("failed to start command: {}", cmd))?;
 
-        let pid = child.id().unwrap_or(0);
+        // A freshly spawned child always has a PID; `id()` only returns `None`
+        // after it has been awaited to completion. Treat the impossible case as
+        // an error rather than coercing it to a meaningless `0`.
+        let pid = child
+            .id()
+            .and_then(NonZeroU32::new)
+            .with_context(|| format!("spawned process for '{}' has no PID", name))?;
         Ok((child, pid))
     }
 
@@ -1796,7 +1872,7 @@ impl ServiceManager {
         name: &str,
         compose_path: &str,
         service: &Service,
-    ) -> Result<RunningService> {
+    ) -> Result<(RunningService, Backend)> {
         let compose_file = self.workspace.path.join(compose_path);
         let project_name = format!("eph-{}-{}", self.workspace.short_id, name);
 
@@ -1905,11 +1981,15 @@ impl ServiceManager {
             }
         }
 
-        Ok(RunningService {
-            name: name.to_string(),
-            container_id: format!("compose:{}", project_name),
-            ports,
-        })
+        Ok((
+            RunningService {
+                name: name.to_string(),
+                ports,
+            },
+            Backend::Compose {
+                project: project_name,
+            },
+        ))
     }
 
     /// Stop all services, clear in-memory state, and persist the result.
@@ -1930,7 +2010,6 @@ impl ServiceManager {
                 .await?;
         }
         self.state.services.clear();
-        self.state.processes.clear();
         self.state.save(&self.workspace).await?;
         Ok(())
     }
@@ -1982,8 +2061,13 @@ impl ServiceManager {
 
         match &service.source {
             ServiceSource::Command(_) => {
-                // Kill the process
-                if let Some(&pid) = self.state.processes.get(name) {
+                // Kill the process, reading its PID from the recorded backend.
+                if let Some(ServiceStateEntry {
+                    backend: Backend::Process { pid },
+                    ..
+                }) = self.state.services.get(name)
+                {
+                    let pid = *pid;
                     info!("Stopping process {} (PID {})", name, pid);
                     // Send SIGTERM. Best-effort: the process may already have
                     // exited (stale PID), in which case `kill` fails and there is
@@ -2001,7 +2085,6 @@ impl ServiceManager {
                         .output()
                         .await;
                 }
-                self.state.processes.remove(name);
             }
             ServiceSource::Compose(path) => {
                 let compose_file = self.workspace.path.join(path);
@@ -2082,7 +2165,6 @@ impl ServiceManager {
         // also drops the remembered auto-port assignments, letting the next `up`
         // pick fresh ports.
         self.state.services.clear();
-        self.state.processes.clear();
         self.state.auto_ports.clear();
 
         // Remove the persisted state file (and its directory).
@@ -2122,69 +2204,43 @@ impl ServiceManager {
         let mut result = HashMap::new();
 
         for (name, entry) in &self.state.services {
-            // Compose services are not named `eph-<id>-<name>`; detect them by
-            // their recorded `compose:<project>` id and check the compose
-            // project's liveness by label instead of by container name. Without
-            // this they would never appear in `status` and their ports could not
-            // be interpolated into `eph env`.
-            if let Some(project) = entry.container_id.strip_prefix("compose:") {
-                if self.docker.compose_project_running(project).await? {
-                    result.insert(
-                        name.clone(),
-                        RunningService {
-                            name: name.clone(),
-                            container_id: entry.container_id.clone(),
-                            ports: entry.ports.clone(),
-                        },
-                    );
+            // Liveness is checked per backend: compose by project label,
+            // run= by probing the PID, and Docker containers by name. A
+            // service that is no longer running is simply omitted.
+            let live = match &entry.backend {
+                // Compose services are not named `eph-<id>-<name>`, so they are
+                // checked by their project's label rather than by container
+                // name. Without this they would never appear in `status` and
+                // their ports could not be interpolated into `eph env`.
+                Backend::Compose { project } => {
+                    self.docker.compose_project_running(project).await?
                 }
-                continue;
-            }
+                // run= services are tracked by PID; probe it the same way
+                // `eph up`'s dedup check does (`kill -0 <pid>`).
+                Backend::Process { pid } => TokioCommand::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .output()
+                    .await
+                    .is_ok_and(|o| o.status.success()),
+                Backend::Container { .. } => {
+                    let container_name = self.workspace.container_name(name);
+                    self.docker
+                        .get_container(&container_name)
+                        .await?
+                        .is_some_and(|info| info.is_running)
+                }
+            };
 
-            // run= services are tracked in state.processes and reported by the
-            // process loop below; their id is `pid:<n>`, which never names a
-            // real eph container, so skip the Docker lookup for them rather than
-            // making a wasted call that could also match an unrelated container.
-            if entry.container_id.starts_with("pid:") {
-                continue;
-            }
-
-            let container_name = self.workspace.container_name(name);
-            if let Some(info) = self.docker.get_container(&container_name).await?
-                && info.is_running
-            {
-                // Use saved state's ports (which have proper names) instead of docker's
+            if live {
+                // Use the saved state's ports (which have proper names) rather
+                // than re-deriving them from the backend.
                 result.insert(
                     name.clone(),
                     RunningService {
                         name: name.clone(),
-                        container_id: info.id,
                         ports: entry.ports.clone(),
                     },
                 );
-            }
-        }
-
-        // Check shell command processes
-        for (name, &pid) in &self.state.processes {
-            // Check if process is still running
-            let output = TokioCommand::new("kill")
-                .args(["-0", &pid.to_string()])
-                .output()
-                .await;
-
-            if output.is_ok_and(|o| o.status.success()) {
-                // Process is running - get ports from state
-                if let Some(entry) = self.state.services.get(name) {
-                    result.insert(
-                        name.clone(),
-                        RunningService {
-                            name: name.clone(),
-                            container_id: format!("pid:{}", pid),
-                            ports: entry.ports.clone(),
-                        },
-                    );
-                }
             }
         }
 
@@ -2842,5 +2898,102 @@ mod tests {
         assert_eq!(mapped.get("api"), Some(&32790));
         assert_eq!(mapped.get("metrics"), None);
         assert_eq!(mapped.len(), 1);
+    }
+
+    fn pid(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).unwrap()
+    }
+
+    /// The persisted backend representation is part of the on-disk state schema,
+    /// so pin it down: each variant must round-trip and serialize to its
+    /// snake_case, externally tagged form.
+    #[test]
+    fn backend_serde_round_trips_each_variant() {
+        let cases = [
+            (
+                Backend::Container {
+                    id: "abc123".to_string(),
+                },
+                r#"{"container":{"id":"abc123"}}"#,
+            ),
+            (
+                Backend::Process { pid: pid(4321) },
+                r#"{"process":{"pid":4321}}"#,
+            ),
+            (
+                Backend::Compose {
+                    project: "eph-ab12-web".to_string(),
+                },
+                r#"{"compose":{"project":"eph-ab12-web"}}"#,
+            ),
+        ];
+
+        for (backend, json) in cases {
+            assert_eq!(serde_json::to_string(&backend).unwrap(), json);
+            assert_eq!(serde_json::from_str::<Backend>(json).unwrap(), backend);
+        }
+    }
+
+    /// A process backend can never carry PID 0 (`kill -0 0` would target the
+    /// caller's own process group), so deserializing one is rejected rather than
+    /// silently accepted.
+    #[test]
+    fn backend_process_rejects_zero_pid() {
+        let err = serde_json::from_str::<Backend>(r#"{"process":{"pid":0}}"#);
+        assert!(err.is_err(), "PID 0 must not deserialize: {err:?}");
+    }
+
+    /// A full state entry round-trips, confirming `backend` and `ports` are the
+    /// only persisted fields after dropping the parallel `processes` map.
+    #[test]
+    fn state_entry_round_trips() {
+        let entry = ServiceStateEntry {
+            backend: Backend::Process { pid: pid(1234) },
+            ports: HashMap::from([("default".to_string(), 5173)]),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: ServiceStateEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.backend, entry.backend);
+        assert_eq!(back.ports, entry.ports);
+    }
+
+    /// Regression: a state file written before the `Backend` enum landed (the
+    /// stringly-typed `container_id` plus a top-level `processes` map) must
+    /// still load, so an in-place upgrade does not orphan running services or
+    /// wedge `eph down` / `eph clean`. Each legacy id form maps to its variant,
+    /// and the now-removed `processes` map is ignored.
+    #[test]
+    fn load_migrates_legacy_state_schema() {
+        let legacy = r#"{
+            "services": {
+                "db":  { "container_id": "abc123def456", "ports": { "default": 5432 } },
+                "web": { "container_id": "pid:4321", "ports": { "default": 5173 } },
+                "stack": { "container_id": "compose:eph-ab12-stack", "ports": {} }
+            },
+            "processes": { "web": 4321 },
+            "auto_ports": { "web": { "default": 5173 } }
+        }"#;
+
+        let state: ServiceState = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(
+            state.services["db"].backend,
+            Backend::Container {
+                id: "abc123def456".to_string()
+            }
+        );
+        assert_eq!(
+            state.services["web"].backend,
+            Backend::Process { pid: pid(4321) }
+        );
+        assert_eq!(
+            state.services["stack"].backend,
+            Backend::Compose {
+                project: "eph-ab12-stack".to_string()
+            }
+        );
+        // The legacy `processes` map is dropped; its PID survives via the
+        // migrated `Backend::Process`. `auto_ports` is unchanged.
+        assert_eq!(state.auto_ports["web"]["default"], 5173);
     }
 }
