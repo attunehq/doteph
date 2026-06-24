@@ -2005,7 +2005,11 @@ impl ServiceManager {
         // Snapshot the running services once, before any teardown, so every
         // pre-stop hook sees the full environment as it was when `down` began.
         let running = self.status().await?;
-        for (name, service) in &eph.services {
+        // Tear down in reverse declaration order: services are started in
+        // declaration order (dependencies first), so stopping in reverse stops a
+        // dependent before the dependency it relies on, which keeps a
+        // dependency alive while the dependent's pre-stop hook runs.
+        for (name, service) in eph.services.iter().rev() {
             self.stop_service(name, service, remove, eph, &running, skip_hooks)
                 .await?;
         }
@@ -2140,7 +2144,9 @@ impl ServiceManager {
         // environment as it was before teardown began.
         let running = self.status().await?;
 
-        for (name, service) in &eph.services {
+        // Reverse declaration order, matching `stop_all`: tear a dependent down
+        // before the dependency it relies on.
+        for (name, service) in eph.services.iter().rev() {
             // Stop and remove the underlying resource for this service.
             self.stop_service(name, service, true, eph, &running, skip_hooks)
                 .await?;
