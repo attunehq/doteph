@@ -12,7 +12,8 @@ fit together. For where each decision lives in the code, see
   dispatches each subcommand to a small `cmd_*` glue function. Nothing here is
   public API.
 - `src/lib.rs` - the library crate (`eph`) that holds all reusable logic, split
-  into five modules: `parser`, `workspace`, `service`, `env`, and `skills`.
+  into modules: `parser`, `workspace`, `service`, `env`, `skills`, and the
+  crate-internal `proc` (the cross-platform shell + PID-control layer).
 - `src/skills.rs` / `skills/` - the agent skills bundled into the binary. Each
   `skills/<slug>/SKILL.md` is embedded with `include_str!`; `eph skills install`
   writes it into a consuming repo's `.claude/skills/` and `.agents/skills/`, `eph
@@ -28,7 +29,8 @@ without going through the CLI, and the binary stays a dumb adapter.
 External dependencies of note: `clap` (CLI), `bollard` (async Docker API),
 `tokio` (runtime), `serde`/`serde_json` (state and JSON output), `sha2`/`hex`
 (workspace IDs), `dirs` (platform data directory), `shell-words` (command
-parsing), and `tracing` (logging to stderr).
+parsing), `sysinfo` (cross-platform PID liveness and termination), and `tracing`
+(logging to stderr).
 
 ## Core concepts
 
@@ -109,12 +111,19 @@ so "exactly one" is a convention, not an enforced rule.)
 - **Docker Compose** - shell out to `docker compose -p eph-<short_id>-<service>
   up -d`; query `docker compose port` for mapped ports; tear down with
   `compose down`.
-- **Shell command** (`run=`) - spawn a background process via `sh -c`, track its
-  PID, run health checks on the host.
+- **Shell command** (`run=`) - spawn a background process via the platform shell,
+  track its PID, run health checks on the host.
 
 The image and Dockerfile paths use the `bollard` Docker API directly; the
 Compose and Dockerfile-build paths shell out to the `docker` CLI because those
 operations are awkward to reproduce over the API.
+
+The host-side bits of the `run=` path (the shell, plus PID liveness and
+teardown) are platform-abstracted in [`src/proc.rs`](../../src/proc.rs): the
+shell is `sh -c` on Unix and `cmd /C` on Windows, and liveness/termination go
+through the `sysinfo` crate (so no external `kill`/`taskkill` binary is needed).
+On Unix the kill path sends `SIGTERM` then `SIGKILL`; on Windows, which has no
+POSIX signals, both map to `TerminateProcess`.
 
 > **Reconciling compose services.** `ServiceManager::status` reconciles state by
 > looking up a container named `eph-<short_id>-<service>`, which exists for
@@ -138,14 +147,16 @@ hooks and returning. The mechanism differs by service type, deliberately:
   split on whitespace - **no shell**. This avoids depending on a shell being
   present in the image, at the cost of not supporting pipes/redirects/expansion.
   Default timeout 30s, polled every 1s.
-- **run/compose**: the command runs on the host through `sh -c`, so full shell
-  syntax is available. Default timeout 30s (run) / 60s (compose).
+- **run/compose**: the command runs on the host through the platform shell
+  (`sh -c` on Unix, `cmd /C` on Windows), so full shell syntax is available in
+  that platform's dialect. Default timeout 30s (run) / 60s (compose).
 
 With no health check, `eph` waits a fixed 500 ms and proceeds.
 
 ## Lifecycle hooks
 
-- `post-start` runs on the host via `sh -c`, in the workspace directory, in a
+- `post-start` runs on the host via the platform shell (`sh -c` / `cmd /C`), in
+  the workspace directory, in a
   **second phase** of `eph up`: every targeted service is first brought to a
   healthy state, then every service's `post-start` hooks run. Deferring hooks
   this way lets a hook reference any other service's resolved port. Hooks run on

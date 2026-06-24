@@ -208,7 +208,8 @@ How the command runs depends on the service type, and this matters:
   containing spaces do **not** work. Use a single simple command (`pg_isready -U
   dev`, `redis-cli ping`).
 - For **`run`** and **`compose`** services, the command runs on the **host**
-  through `sh -c`, so full shell syntax is available.
+  through the platform shell (`sh -c` on Unix, `cmd /C` on Windows), so full
+  shell syntax is available (in that platform's shell dialect).
 
 If you omit `healthcheck`, `eph` waits a fixed 500 ms and assumes the service is
 ready. `ready-timeout` defaults to 30 seconds (60 for compose).
@@ -216,8 +217,8 @@ ready. `ready-timeout` defaults to 30 seconds (60 for compose).
 ## Lifecycle hooks
 
 `post-start=` runs after a service is healthy; `pre-stop=` runs before it stops.
-Both run on the host through `sh -c`, in the workspace root, and both are
-repeatable and run in order:
+Both run on the host through the platform shell (`sh -c` on Unix, `cmd /C` on
+Windows), in the workspace root, and both are repeatable and run in order:
 
 ```ini
 [postgres]

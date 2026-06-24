@@ -494,10 +494,11 @@ async fn concurrent_workspaces_are_isolated() {
 // Test 3: `run=` shell-command service
 // ============================================================================
 
-// run= services shell out to `sh` and are tracked/killed via `kill`, so the
-// feature is Unix-only (on Windows eph requires WSL). Gate the test to Unix
-// accordingly: on native Windows the spawned server's stdout pipe handle is
-// leaked into the grandchild via bInheritHandles, which would hang the harness.
+// eph's run= support is cross-platform (the shell is `sh -c` on Unix, `cmd /C`
+// on Windows, with native PID liveness/teardown), but this fixture is Unix
+// shaped: the command (`python3 -m http.server`) is a POSIX invocation, and on
+// native Windows the spawned server's stdout pipe handle is leaked into the
+// grandchild via bInheritHandles, which would hang the harness. Gate to Unix.
 #[cfg(unix)]
 #[tokio::test]
 #[ignore = "stress: requires Docker host plus `python3`/`sh` on PATH"]

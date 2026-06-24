@@ -1,6 +1,7 @@
 //! Service management - starting, stopping, and managing Docker containers
 
 use crate::parser::{EphFile, PortMapping, Service, ServiceSource, resolve_interpolations};
+use crate::proc;
 use crate::workspace::Workspace;
 use anyhow::{Context, Result, anyhow, bail};
 use bollard::Docker;
@@ -195,7 +196,8 @@ pub(crate) enum Backend {
     /// A Docker container (`image=` / `dockerfile=`), by container id.
     Container { id: String },
     /// A `run=` shell command, by process id. Non-zero because a real PID never
-    /// is, and `kill -0 0` would otherwise probe the calling process group.
+    /// is, and PID 0 is special on Unix (signaling it targets the caller's own
+    /// process group), so the type forbids it outright.
     Process { pid: NonZeroU32 },
     /// A docker-compose project (`compose=`), by project name.
     Compose { project: String },
@@ -1468,23 +1470,17 @@ impl ServiceManager {
         // Dedup run= (shell command) services: the Docker-based guard below
         // explicitly skips ServiceSource::Command, so without this check running
         // `eph up` twice would spawn a second process and orphan the first.
-        // Probe the tracked PID the same way status() does (`kill -0 <pid>`).
+        // Probe the tracked PID the same way status() does.
         if matches!(service.source, ServiceSource::Command(_))
             && let Some(entry) = self.state.services.get(name)
             && let Backend::Process { pid } = &entry.backend
+            && proc::is_alive(*pid)
         {
-            let alive = TokioCommand::new("kill")
-                .args(["-0", &pid.to_string()])
-                .output()
-                .await
-                .is_ok_and(|o| o.status.success());
-            if alive {
-                info!("Service {} already running (PID {})", name, pid);
-                return Ok(RunningService {
-                    name: name.to_string(),
-                    ports: entry.ports.clone(),
-                });
-            }
+            info!("Service {} already running (PID {})", name, pid);
+            return Ok(RunningService {
+                name: name.to_string(),
+                ports: entry.ports.clone(),
+            });
         }
 
         // Check if already running (for Docker-based services)
@@ -1822,9 +1818,7 @@ impl ServiceManager {
             .try_clone()
             .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
 
-        let child = TokioCommand::new("sh")
-            .arg("-c")
-            .arg(cmd)
+        let child = proc::shell_command(cmd)
             .current_dir(&self.workspace.path)
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::null())
@@ -1886,9 +1880,7 @@ impl ServiceManager {
                 return Ok(Some(self.classify_exit(name).await));
             }
 
-            let output = TokioCommand::new("sh")
-                .arg("-c")
-                .arg(healthcheck)
+            let output = proc::shell_command(healthcheck)
                 .current_dir(&self.workspace.path)
                 // Run the check with the same resolved environment the app got,
                 // so it can reach the app's (possibly auto-allocated) port.
@@ -2023,9 +2015,7 @@ impl ServiceManager {
         if let Some(ref healthcheck) = service.healthcheck {
             let timeout_dur = Duration::from_secs(service.ready_timeout_secs.unwrap_or(60));
             wait_until_ready(name, timeout_dur, Duration::from_secs(2), async || {
-                let output = TokioCommand::new("sh")
-                    .arg("-c")
-                    .arg(healthcheck)
+                let output = proc::shell_command(healthcheck)
                     .current_dir(&self.workspace.path)
                     .output()
                     .await?;
@@ -2134,21 +2124,16 @@ impl ServiceManager {
                 {
                     let pid = *pid;
                     info!("Stopping process {} (PID {})", name, pid);
-                    // Send SIGTERM. Best-effort: the process may already have
-                    // exited (stale PID), in which case `kill` fails and there is
-                    // nothing left to stop, so the error is intentionally ignored.
-                    let _ = TokioCommand::new("kill")
-                        .arg(pid.to_string())
-                        .output()
-                        .await;
-                    // Wait a bit then SIGKILL if it ignored SIGTERM. Same
-                    // best-effort rationale: a failure means the process is
-                    // already gone, so the result is intentionally ignored.
+                    // Ask it to terminate gracefully (SIGTERM on Unix,
+                    // TerminateProcess on Windows). Best-effort: the process may
+                    // already have exited (stale PID), in which case this is a
+                    // no-op, so any failure is intentionally ignored.
+                    proc::terminate(pid);
+                    // Wait a bit then force-kill if it ignored the request. Same
+                    // best-effort rationale: a process that is already gone is a
+                    // no-op.
                     sleep(Duration::from_secs(2)).await;
-                    let _ = TokioCommand::new("kill")
-                        .args(["-9", &pid.to_string()])
-                        .output()
-                        .await;
+                    proc::force_kill(pid);
                 }
             }
             ServiceSource::Compose(path) => {
@@ -2284,12 +2269,8 @@ impl ServiceManager {
                     self.docker.compose_project_running(project).await?
                 }
                 // run= services are tracked by PID; probe it the same way
-                // `eph up`'s dedup check does (`kill -0 <pid>`).
-                Backend::Process { pid } => TokioCommand::new("kill")
-                    .args(["-0", &pid.to_string()])
-                    .output()
-                    .await
-                    .is_ok_and(|o| o.status.success()),
+                // `eph up`'s dedup check does.
+                Backend::Process { pid } => proc::is_alive(*pid),
                 Backend::Container { .. } => {
                     let container_name = self.workspace.container_name(name);
                     self.docker
@@ -2717,9 +2698,7 @@ impl ServiceManager {
     /// top of it, so later entries (the owning service's `env.X`) win over the
     /// resolved top-level variables they may shadow.
     async fn run_hook(&self, cmd: &str, env: &[(String, String)]) -> Result<()> {
-        let output = TokioCommand::new("sh")
-            .arg("-c")
-            .arg(cmd)
+        let output = proc::shell_command(cmd)
             .current_dir(&self.workspace.path)
             .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .output()
@@ -3093,9 +3072,9 @@ mod tests {
         }
     }
 
-    /// A process backend can never carry PID 0 (`kill -0 0` would target the
-    /// caller's own process group), so deserializing one is rejected rather than
-    /// silently accepted.
+    /// A process backend can never carry PID 0 (it is not a real process, and on
+    /// Unix signaling PID 0 targets the caller's own process group), so
+    /// deserializing one is rejected rather than silently accepted.
     #[test]
     fn backend_process_rejects_zero_pid() {
         let err = serde_json::from_str::<Backend>(r#"{"process":{"pid":0}}"#);

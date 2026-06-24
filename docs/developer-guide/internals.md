@@ -120,7 +120,8 @@ engine.
   a thin wrapper with an empty filter. A `skip_hooks` flag (CLI `--skip-hooks`)
   short-circuits phase 2.
 - `create_service` is the idempotent core that produces a healthy `RunningService`
-  (no hooks). For `run=` services it first probes the tracked PID (`kill -0`) to
+  (no hooks). For `run=` services it first probes the tracked PID (a native
+  liveness check via `proc::is_alive`) to
   avoid spawning duplicates. For Docker services it checks for an existing
   container: running -> reuse; stopped -> restart; absent -> create fresh via the
   matching source path. `post-start` is **not** run here -- it runs in phase 2 of
@@ -128,13 +129,15 @@ engine.
   idempotent.
 - `wait_for_healthy` polls `exec_in_container` (image/dockerfile) on a 1s
   interval under a `tokio::time::timeout`; no health check means a 500 ms sleep.
-  `start_shell_command` and `start_compose` have their own host-side `sh -c`
-  health-check loops (compose default 60s).
+  `start_shell_command` and `start_compose` have their own host-side
+  platform-shell health-check loops (`sh -c` on Unix, `cmd /C` on Windows;
+  compose default 60s).
 - `stop_service` takes the loaded `EphFile` and a snapshot of running services,
   runs `pre-stop` with the resolved environment (a failure is **propagated**,
   aborting teardown, unless `skip_hooks` / CLI `--skip-hooks`), then stops by
-  source type: Docker (stop, optionally remove), `run` (SIGTERM, wait, SIGKILL),
-  or compose (`docker compose down`). `stop_all` and `clean` snapshot running
+  source type: Docker (stop, optionally remove), `run` (graceful terminate via
+  `proc::terminate`, wait, then `proc::force_kill`: `SIGTERM`/`SIGKILL` on Unix,
+  `TerminateProcess` on Windows), or compose (`docker compose down`). `stop_all` and `clean` snapshot running
   services once up front and thread `skip_hooks` through; `stop_all` clears state.
 - `resolve_env_vars` / `command_env` / `hook_env` build the resolved environment
   shared by `eph env`, `eph run`, and the lifecycle hooks.

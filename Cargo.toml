@@ -27,6 +27,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 shell-words = "1"
+# Native PID liveness + termination so `run=` services work without a POSIX
+# `kill` (Windows has none). Only the process-inspection surface is needed, so
+# the default features (disks, network, components, users) are turned off.
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -5,8 +5,10 @@
 //! ([`workspace`]), managing Docker-backed services ([`service`]), rendering
 //! resolved environment variables for shell `eval` ([`mod@env`]), and the agent
 //! skills bundled into the binary and installed into a consuming repo
-//! ([`skills`]). The binary in `main.rs` is a thin clap front end over these
-//! APIs.
+//! ([`skills`]). The crate-internal `proc` module hides the platform split for
+//! the shell and PID control (`sh -c`/`cmd /C`, native liveness and teardown) so
+//! `run=` services and hooks work on Windows as well as Unix. The binary in
+//! `main.rs` is a thin clap front end over these APIs.
 
 #![warn(missing_docs)]
 #![deny(clippy::correctness)]
@@ -17,6 +19,7 @@
 
 pub mod env;
 pub mod parser;
+pub(crate) mod proc;
 pub mod service;
 pub mod skills;
 pub mod workspace;

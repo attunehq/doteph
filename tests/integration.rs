@@ -866,8 +866,9 @@ DATABASE_URL=postgres://test:test@localhost:${postgres.port}/test
 // Logs Tests
 // ============================================================================
 
-// `run=` shell services are spawned by eph and tracked/killed via POSIX tools,
-// so they are Unix-only (Windows requires WSL); gate the capture test to match.
+// eph's run= support is cross-platform now, but this fixture's command uses
+// POSIX shell syntax (`echo ... && sleep 300`), so gate the capture test to Unix
+// to match the command string rather than because the feature is unavailable.
 #[cfg(unix)]
 #[tokio::test]
 async fn logs_captures_run_service_output() {

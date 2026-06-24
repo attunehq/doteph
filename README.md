@@ -45,11 +45,14 @@ cargo install --path .
 make install
 ```
 
-`eph` runs natively on Linux and macOS. On Windows, the Docker-backed services
-(`image=`, `dockerfile=`, `compose=`) run natively. The shell-based features
-(`run=` services, `post-start`/`pre-stop` hooks, and shell health checks) rely on
-POSIX `sh` and `kill`, so they require
-[WSL](docs/user-guide/troubleshooting.md#windows-and-wsl).
+`eph` runs natively on Linux, macOS, and Windows. The Docker-backed services
+(`image=`, `dockerfile=`, `compose=`) behave identically everywhere. The
+shell-based features (`run=` services, `post-start`/`pre-stop` hooks, and shell
+health checks) run through the platform shell: `sh -c` on Unix and `cmd /C` on
+Windows. The feature works natively on Windows, but a command string written for
+`sh` (pipes, `$VAR`, `&&`, POSIX tools) may need a `cmd`-compatible form. To keep
+writing POSIX command strings on Windows, run eph inside
+[WSL](docs/user-guide/troubleshooting.md#windows).
 
 ## Quick taste
 
