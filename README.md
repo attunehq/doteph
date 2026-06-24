@@ -45,8 +45,11 @@ cargo install --path .
 make install
 ```
 
-`eph` runs natively on Linux, macOS, and Windows. On Windows you can also run it
-inside WSL.
+`eph` runs natively on Linux and macOS. On Windows, the Docker-backed services
+(`image=`, `dockerfile=`, `compose=`) run natively. The shell-based features
+(`run=` services, `post-start`/`pre-stop` hooks, and shell health checks) rely on
+POSIX `sh` and `kill`, so they require
+[WSL](docs/user-guide/troubleshooting.md#windows-and-wsl).
 
 ## Quick taste
 
