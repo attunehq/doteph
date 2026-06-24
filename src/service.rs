@@ -1069,6 +1069,10 @@ impl DockerClient {
 
     /// Pull an image and run it as a container.
     ///
+    /// `cmd` is the already-parsed `command=` override (see
+    /// [`parse_command_override`]), validated by the caller before any
+    /// container reuse so a malformed value fails closed on every start path.
+    ///
     /// Returns the [`RunningService`] connection info plus the created
     /// container's id, which the caller needs to probe health and to record the
     /// [`Backend::Container`] in state.
@@ -1078,6 +1082,7 @@ impl DockerClient {
         image: &str,
         service: &Service,
         workspace: &Workspace,
+        cmd: Option<Vec<String>>,
     ) -> Result<(RunningService, String)> {
         // Pull image if needed
         self.ensure_image(image).await?;
@@ -1146,10 +1151,6 @@ impl DockerClient {
             ..Default::default()
         };
 
-        // Handle command override. A malformed value fails here, at startup,
-        // with a clear message (see `parse_command_override`).
-        let cmd = parse_command_override(&service.name, service.command_override.as_deref())?;
-
         let config = ContainerCreateBody {
             image: Some(image.to_string()),
             exposed_ports: Some(exposed_ports),
@@ -1207,6 +1208,7 @@ impl DockerClient {
         dockerfile_path: &std::path::Path,
         service: &Service,
         workspace: &Workspace,
+        cmd: Option<Vec<String>>,
     ) -> Result<(RunningService, String)> {
         let image_tag = format!("eph-{}-{}", workspace.short_id, service.name);
 
@@ -1246,7 +1248,7 @@ impl DockerClient {
         }
 
         // Now run like a normal image
-        self.run_image(container_name, &image_tag, service, workspace)
+        self.run_image(container_name, &image_tag, service, workspace, cmd)
             .await
     }
 
@@ -1446,6 +1448,13 @@ impl ServiceManager {
     ) -> Result<RunningService> {
         let container_name = self.workspace.container_name(name);
 
+        // Validate (and parse) the command override up front, before any
+        // existing-container reuse/restart fast path below. Otherwise an edited
+        // `.eph` with a malformed `command=` could still "succeed" by reusing a
+        // stale container, defeating the fail-closed intent. Only image and
+        // dockerfile services use it; for the rest this is `None`.
+        let command = parse_command_override(name, service.command_override.as_deref())?;
+
         // Dedup run= (shell command) services: the Docker-based guard below
         // explicitly skips ServiceSource::Command, so without this check running
         // `eph up` twice would spawn a second process and orphan the first.
@@ -1533,7 +1542,7 @@ impl ServiceManager {
             ServiceSource::Image(image) => {
                 let (r, id) = self
                     .docker
-                    .run_image(&container_name, image, service, &self.workspace)
+                    .run_image(&container_name, image, service, &self.workspace, command)
                     .await?;
 
                 // Wait for health check
@@ -1545,7 +1554,13 @@ impl ServiceManager {
                 let dockerfile_path = self.workspace.path.join(path);
                 let (r, id) = self
                     .docker
-                    .build_and_run(&container_name, &dockerfile_path, service, &self.workspace)
+                    .build_and_run(
+                        &container_name,
+                        &dockerfile_path,
+                        service,
+                        &self.workspace,
+                        command,
+                    )
                     .await?;
 
                 // Wait for health check

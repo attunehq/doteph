@@ -777,6 +777,49 @@ port=6379
     );
 }
 
+/// Regression for #15: a malformed `command=` override must fail closed even
+/// when the service's container already exists (the reuse fast path), not only
+/// on first create. The error is reported at `up` time, not silently smuggled
+/// through as a single argv element.
+#[tokio::test]
+async fn malformed_command_override_fails_closed_on_reuse() {
+    let ws = TestWorkspace::new(
+        r#"
+[box]
+image=redis:7-alpine
+command=sleep 3600
+"#,
+    );
+
+    // First up creates the container and leaves it running.
+    ws.eph_ok(&["up", "box"]).await;
+
+    // Edit the file so `command=` now has an unbalanced quote.
+    ws.write_file(
+        ".eph",
+        r#"
+[box]
+image=redis:7-alpine
+command=sleep "3600
+"#,
+    );
+
+    // The container already exists, so this goes through the reuse path. It must
+    // still fail, with a clear message, rather than reusing the stale config.
+    let output = ws.eph(&["up", "box"]).await;
+    assert!(
+        !output.status.success(),
+        "malformed command= should fail even when the container already exists"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid command override for service 'box'"),
+        "expected a command-override parse error, got: {stderr}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
 // ============================================================================
 // Health Check Tests
 // ============================================================================
