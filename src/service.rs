@@ -201,6 +201,30 @@ pub(crate) enum Backend {
     Compose { project: String },
 }
 
+impl Backend {
+    /// Parse a pre-typed-`Backend` state id back into a [`Backend`].
+    ///
+    /// Earlier versions stored a single `container_id` string that encoded the
+    /// backend by prefix: `compose:<project>`, `pid:<n>`, or a bare Docker
+    /// container id. This lets [`ServiceState::load`] migrate an on-disk state
+    /// file written by such a version, so an in-place upgrade does not orphan
+    /// running services or wedge `eph down` / `eph clean`.
+    fn from_legacy_id(id: &str) -> Result<Self> {
+        if let Some(project) = id.strip_prefix("compose:") {
+            Ok(Backend::Compose {
+                project: project.to_string(),
+            })
+        } else if let Some(pid) = id.strip_prefix("pid:") {
+            let pid: NonZeroU32 = pid
+                .parse()
+                .with_context(|| format!("invalid legacy process id in state: {id:?}"))?;
+            Ok(Backend::Process { pid })
+        } else {
+            Ok(Backend::Container { id: id.to_string() })
+        }
+    }
+}
+
 /// Persistent state for a workspace's services
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct ServiceState {
@@ -216,10 +240,42 @@ pub(crate) struct ServiceState {
 }
 
 /// State entry for a single service
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub(crate) struct ServiceStateEntry {
     pub(crate) backend: Backend,
     pub(crate) ports: HashMap<String, u16>,
+}
+
+/// Deserialize accepting either the current schema (`backend`) or the legacy
+/// one (a `container_id` string), so an on-disk state file written before the
+/// [`Backend`] enum landed still loads after an upgrade. New writes always use
+/// `backend` (see the derived [`Serialize`]); the legacy top-level `processes`
+/// map is ignored, since the PID it held is recovered from `pid:<n>`.
+impl<'de> Deserialize<'de> for ServiceStateEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Repr {
+            #[serde(default)]
+            backend: Option<Backend>,
+            #[serde(default)]
+            container_id: Option<String>,
+            ports: HashMap<String, u16>,
+        }
+
+        let repr = Repr::deserialize(deserializer)?;
+        let backend = match (repr.backend, repr.container_id) {
+            (Some(backend), _) => backend,
+            (None, Some(id)) => Backend::from_legacy_id(&id).map_err(serde::de::Error::custom)?,
+            (None, None) => return Err(serde::de::Error::missing_field("backend")),
+        };
+        Ok(ServiceStateEntry {
+            backend,
+            ports: repr.ports,
+        })
+    }
 }
 
 impl ServiceState {
@@ -2899,5 +2955,45 @@ mod tests {
         let back: ServiceStateEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(back.backend, entry.backend);
         assert_eq!(back.ports, entry.ports);
+    }
+
+    /// Regression: a state file written before the `Backend` enum landed (the
+    /// stringly-typed `container_id` plus a top-level `processes` map) must
+    /// still load, so an in-place upgrade does not orphan running services or
+    /// wedge `eph down` / `eph clean`. Each legacy id form maps to its variant,
+    /// and the now-removed `processes` map is ignored.
+    #[test]
+    fn load_migrates_legacy_state_schema() {
+        let legacy = r#"{
+            "services": {
+                "db":  { "container_id": "abc123def456", "ports": { "default": 5432 } },
+                "web": { "container_id": "pid:4321", "ports": { "default": 5173 } },
+                "stack": { "container_id": "compose:eph-ab12-stack", "ports": {} }
+            },
+            "processes": { "web": 4321 },
+            "auto_ports": { "web": { "default": 5173 } }
+        }"#;
+
+        let state: ServiceState = serde_json::from_str(legacy).unwrap();
+
+        assert_eq!(
+            state.services["db"].backend,
+            Backend::Container {
+                id: "abc123def456".to_string()
+            }
+        );
+        assert_eq!(
+            state.services["web"].backend,
+            Backend::Process { pid: pid(4321) }
+        );
+        assert_eq!(
+            state.services["stack"].backend,
+            Backend::Compose {
+                project: "eph-ab12-stack".to_string()
+            }
+        );
+        // The legacy `processes` map is dropped; its PID survives via the
+        // migrated `Backend::Process`. `auto_ports` is unchanged.
+        assert_eq!(state.auto_ports["web"]["default"], 5173);
     }
 }
