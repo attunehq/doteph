@@ -921,6 +921,32 @@ APP_URL=http://localhost:${web.port}
     ws.eph_ok(&["down"]).await;
 }
 
+// An auto-port readiness check must run with the same environment the app gets,
+// and have its ${...} resolved, or `curl -sf http://localhost:$PORT` style
+// checks would never see the allocated port and `eph up` would time out.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_service_auto_port_healthcheck_sees_port() {
+    // The check passes only if BOTH the eph-resolved `${web.port}` and the
+    // injected `$PORT` env equal the allocated port. If eph ran the healthcheck
+    // without the app's env, `$PORT` would be empty; if it didn't resolve the
+    // string, `${web.port}` would be a literal -- either way `eph up` would fail.
+    let ws = TestWorkspace::new(
+        r#"
+[web]
+run=sleep 300
+port=auto
+env.PORT=${web.port}
+healthcheck=test -n "$PORT" && test "${web.port}" = "$PORT"
+ready-timeout=10
+"#,
+    );
+
+    // `eph_ok` panics if `up` times out, so reaching `down` is the assertion.
+    ws.eph_ok(&["up"]).await;
+    ws.eph_ok(&["down"]).await;
+}
+
 // An eph-allocated auto port stays the same across `eph down` / `eph up`, so a
 // managed app's URL is stable for bookmarks and OAuth callbacks.
 #[cfg(unix)]

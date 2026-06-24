@@ -1542,6 +1542,14 @@ impl ServiceManager {
             );
             let env = self.app_env(eph, &running, service);
 
+            // Resolve the healthcheck's ${...} against the same running set, so a
+            // readiness check can name the app's assigned port as ${<name>.port}
+            // (it also receives the env below, so `$PORT` works too).
+            let healthcheck = service
+                .healthcheck
+                .as_deref()
+                .map(|hc| resolve_against(hc, &running));
+
             let (child, pid) = self.spawn_command(name, cmd, &env)?;
             info!(
                 "Started {} with PID {} (attempt {}/{})",
@@ -1560,7 +1568,14 @@ impl ServiceManager {
             );
 
             match self
-                .await_command_ready(name, service, child, has_auto)
+                .await_command_ready(
+                    name,
+                    healthcheck.as_deref(),
+                    service.ready_timeout_secs,
+                    &env,
+                    child,
+                    has_auto,
+                )
                 .await?
             {
                 ReadyOutcome::Ready => {
@@ -1671,14 +1686,23 @@ impl ServiceManager {
     /// [`ReadyOutcome::PortConflict`] or [`ReadyOutcome::Exited`] depending on
     /// whether its log names a port conflict; when it is clear (fixed-port
     /// services), an early exit is ignored, preserving the historical behavior.
+    ///
+    /// `healthcheck` is already `${...}`-resolved, and `env` is the exact
+    /// environment the app was spawned with, so a readiness check can reference
+    /// the app's assigned port the same way the app does
+    /// (`curl -sf http://localhost:$PORT/health`, or the eph-resolved
+    /// `${web.port}`). Without this, an auto-port healthcheck would never see the
+    /// port and would always time out.
     async fn await_command_ready(
         &self,
         name: &str,
-        service: &Service,
+        healthcheck: Option<&str>,
+        ready_timeout_secs: Option<u64>,
+        env: &[(String, String)],
         mut child: tokio::process::Child,
         detect_exit: bool,
     ) -> Result<ReadyOutcome> {
-        let Some(ref healthcheck) = service.healthcheck else {
+        let Some(healthcheck) = healthcheck else {
             // Give the process a moment to start, then (if watching) classify an
             // early exit.
             sleep(Duration::from_millis(500)).await;
@@ -1688,7 +1712,7 @@ impl ServiceManager {
             return Ok(ReadyOutcome::Ready);
         };
 
-        let timeout_secs = service.ready_timeout_secs.unwrap_or(30);
+        let timeout_secs = ready_timeout_secs.unwrap_or(30);
         info!(
             "Waiting for {} to be healthy (timeout: {}s)",
             name, timeout_secs
@@ -1704,6 +1728,9 @@ impl ServiceManager {
                     .arg("-c")
                     .arg(healthcheck)
                     .current_dir(&self.workspace.path)
+                    // Run the check with the same resolved environment the app got,
+                    // so it can reach the app's (possibly auto-allocated) port.
+                    .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                     .output()
                     .await?;
 

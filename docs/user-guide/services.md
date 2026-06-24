@@ -125,8 +125,10 @@ healthcheck=curl -sf http://localhost:4566/_localstack/health
   as-is for interpolation. Pick a port your process will actually use.
 - **`port=auto` lets eph allocate the port** (see [First-party app
   ports](#first-party-app-ports-portauto) below).
-- The `healthcheck` (if any) runs on the host through `sh -c`, so full shell
-  syntax works.
+- The `healthcheck` (if any) runs on the host through `sh -c` with the **same
+  resolved environment** the process gets (and its `${...}` resolved), so a
+  readiness check can reach an auto-allocated port:
+  `healthcheck=curl -sf http://localhost:$PORT/health` (or `${web.port}`).
 - `eph down` sends `SIGTERM`, waits, then `SIGKILL`. Starting an already-running
   `run` service again is a no-op (its PID is checked first).
 
