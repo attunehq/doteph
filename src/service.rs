@@ -466,6 +466,21 @@ fn has_auto_port(declared: &[PortMapping]) -> bool {
     declared.iter().any(|p| p.auto)
 }
 
+/// The order services are brought up in: declaration order, but with `run=`
+/// (command) services moved to the end so a managed app starts after the
+/// backing services it can reference (e.g. `${postgres.port}`). The sort is
+/// stable, so declaration order is preserved within each group.
+///
+/// This is the single source of truth for start sequencing: `start_services`
+/// uses it to pick the phase-1 order, and `stop_all` / `clean` tear down in its
+/// reverse, so a dependent is always stopped before the dependency it relies on
+/// (its `pre-stop` hook sees the dependency still up).
+fn start_order(eph: &EphFile) -> Vec<&String> {
+    let mut names: Vec<&String> = eph.services.keys().collect();
+    names.sort_by_key(|name| matches!(eph.services[*name].source, ServiceSource::Command(_)));
+    names
+}
+
 /// Whether a dead process's captured `log` names a port conflict, matched
 /// case-insensitively against [`PORT_CONFLICT_MARKERS`]. Used to decide whether
 /// re-launching the service on a fresh port could help.
@@ -1281,22 +1296,26 @@ impl ServiceManager {
         // the order requested). post-start hooks run in a second phase once all
         // of these are healthy, so the phase-1 start order does not affect
         // whether a hook's cross-service references resolve.
-        let mut targets: Vec<&String> = if filter.is_empty() {
-            eph.services.keys().collect()
+        // Backing services (image/dockerfile/compose) start before run= apps so
+        // a managed app's environment can reference the services it depends on
+        // (e.g. ${postgres.port}) at spawn time. `start_order` encodes this for
+        // the full set (and is mirrored, reversed, by teardown); a filtered
+        // request keeps the requested order but applies the same command-last
+        // rule with a stable sort.
+        let targets: Vec<&String> = if filter.is_empty() {
+            start_order(eph)
         } else {
             for name in filter {
                 if !eph.services.contains_key(name) {
                     bail!("unknown service: {}", name);
                 }
             }
-            filter.iter().collect()
+            let mut targets: Vec<&String> = filter.iter().collect();
+            targets.sort_by_key(|name| {
+                matches!(eph.services[*name].source, ServiceSource::Command(_))
+            });
+            targets
         };
-
-        // Start backing services (image/dockerfile/compose) before run= apps, so
-        // a managed app's environment can reference the services it depends on
-        // (e.g. ${postgres.port}) at spawn time. sort_by_key is stable, so this
-        // only moves Command services to the end and otherwise preserves order.
-        targets.sort_by_key(|name| matches!(eph.services[*name].source, ServiceSource::Command(_)));
 
         // Phase 1: create or reuse every target, waiting for health.
         let mut running = HashMap::new();
@@ -2005,11 +2024,12 @@ impl ServiceManager {
         // Snapshot the running services once, before any teardown, so every
         // pre-stop hook sees the full environment as it was when `down` began.
         let running = self.status().await?;
-        // Tear down in reverse declaration order: services are started in
-        // declaration order (dependencies first), so stopping in reverse stops a
-        // dependent before the dependency it relies on, which keeps a
-        // dependency alive while the dependent's pre-stop hook runs.
-        for (name, service) in eph.services.iter().rev() {
+        // Tear down in the reverse of the actual start order (see `start_order`,
+        // which defers run= apps to the end), so a dependent is stopped before
+        // the dependency it relies on and its pre-stop hook still sees that
+        // dependency up.
+        for name in start_order(eph).into_iter().rev() {
+            let service = &eph.services[name];
             self.stop_service(name, service, remove, eph, &running, skip_hooks)
                 .await?;
         }
@@ -2144,9 +2164,10 @@ impl ServiceManager {
         // environment as it was before teardown began.
         let running = self.status().await?;
 
-        // Reverse declaration order, matching `stop_all`: tear a dependent down
-        // before the dependency it relies on.
-        for (name, service) in eph.services.iter().rev() {
+        // Reverse of the actual start order, matching `stop_all`: tear a
+        // dependent down before the dependency it relies on.
+        for name in start_order(eph).into_iter().rev() {
+            let service = &eph.services[name];
             // Stop and remove the underlying resource for this service.
             self.stop_service(name, service, true, eph, &running, skip_hooks)
                 .await?;
@@ -3001,5 +3022,41 @@ mod tests {
         // The legacy `processes` map is dropped; its PID survives via the
         // migrated `Backend::Process`. `auto_ports` is unchanged.
         assert_eq!(state.auto_ports["web"]["default"], 5173);
+    }
+
+    /// `start_order` defers `run=` apps to the end (so backing services start
+    /// first) while preserving declaration order within each group, and teardown
+    /// is exactly its reverse, so a dependent stops before its dependency even
+    /// when the app is declared before the service it depends on.
+    #[test]
+    fn start_order_defers_run_services_and_teardown_reverses_it() {
+        // `app` (run=) is declared *before* `postgres` it depends on, plus a
+        // second backing service to confirm intra-group order is kept.
+        let eph = crate::parser::parse(
+            r#"
+[app]
+run=./serve
+port=auto
+
+[postgres]
+image=postgres:16
+
+[redis]
+image=redis:7
+"#,
+        )
+        .unwrap();
+
+        let order: Vec<&str> = start_order(&eph).iter().map(|s| s.as_str()).collect();
+        // Backing services first (in declaration order), then the run= app.
+        assert_eq!(order, ["postgres", "redis", "app"]);
+
+        // Teardown reverses the start order: the app stops before postgres/redis.
+        let teardown: Vec<&str> = start_order(&eph)
+            .into_iter()
+            .rev()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(teardown, ["app", "redis", "postgres"]);
     }
 }
