@@ -134,7 +134,8 @@ from scratch.
 
 ## Windows and WSL
 
-`eph` runs natively on Linux and macOS. On Windows, run it inside **WSL**.
+`eph` runs natively on Linux and macOS. On Windows, the Docker-backed services
+run natively, but the shell-based features below require **WSL**.
 
 Plain `image=`/`dockerfile=` services with container (`docker exec`) health
 checks and no hooks are the cross-platform path. But `run=` services,
