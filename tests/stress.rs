@@ -7,15 +7,15 @@
 //! ports actually work.
 //!
 //! What it covers:
-//! - **Multi-service environment** — postgres + redis + minio in one workspace,
+//! - **Multi-service environment**: postgres + redis + minio in one workspace,
 //!   with real SQL / RESP / S3-health connectivity over the mapped host ports.
-//! - **Concurrent workspace isolation** — N independent workspaces each running
+//! - **Concurrent workspace isolation**: N independent workspaces each running
 //!   postgres + redis, brought up in parallel, with assertions that no host
 //!   ports or container names collide and that data written to one workspace's
 //!   backend is invisible to the others.
-//! - **Every service source type** — `image=`, `dockerfile=` (build), `run=`
+//! - **Every service source type**: `image=`, `dockerfile=` (build), `run=`
 //!   (shell command), and `compose=`, which the lighter suite never exercises.
-//! - **Leak-free teardown** — after `eph clean`, no containers for the
+//! - **Leak-free teardown**: after `eph clean`, no containers for the
 //!   workspace remain.
 //!
 //! These tests are slow, need a Docker daemon, pull real images, and (for the
@@ -126,7 +126,7 @@ enum RedisReply {
 ///
 /// RESP is stream-framed, so a single `read()` can split even a tiny reply.
 /// This reads the status line, then for a bulk string reads exactly the
-/// declared byte count plus the trailing CRLF — so a fragmented read can never
+/// declared byte count plus the trailing CRLF, so a fragmented read can never
 /// silently truncate a value into a false test failure.
 async fn redis_command(port: u16, args: &[&str]) -> Result<RedisReply> {
     // Cap the whole exchange: a peer that accepts the connection but never sends

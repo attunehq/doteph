@@ -154,7 +154,7 @@ APP_URL=http://localhost:${web.port}
 How it works and what to know:
 
 - **eph picks the port and injects it.** Reference the service's own assigned
-  port as `${web.port}` (or `${web.port.<name>}`) in its `env.*` — that is how
+  port as `${web.port}` (or `${web.port.<name>}`) in its `env.*`; that is how
   the value reaches the process (most frameworks read `PORT`). The same port is
   available to other services and to `eph env` / `${web.port}` everywhere.
 - **Stable across restarts.** eph reuses the previously-assigned port on the
@@ -166,7 +166,7 @@ How it works and what to know:
   port conflict (an "address already in use" message) and **re-launches on a
   fresh port** automatically, a few times before giving up. For this to trigger,
   your dev server must *exit* on a busy port rather than silently picking the
-  next one — prefer a "strict port" mode if your framework offers one (e.g.
+  next one. Prefer a "strict port" mode if your framework offers one (e.g.
   Vite's `--strictPort`).
 - **Backing services start first.** Within one `eph up`, container/compose
   services are started before `run=` apps, so an app's environment can reference
