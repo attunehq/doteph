@@ -126,6 +126,14 @@ Unix the kill path sends `SIGTERM` then `SIGKILL`; on Windows, which has no POSI
 signals, both the graceful and forced stops become a hard terminate (sysinfo
 uses the built-in `taskkill /F`, so no extra setup or WSL is needed).
 
+Teardown kills the whole process tree rooted at the tracked PID, not just that
+one process. On Windows the tracked PID is the `cmd /C` wrapper and the real
+service is its child, so killing only the wrapper would orphan the service; the
+same applies to a `sh -c` that stayed alive as the parent of a backgrounded or
+compound command on Unix. The tree is found by walking parent links in a
+`sysinfo` snapshot, so it works across separate `eph` invocations (an `eph down`
+reads the PID from state and reconstructs the tree).
+
 > **Reconciling compose services.** `ServiceManager::status` reconciles state by
 > looking up a container named `eph-<short_id>-<service>`, which exists for
 > image/dockerfile services (and is approximated by a tracked PID for `run`
