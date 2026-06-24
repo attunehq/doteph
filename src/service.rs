@@ -2860,7 +2860,10 @@ mod tests {
                 },
                 r#"{"container":{"id":"abc123"}}"#,
             ),
-            (Backend::Process { pid: pid(4321) }, r#"{"process":{"pid":4321}}"#),
+            (
+                Backend::Process { pid: pid(4321) },
+                r#"{"process":{"pid":4321}}"#,
+            ),
             (
                 Backend::Compose {
                     project: "eph-ab12-web".to_string(),
