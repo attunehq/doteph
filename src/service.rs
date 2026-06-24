@@ -487,6 +487,40 @@ fn parse_command_override(
         .transpose()
 }
 
+/// Resolve one `volumes` entry into a Docker `-v` bind spec.
+///
+/// A spec starting with `/` or `.` is a host-path bind mount: a leading `.` is
+/// resolved relative to the workspace root, while an absolute path is used as
+/// is. Anything else is a named volume, namespaced to this workspace and
+/// service (via [`Workspace::volume_name`]) so two workspaces, or two services,
+/// never collide on a shared volume. A spec without a `:<container_path>` half
+/// is passed through unchanged, so Docker reports the malformed mount itself.
+fn resolve_volume_spec(spec: &str, workspace: &Workspace, service_name: &str) -> String {
+    if spec.starts_with('/') || spec.starts_with('.') {
+        // Host-path bind mount.
+        let parts: Vec<&str> = spec.splitn(2, ':').collect();
+        if parts.len() == 2 {
+            let host_path = if parts[0].starts_with('.') {
+                workspace.path.join(parts[0]).to_string_lossy().to_string()
+            } else {
+                parts[0].to_string()
+            };
+            format!("{}:{}", host_path, parts[1])
+        } else {
+            spec.to_string()
+        }
+    } else {
+        // Named volume, namespaced to the workspace + service.
+        let parts: Vec<&str> = spec.splitn(2, ':').collect();
+        if parts.len() == 2 {
+            let volume_name = workspace.volume_name(service_name, parts[0]);
+            format!("{}:{}", volume_name, parts[1])
+        } else {
+            spec.to_string()
+        }
+    }
+}
+
 /// Poll `probe` until it yields a result or `timeout_dur` elapses, sleeping
 /// `interval` between attempts.
 ///
@@ -1118,31 +1152,7 @@ impl DockerClient {
         let binds: Vec<String> = service
             .volumes
             .iter()
-            .map(|v| {
-                if v.starts_with('/') || v.starts_with('.') {
-                    // Absolute or relative path - resolve relative to workspace
-                    let parts: Vec<&str> = v.splitn(2, ':').collect();
-                    if parts.len() == 2 {
-                        let host_path = if parts[0].starts_with('.') {
-                            workspace.path.join(parts[0]).to_string_lossy().to_string()
-                        } else {
-                            parts[0].to_string()
-                        };
-                        format!("{}:{}", host_path, parts[1])
-                    } else {
-                        v.clone()
-                    }
-                } else {
-                    // Named volume - prefix with workspace
-                    let parts: Vec<&str> = v.splitn(2, ':').collect();
-                    if parts.len() == 2 {
-                        let volume_name = workspace.volume_name(&service.name, parts[0]);
-                        format!("{}:{}", volume_name, parts[1])
-                    } else {
-                        v.clone()
-                    }
-                }
-            })
+            .map(|v| resolve_volume_spec(v, workspace, &service.name))
             .collect();
 
         let host_config = HostConfig {
@@ -2839,6 +2849,62 @@ mod tests {
             err.starts_with("invalid command override for service 'web':"),
             "got: {err}"
         );
+    }
+
+    /// A `Workspace` with fixed ids, built without touching the filesystem, so
+    /// volume-spec resolution can be exercised without Docker or a real
+    /// workspace directory.
+    fn test_workspace(path: &str) -> Workspace {
+        Workspace {
+            path: PathBuf::from(path),
+            id: "abcd1234ef567890".to_string(),
+            short_id: "abcd1234".to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_volume_spec_namespaces_named_volumes() {
+        let ws = test_workspace("/ws");
+        // A bare name is namespaced to `eph-<short_id>-<service>-<name>` so two
+        // workspaces or services never share a volume.
+        assert_eq!(
+            resolve_volume_spec("data:/var/lib/postgresql/data", &ws, "db"),
+            "eph-abcd1234-db-data:/var/lib/postgresql/data"
+        );
+    }
+
+    #[test]
+    fn resolve_volume_spec_passes_absolute_binds_through() {
+        let ws = test_workspace("/ws");
+        // An absolute host path is a bind mount used verbatim (not namespaced).
+        assert_eq!(
+            resolve_volume_spec("/host/path:/in/container", &ws, "db"),
+            "/host/path:/in/container"
+        );
+    }
+
+    #[test]
+    fn resolve_volume_spec_resolves_relative_binds_against_workspace() {
+        let ws = test_workspace("/ws");
+        // A leading `.` is resolved relative to the workspace root.
+        let expected = format!(
+            "{}:/in/container",
+            PathBuf::from("/ws").join("./data").to_string_lossy()
+        );
+        assert_eq!(
+            resolve_volume_spec("./data:/in/container", &ws, "db"),
+            expected
+        );
+    }
+
+    #[test]
+    fn resolve_volume_spec_passes_through_specs_without_a_container_path() {
+        let ws = test_workspace("/ws");
+        // No `:<container_path>` half: passed through unchanged (Docker reports
+        // the malformed mount). Holds for both the named and host-path branches.
+        assert_eq!(resolve_volume_spec("justaname", &ws, "db"), "justaname");
+        assert_eq!(resolve_volume_spec("/abs/only", &ws, "db"), "/abs/only");
+        assert_eq!(resolve_volume_spec("./rel/only", &ws, "db"), "./rel/only");
     }
 
     #[test]
