@@ -145,13 +145,18 @@ engine.
   returning only what is actually running.
 
 **State persistence:** `ServiceState { services: HashMap<String,
-ServiceStateEntry>, processes: HashMap<String, u32> }`, serialized as pretty JSON
-to `<state_dir>/state.json`. `ServiceStateEntry { container_id, ports }`.
+ServiceStateEntry>, auto_ports: ... }`, serialized as pretty JSON to
+`<state_dir>/state.json`. `ServiceStateEntry { backend, ports }`, where `backend`
+is a typed `Backend` enum: `Container { id }` for `image=` / `dockerfile=`,
+`Process { pid }` for `run=`, or `Compose { project }` for compose. It is the
+single source of truth for a `run=` service's PID. `load` migrates a legacy file
+that used a stringly-typed `container_id` (a bare id, `pid:<n>`, or
+`compose:<project>`) plus a separate `processes` map.
 
 **`RunningService`** is the runtime handle returned to callers: `host()` (always
-`localhost`), `port()` (the `default` port, else any), `named_port(name)`. The
-`container_id` field doubles as a backend tag: a real id, `pid:<n>` for `run`
-services, or `compose:<project>` for compose.
+`localhost`), `port()` (the `default` port, else any), `named_port(name)`. It is
+pure connection info; the backend handle lives only in the persisted
+`ServiceStateEntry`.
 
 ## env
 

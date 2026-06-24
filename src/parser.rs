@@ -22,6 +22,7 @@
 //! ```
 
 use anyhow::{Context, Result, bail};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::warn;
@@ -38,8 +39,10 @@ use tracing::warn;
 pub struct EphFile {
     /// Top-level environment variables, in declaration order.
     pub env_vars: Vec<EnvVar>,
-    /// Service definitions, keyed by service name (the section header).
-    pub services: HashMap<String, Service>,
+    /// Service definitions, keyed by service name (the section header), kept in
+    /// declaration order so start sequencing and command output are
+    /// reproducible (the parser preserves section order end to end).
+    pub services: IndexMap<String, Service>,
 }
 
 /// An environment variable definition.
@@ -108,8 +111,20 @@ pub enum ServiceSource {
 pub struct PortMapping {
     /// Optional name for this port (e.g., "api", "admin")
     pub name: Option<String>,
-    /// Container port to expose
+    /// Container port to expose.
+    ///
+    /// For an auto-allocated port ([`auto`](Self::auto) is `true`) there is no
+    /// container port; this is `0` and eph assigns a free host port at start
+    /// time.
     pub container_port: u16,
+    /// When `true`, eph allocates a free host port for this mapping at start
+    /// time instead of using a fixed number, and tells the spawned process the
+    /// assigned port through its environment. Written as `port=auto` /
+    /// `port.<name>=auto` in the `.eph` file. Only valid for `run=` services
+    /// (the parser rejects it elsewhere), since those are processes eph launches
+    /// and can re-launch on a fresh port if they hit a port conflict.
+    #[serde(default)]
+    pub auto: bool,
 }
 
 // ============================================================================
@@ -146,6 +161,26 @@ impl ServiceBuilder {
                 self.name
             )
         })?;
+        // Auto-allocated ports (`port=auto`) only make sense for `run=` services:
+        // those are host processes eph launches itself, so it can pick a free
+        // port, inject it, and re-launch on a fresh one if the process hits a
+        // conflict. For image/dockerfile/compose services Docker already assigns
+        // a random host port, and there is no process for eph to relaunch, so a
+        // bare `auto` there is a mistake worth catching at parse time.
+        if !matches!(source, ServiceSource::Command(_))
+            && let Some(p) = self.ports.iter().find(|p| p.auto)
+        {
+            let which = p
+                .name
+                .as_deref()
+                .map_or_else(|| "port".to_string(), |n| format!("port.{n}"));
+            bail!(
+                "service '{}' sets `{} = auto`, but auto-allocated ports are only \
+                 supported for `run=` services",
+                self.name,
+                which
+            );
+        }
         Ok(Service {
             name: self.name,
             source,
@@ -280,8 +315,9 @@ pub fn parse(input: &str) -> Result<EphFile> {
 
     // Finalize each section into a concrete Service, rejecting any that never
     // declared a source. This keeps the illegal "service with no source" state
-    // out of the returned EphFile entirely.
-    let mut services: HashMap<String, Service> = HashMap::with_capacity(builders.len());
+    // out of the returned EphFile entirely. `builders` is in declaration order,
+    // and inserting in that order makes `services` iterate the same way.
+    let mut services: IndexMap<String, Service> = IndexMap::with_capacity(builders.len());
     for builder in builders {
         let service = builder.finish()?;
         services.insert(service.name.clone(), service);
@@ -316,6 +352,21 @@ fn strip_quotes(s: &str) -> &str {
     }
 }
 
+/// Parse a port property's value into `(container_port, auto)`.
+///
+/// The literal `auto` (case-insensitive) requests an eph-allocated free host
+/// port and yields `(0, true)`; anything else must be a valid `u16` port number
+/// and yields `(n, false)`.
+fn parse_port_value(value: &str, line_num: usize) -> Result<(u16, bool)> {
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok((0, true));
+    }
+    let port: u16 = value
+        .parse()
+        .with_context(|| format!("invalid port number at line {}", line_num))?;
+    Ok((port, false))
+}
+
 fn parse_service_property(
     service: &mut ServiceBuilder,
     key: &str,
@@ -331,12 +382,11 @@ fn parse_service_property(
         // Container command override (for use with image/dockerfile)
         "command" => service.command_override = Some(value.to_string()),
         "port" => {
-            let port: u16 = value
-                .parse()
-                .with_context(|| format!("invalid port number at line {}", line_num))?;
+            let (port, auto) = parse_port_value(value, line_num)?;
             service.ports.push(PortMapping {
                 name: None,
                 container_port: port,
+                auto,
             });
         }
         "volume" => {
@@ -359,12 +409,11 @@ fn parse_service_property(
         }
         key if key.starts_with("port.") => {
             let port_name = &key[5..];
-            let port: u16 = value
-                .parse()
-                .with_context(|| format!("invalid port number at line {}", line_num))?;
+            let (port, auto) = parse_port_value(value, line_num)?;
             service.ports.push(PortMapping {
                 name: Some(port_name.to_string()),
                 container_port: port,
+                auto,
             });
         }
         key if key.starts_with("env.") => {
@@ -380,6 +429,7 @@ fn parse_service_property(
             service.ports.push(PortMapping {
                 name: Some(port_name.to_string()),
                 container_port: port,
+                auto: false,
             });
         }
         // Build context for Dockerfiles
@@ -504,6 +554,36 @@ env.POSTGRES_USER=dev
     }
 
     #[test]
+    fn test_services_preserve_declaration_order() {
+        // Section order in the file must survive into `services` iteration, so
+        // start sequencing and command output are reproducible rather than
+        // varying with hash-map order. Use a name set whose hash order is
+        // unlikely to coincide with declaration order.
+        let input = r#"
+[zebra]
+image=busybox
+
+[apple]
+image=busybox
+
+[mango]
+run=sleep 1
+port=auto
+
+[delta]
+compose=docker-compose.yml
+"#;
+        let result = parse(input).unwrap();
+        let order: Vec<&str> = result.services.keys().map(String::as_str).collect();
+        assert_eq!(order, ["zebra", "apple", "mango", "delta"]);
+
+        // Re-parsing yields the same order every time (a HashMap would not).
+        let again = parse(input).unwrap();
+        let again_order: Vec<&str> = again.services.keys().map(String::as_str).collect();
+        assert_eq!(order, again_order);
+    }
+
+    #[test]
     fn test_parse_interpolation() {
         let input = r#"
 [postgres]
@@ -595,6 +675,65 @@ image=postgres:16
 prot=5432
 "#;
         assert!(parse(input).is_err());
+    }
+
+    #[test]
+    fn test_parse_auto_port_for_run_service() {
+        let input = r#"
+[web]
+run=npm run dev
+port=auto
+port.hmr=auto
+port.api=5000
+"#;
+        let result = parse(input).unwrap();
+        let web = result.services.get("web").unwrap();
+        assert!(matches!(&web.source, ServiceSource::Command(c) if c == "npm run dev"));
+
+        let unnamed = web.ports.iter().find(|p| p.name.is_none()).unwrap();
+        assert!(unnamed.auto);
+        assert_eq!(unnamed.container_port, 0);
+
+        let hmr = web
+            .ports
+            .iter()
+            .find(|p| p.name.as_deref() == Some("hmr"))
+            .unwrap();
+        assert!(hmr.auto);
+
+        // A fixed numeric port alongside auto ports stays fixed.
+        let api = web
+            .ports
+            .iter()
+            .find(|p| p.name.as_deref() == Some("api"))
+            .unwrap();
+        assert!(!api.auto);
+        assert_eq!(api.container_port, 5000);
+    }
+
+    #[test]
+    fn test_auto_port_is_case_insensitive() {
+        let result = parse("[web]\nrun=serve\nport=AUTO\n").unwrap();
+        assert!(result.services["web"].ports[0].auto);
+    }
+
+    #[test]
+    fn test_auto_port_rejected_for_image_service() {
+        // `auto` is only meaningful for run= services; Docker already assigns a
+        // random host port for image services, so this is a parse-time error.
+        let input = "[postgres]\nimage=postgres:16\nport=auto\n";
+        let err = parse(input).expect_err("auto port on an image service must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("auto") && msg.contains("run="),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_non_auto_invalid_port_still_errors() {
+        // A non-numeric, non-`auto` port value remains a hard error.
+        assert!(parse("[web]\nrun=serve\nport=nope\n").is_err());
     }
 
     #[test]

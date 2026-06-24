@@ -777,6 +777,49 @@ port=6379
     );
 }
 
+/// Regression for #15: a malformed `command=` override must fail closed even
+/// when the service's container already exists (the reuse fast path), not only
+/// on first create. The error is reported at `up` time, not silently smuggled
+/// through as a single argv element.
+#[tokio::test]
+async fn malformed_command_override_fails_closed_on_reuse() {
+    let ws = TestWorkspace::new(
+        r#"
+[box]
+image=redis:7-alpine
+command=sleep 3600
+"#,
+    );
+
+    // First up creates the container and leaves it running.
+    ws.eph_ok(&["up", "box"]).await;
+
+    // Edit the file so `command=` now has an unbalanced quote.
+    ws.write_file(
+        ".eph",
+        r#"
+[box]
+image=redis:7-alpine
+command=sleep "3600
+"#,
+    );
+
+    // The container already exists, so this goes through the reuse path. It must
+    // still fail, with a clear message, rather than reusing the stale config.
+    let output = ws.eph(&["up", "box"]).await;
+    assert!(
+        !output.status.success(),
+        "malformed command= should fail even when the container already exists"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid command override for service 'box'"),
+        "expected a command-override parse error, got: {stderr}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
 // ============================================================================
 // Health Check Tests
 // ============================================================================
@@ -879,6 +922,101 @@ run=echo about-to-die && exit 1
         logs.contains("about-to-die"),
         "expected the dead service's trace to survive, got:\n{}",
         logs
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// `port=auto` on a run= service: eph allocates a free host port, injects it into
+// the process environment, and resolves it for interpolation -- the core of
+// first-party app port creation.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_service_auto_port_is_allocated_and_injected() {
+    // The process echoes the PORT it was handed, then stays alive so its log can
+    // be read. `env.PORT=${web.port}` is how the assigned port reaches it.
+    let ws = TestWorkspace::new(
+        r#"
+[web]
+run=echo "BOUND_PORT=$PORT" && sleep 300
+port=auto
+env.PORT=${web.port}
+
+APP_URL=http://localhost:${web.port}
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+
+    // The allocated port is resolved into the top-level variable...
+    let env = ws.env_json().await;
+    let app_url = env.get("APP_URL").expect("APP_URL should be set");
+    let port = extract_port(app_url).expect("APP_URL should contain a real port");
+    assert!(port > 1024, "expected an ephemeral host port, got {port}");
+
+    // ...and the same port was injected into the process as PORT.
+    let logs = ws.eph_ok(&["logs", "web"]).await;
+    assert!(
+        logs.contains(&format!("BOUND_PORT={port}")),
+        "expected the process to receive PORT={port}, got:\n{logs}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// An auto-port readiness check must run with the same environment the app gets,
+// and have its ${...} resolved, or `curl -sf http://localhost:$PORT` style
+// checks would never see the allocated port and `eph up` would time out.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_service_auto_port_healthcheck_sees_port() {
+    // The check passes only if BOTH the eph-resolved `${web.port}` and the
+    // injected `$PORT` env equal the allocated port. If eph ran the healthcheck
+    // without the app's env, `$PORT` would be empty; if it didn't resolve the
+    // string, `${web.port}` would be a literal -- either way `eph up` would fail.
+    let ws = TestWorkspace::new(
+        r#"
+[web]
+run=sleep 300
+port=auto
+env.PORT=${web.port}
+healthcheck=test -n "$PORT" && test "${web.port}" = "$PORT"
+ready-timeout=10
+"#,
+    );
+
+    // `eph_ok` panics if `up` times out, so reaching `down` is the assertion.
+    ws.eph_ok(&["up"]).await;
+    ws.eph_ok(&["down"]).await;
+}
+
+// An eph-allocated auto port stays the same across `eph down` / `eph up`, so a
+// managed app's URL is stable for bookmarks and OAuth callbacks.
+#[cfg(unix)]
+#[tokio::test]
+async fn run_service_auto_port_is_stable_across_restart() {
+    let ws = TestWorkspace::new(
+        r#"
+[web]
+run=sleep 300
+port=auto
+
+APP_URL=http://localhost:${web.port}
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+    let first = extract_port(ws.env_json().await.get("APP_URL").unwrap())
+        .expect("APP_URL should contain a port");
+
+    ws.eph_ok(&["down"]).await;
+    ws.eph_ok(&["up"]).await;
+    let second = extract_port(ws.env_json().await.get("APP_URL").unwrap())
+        .expect("APP_URL should contain a port");
+
+    assert_eq!(
+        first, second,
+        "auto port should be reused across down/up for a stable URL"
     );
 
     ws.eph_ok(&["down"]).await;

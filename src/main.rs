@@ -15,7 +15,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eph::parser::{self, EphFile, ServiceSource};
-use eph::{LogOptions, ServiceManager, Workspace, skills};
+use eph::{LogOptions, RunningService, ServiceManager, Workspace, skills};
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -238,14 +238,13 @@ async fn cmd_up(service_filter: Vec<String>, skip_hooks: bool) -> Result<()> {
         .start_services(&eph, &service_filter, skip_hooks)
         .await?;
 
-    // Print summary
+    // Print summary in declaration order (iterate the .eph definitions rather
+    // than the unordered `running` map) so the output is reproducible.
     println!();
     println!("Services started:");
-    for (name, svc) in &running {
-        if let Some(port) = svc.port() {
-            println!("  {} -> localhost:{}", name, port);
-        } else {
-            println!("  {} (no ports)", name);
+    for name in eph.services.keys() {
+        if let Some(svc) = running.get(name) {
+            print_service_ports(name, svc);
         }
     }
 
@@ -336,11 +335,25 @@ async fn cmd_status() -> Result<()> {
         }
     } else {
         println!("Running services:");
-        for (name, svc) in &running {
-            if let Some(port) = svc.port() {
-                println!("  {} -> localhost:{}", name, port);
-            } else {
-                println!("  {} (no ports)", name);
+        // Declared services first, in declaration order, so the listing is
+        // reproducible across runs.
+        for name in eph.services.keys() {
+            if let Some(svc) = running.get(name) {
+                print_service_ports(name, svc);
+            }
+        }
+        // Then any service that is running in persisted state but no longer
+        // declared in the `.eph` file (renamed or removed). These are still
+        // surfaced so they remain visible and tearable, sorted by name to stay
+        // deterministic.
+        let mut undeclared: Vec<&String> = running
+            .keys()
+            .filter(|n| !eph.services.contains_key(*n))
+            .collect();
+        undeclared.sort();
+        for name in undeclared {
+            if let Some(svc) = running.get(name) {
+                print_service_ports(name, svc);
             }
         }
 
@@ -359,6 +372,26 @@ async fn cmd_status() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Print a running service and its assigned host ports for `eph up` / `eph
+/// status`. A single port is shown inline; multiple named ports (e.g. an app
+/// with both a frontend and an HMR port) are listed one per line. Names are
+/// sorted so the output is stable across runs regardless of map order.
+fn print_service_ports(name: &str, svc: &RunningService) {
+    let mut ports: Vec<(&String, &u16)> = svc.ports.iter().collect();
+    ports.sort_by(|a, b| a.0.cmp(b.0));
+
+    match ports.as_slice() {
+        [] => println!("  {} (no ports)", name),
+        [(_, port)] => println!("  {} -> localhost:{}", name, port),
+        many => {
+            println!("  {}:", name);
+            for (port_name, port) in many {
+                println!("    {} -> localhost:{}", port_name, port);
+            }
+        }
+    }
 }
 
 async fn cmd_env(format: &str) -> Result<()> {
