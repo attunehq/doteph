@@ -466,6 +466,51 @@ fn has_auto_port(declared: &[PortMapping]) -> bool {
     declared.iter().any(|p| p.auto)
 }
 
+/// Poll `probe` until it yields a result or `timeout_dur` elapses, sleeping
+/// `interval` between attempts.
+///
+/// `probe` returns `Ok(Some(value))` to finish with that value, `Ok(None)` to
+/// keep waiting, or `Err` to abort immediately. On timeout this returns a
+/// single, consistent lowercase "failed to become healthy" error, so every
+/// readiness path (Docker exec, `run=` shell probe, compose) shares one home
+/// for the wait semantics and one error message.
+///
+/// The probe owns the command details and any success/`debug!` logging, since
+/// what "ready" means (and whether it is even healthy, versus a classified
+/// early exit) differs per backend. This only owns the start log, the timeout,
+/// the sleep, and the failure message.
+async fn wait_until_ready<T>(
+    name: &str,
+    timeout_dur: Duration,
+    interval: Duration,
+    mut probe: impl AsyncFnMut() -> Result<Option<T>>,
+) -> Result<T> {
+    info!(
+        "Waiting for {} to be healthy (timeout: {}s)",
+        name,
+        timeout_dur.as_secs()
+    );
+
+    let polled = timeout(timeout_dur, async {
+        loop {
+            if let Some(value) = probe().await? {
+                return Ok::<T, anyhow::Error>(value);
+            }
+            sleep(interval).await;
+        }
+    })
+    .await;
+
+    match polled {
+        Ok(inner) => inner,
+        Err(_) => bail!(
+            "service {} failed to become healthy within {}s",
+            name,
+            timeout_dur.as_secs()
+        ),
+    }
+}
+
 /// The order services are brought up in: declaration order, but with `run=`
 /// (command) services moved to the end so a managed app starts after the
 /// backing services it can reference (e.g. `${postgres.port}`). The sort is
@@ -1522,46 +1567,28 @@ impl ServiceManager {
             return Ok(());
         };
 
-        let timeout_secs = service.ready_timeout_secs.unwrap_or(30);
-        let check_interval = Duration::from_secs(1);
-
-        info!(
-            "Waiting for {} to be healthy (timeout: {}s)",
-            name, timeout_secs
-        );
-
-        let result = timeout(Duration::from_secs(timeout_secs), async {
-            loop {
-                // Parse healthcheck command
-                let parts: Vec<&str> = healthcheck.split_whitespace().collect();
-                if parts.is_empty() {
-                    return Ok(());
-                }
-
-                let exit_code = self.docker.exec_in_container(container_id, &parts).await?;
-
-                if exit_code == 0 {
-                    info!("Service {} is healthy", name);
-                    return Ok(());
-                }
-
-                debug!(
-                    "Health check for {} failed (exit {}), retrying...",
-                    name, exit_code
-                );
-                sleep(check_interval).await;
+        let timeout_dur = Duration::from_secs(service.ready_timeout_secs.unwrap_or(30));
+        wait_until_ready(name, timeout_dur, Duration::from_secs(1), async || {
+            // Parse healthcheck command. An empty command is treated as ready
+            // immediately (nothing to probe).
+            let parts: Vec<&str> = healthcheck.split_whitespace().collect();
+            if parts.is_empty() {
+                return Ok(Some(()));
             }
-        })
-        .await;
 
-        match result {
-            Ok(inner) => inner,
-            Err(_) => bail!(
-                "service {} failed to become healthy within {}s",
-                name,
-                timeout_secs
-            ),
-        }
+            let exit_code = self.docker.exec_in_container(container_id, &parts).await?;
+            if exit_code == 0 {
+                info!("Service {} is healthy", name);
+                return Ok(Some(()));
+            }
+
+            debug!(
+                "Health check for {} failed (exit {}), retrying...",
+                name, exit_code
+            );
+            Ok(None)
+        })
+        .await
     }
 
     /// Start a `run=` (shell command) service: a host process eph launches and
@@ -1807,47 +1834,33 @@ impl ServiceManager {
             return Ok(ReadyOutcome::Ready);
         };
 
-        let timeout_secs = ready_timeout_secs.unwrap_or(30);
-        info!(
-            "Waiting for {} to be healthy (timeout: {}s)",
-            name, timeout_secs
-        );
-
-        let result = timeout(Duration::from_secs(timeout_secs), async {
-            loop {
-                if detect_exit && matches!(child.try_wait(), Ok(Some(_))) {
-                    return Ok::<ReadyOutcome, anyhow::Error>(self.classify_exit(name).await);
-                }
-
-                let output = TokioCommand::new("sh")
-                    .arg("-c")
-                    .arg(healthcheck)
-                    .current_dir(&self.workspace.path)
-                    // Run the check with the same resolved environment the app got,
-                    // so it can reach the app's (possibly auto-allocated) port.
-                    .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-                    .output()
-                    .await?;
-
-                if output.status.success() {
-                    info!("Service {} is healthy", name);
-                    return Ok(ReadyOutcome::Ready);
-                }
-
-                debug!("Health check for {} failed, retrying...", name);
-                sleep(Duration::from_secs(1)).await;
+        let timeout_dur = Duration::from_secs(ready_timeout_secs.unwrap_or(30));
+        wait_until_ready(name, timeout_dur, Duration::from_secs(1), async || {
+            // A watched process that has already exited is classified (port
+            // conflict vs other failure) rather than probed further.
+            if detect_exit && matches!(child.try_wait(), Ok(Some(_))) {
+                return Ok(Some(self.classify_exit(name).await));
             }
-        })
-        .await;
 
-        match result {
-            Ok(inner) => inner,
-            Err(_) => bail!(
-                "service {} failed to become healthy within {}s",
-                name,
-                timeout_secs
-            ),
-        }
+            let output = TokioCommand::new("sh")
+                .arg("-c")
+                .arg(healthcheck)
+                .current_dir(&self.workspace.path)
+                // Run the check with the same resolved environment the app got,
+                // so it can reach the app's (possibly auto-allocated) port.
+                .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .output()
+                .await?;
+
+            if output.status.success() {
+                info!("Service {} is healthy", name);
+                return Ok(Some(ReadyOutcome::Ready));
+            }
+
+            debug!("Health check for {} failed, retrying...", name);
+            Ok(None)
+        })
+        .await
     }
 
     /// Classify why a freshly-spawned `run=` process exited by scanning its
@@ -1964,40 +1977,24 @@ impl ServiceManager {
 
         // Wait for health check if specified
         if let Some(ref healthcheck) = service.healthcheck {
-            let timeout_secs = service.ready_timeout_secs.unwrap_or(60);
-            info!(
-                "Waiting for {} to be healthy (timeout: {}s)",
-                name, timeout_secs
-            );
+            let timeout_dur = Duration::from_secs(service.ready_timeout_secs.unwrap_or(60));
+            wait_until_ready(name, timeout_dur, Duration::from_secs(2), async || {
+                let output = TokioCommand::new("sh")
+                    .arg("-c")
+                    .arg(healthcheck)
+                    .current_dir(&self.workspace.path)
+                    .output()
+                    .await?;
 
-            let result = timeout(Duration::from_secs(timeout_secs), async {
-                loop {
-                    let output = TokioCommand::new("sh")
-                        .arg("-c")
-                        .arg(healthcheck)
-                        .current_dir(&self.workspace.path)
-                        .output()
-                        .await?;
-
-                    if output.status.success() {
-                        info!("Service {} is healthy", name);
-                        return Ok::<_, anyhow::Error>(());
-                    }
-
-                    debug!("Health check for {} failed, retrying...", name);
-                    sleep(Duration::from_secs(2)).await;
+                if output.status.success() {
+                    info!("Service {} is healthy", name);
+                    return Ok(Some(()));
                 }
-            })
-            .await;
 
-            match result {
-                Ok(inner) => inner?,
-                Err(_) => bail!(
-                    "Service {} failed to become healthy within {}s",
-                    name,
-                    timeout_secs
-                ),
-            }
+                debug!("Health check for {} failed, retrying...", name);
+                Ok(None)
+            })
+            .await?;
         }
 
         Ok((
@@ -3058,5 +3055,58 @@ image=redis:7
             .map(|s| s.as_str())
             .collect();
         assert_eq!(teardown, ["app", "redis", "postgres"]);
+    }
+
+    #[tokio::test]
+    async fn wait_until_ready_returns_the_first_some_after_polling() {
+        let mut calls = 0;
+        let out: i32 = wait_until_ready(
+            "svc",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            async || {
+                calls += 1;
+                // Pend twice, then become ready with a value.
+                if calls >= 3 { Ok(Some(42)) } else { Ok(None) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, 42);
+        assert_eq!(calls, 3, "probe should be polled until it returns Some");
+    }
+
+    #[tokio::test]
+    async fn wait_until_ready_times_out_with_one_lowercase_message() {
+        // A probe that never becomes ready must time out with the single,
+        // lowercase "service ... failed to become healthy" message shared by
+        // every readiness path (regression for the casing split in #19).
+        let err = wait_until_ready::<()>(
+            "svc",
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+            async || Ok(None),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "service svc failed to become healthy within 0s"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_until_ready_propagates_a_probe_error() {
+        // An `Err` from the probe aborts immediately rather than waiting out the
+        // timeout.
+        let err = wait_until_ready::<()>(
+            "svc",
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            async || anyhow::bail!("probe blew up"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("probe blew up"), "got: {err}");
     }
 }
