@@ -2,7 +2,7 @@
 
 use crate::parser::{EphFile, PortMapping, Service, ServiceSource, resolve_interpolations};
 use crate::workspace::Workspace;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bollard::Docker;
 use bollard::models::{ContainerCreateBody, ContainerSummaryStateEnum, HostConfig, PortBinding};
 use bollard::query_parameters::{
@@ -464,6 +464,27 @@ fn allocate_ports(
 /// service is a managed app whose process eph may re-launch on a fresh port.
 fn has_auto_port(declared: &[PortMapping]) -> bool {
     declared.iter().any(|p| p.auto)
+}
+
+/// Split a `command=` override into an argv vector, or `None` when the service
+/// declares no override.
+///
+/// `command=` is freeform user input from the `.eph` file, so a malformed value
+/// (most commonly an unbalanced quote) is a parse error, surfaced here at
+/// startup with a message naming the service. The previous behavior fell back
+/// to passing the entire unparsed string as a single argument, which made the
+/// container fail later with a confusing error far from the real cause; failing
+/// closed matches the repo's parse-don't-validate posture.
+fn parse_command_override(
+    name: &str,
+    command_override: Option<&str>,
+) -> Result<Option<Vec<String>>> {
+    command_override
+        .map(|c| {
+            shell_words::split(c)
+                .map_err(|e| anyhow!("invalid command override for service '{}': {}", name, e))
+        })
+        .transpose()
 }
 
 /// Poll `probe` until it yields a result or `timeout_dur` elapses, sleeping
@@ -1125,11 +1146,9 @@ impl DockerClient {
             ..Default::default()
         };
 
-        // Handle command override
-        let cmd = service
-            .command_override
-            .as_ref()
-            .map(|c| shell_words::split(c).unwrap_or_else(|_| vec![c.clone()]));
+        // Handle command override. A malformed value fails here, at startup,
+        // with a clear message (see `parse_command_override`).
+        let cmd = parse_command_override(&service.name, service.command_override.as_deref())?;
 
         let config = ContainerCreateBody {
             image: Some(image.to_string()),
@@ -2770,6 +2789,41 @@ mod tests {
         assert!(has_auto_port(&[port(None, 3000), auto_port(Some("api"))]));
         assert!(!has_auto_port(&[port(None, 3000), port(Some("api"), 4000)]));
         assert!(!has_auto_port(&[]));
+    }
+
+    #[test]
+    fn parse_command_override_splits_and_passes_through_none() {
+        // No override declared.
+        assert_eq!(parse_command_override("web", None).unwrap(), None);
+
+        // A well-formed override is split into argv, honoring quoting.
+        assert_eq!(
+            parse_command_override("web", Some(r#"sh -c "echo hi""#)).unwrap(),
+            Some(vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo hi".to_string()
+            ])
+        );
+
+        // An empty override parses to an empty argv (no tokens), not an error.
+        assert_eq!(
+            parse_command_override("web", Some("")).unwrap(),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn parse_command_override_fails_closed_on_unbalanced_quote() {
+        // Regression for #15: an unbalanced quote must error at startup, naming
+        // the service, rather than being smuggled through as one argv element.
+        let err = parse_command_override("web", Some(r#"sh -c "echo hi"#))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("invalid command override for service 'web':"),
+            "got: {err}"
+        );
     }
 
     #[test]
