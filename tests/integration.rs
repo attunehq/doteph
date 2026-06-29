@@ -16,6 +16,80 @@ use tokio::time::sleep;
 mod common;
 use common::{TestWorkspace, extract_port, parse_env_json};
 
+#[cfg(unix)]
+fn hook_touch_marker() -> &'static str {
+    "touch post-start-ran"
+}
+
+#[cfg(windows)]
+fn hook_touch_marker() -> &'static str {
+    "type nul > post-start-ran"
+}
+
+#[cfg(unix)]
+fn hook_write_env_lines() -> &'static str {
+    r#"printf '%s\n%s\n%s\n' "$REDIS_URL" "$EPH_REDIS_PORT" "$EPH_WORKSPACE_ID" > hook-env"#
+}
+
+#[cfg(windows)]
+fn hook_write_env_lines() -> &'static str {
+    "(echo %REDIS_URL%& echo %EPH_REDIS_PORT%& echo %EPH_WORKSPACE_ID%) > hook-env"
+}
+
+#[cfg(unix)]
+fn hook_write_redis_url(file: &str) -> String {
+    format!(r#"printf '%s' "$REDIS_URL" > {file}"#)
+}
+
+#[cfg(windows)]
+fn hook_write_redis_url(file: &str) -> String {
+    format!(r#"echo %REDIS_URL%> {file}"#)
+}
+
+#[cfg(unix)]
+fn hook_append_x() -> &'static str {
+    "printf 'x' >> ran-count"
+}
+
+#[cfg(windows)]
+fn hook_append_x() -> &'static str {
+    "echo x>> ran-count"
+}
+
+#[cfg(unix)]
+fn hook_success() -> &'static str {
+    "true"
+}
+
+#[cfg(windows)]
+fn hook_success() -> &'static str {
+    "ver >NUL"
+}
+
+#[cfg(unix)]
+fn print_env_command(name: &str) -> Vec<&str> {
+    vec!["run", "printenv", name]
+}
+
+#[cfg(windows)]
+fn print_env_command(name: &str) -> Vec<&'static str> {
+    match name {
+        "REDIS_URL" => vec!["run", "cmd", "/C", "echo %REDIS_URL%"],
+        "EPH_REDIS_PORT" => vec!["run", "cmd", "/C", "echo %EPH_REDIS_PORT%"],
+        _ => panic!("unsupported Windows test env var: {name}"),
+    }
+}
+
+#[cfg(unix)]
+fn exit_7_command() -> Vec<&'static str> {
+    vec!["run", "sh", "-c", "exit 7"]
+}
+
+#[cfg(windows)]
+fn exit_7_command() -> Vec<&'static str> {
+    vec!["run", "cmd", "/C", "exit /B 7"]
+}
+
 // ============================================================================
 // Check Functions
 // ============================================================================
@@ -353,21 +427,17 @@ DEBUG=true
 
 #[tokio::test]
 async fn post_start_hook_runs() {
-    // The hook writes its marker with a path relative to the workspace. eph
-    // runs hooks with the working directory set to the workspace, so the marker
-    // lands in `ws.path()`. Using a relative path keeps the `sh -c` command free
-    // of host-absolute paths, which on Windows would contain backslashes that
-    // the POSIX shell would interpret as escapes.
-    let ws = TestWorkspace::new(
+    let ws = TestWorkspace::new(&format!(
         r#"
 [redis]
 image=redis:7-alpine
 port=6379
-post-start=touch post-start-ran
+post-start={}
 
-REDIS_URL=redis://localhost:${redis.port}
+REDIS_URL=redis://localhost:${{redis.port}}
 "#,
-    );
+        hook_touch_marker()
+    ));
 
     // Start service
     ws.eph_ok(&["up", "redis"]).await;
@@ -386,16 +456,17 @@ REDIS_URL=redis://localhost:${redis.port}
 /// variables.
 #[tokio::test]
 async fn post_start_hook_receives_resolved_env() {
-    let ws = TestWorkspace::new(
+    let ws = TestWorkspace::new(&format!(
         r#"
 [redis]
 image=redis:7-alpine
 port=6379
-post-start=printf '%s\n%s\n%s\n' "$REDIS_URL" "$EPH_REDIS_PORT" "$EPH_WORKSPACE_ID" > hook-env
+post-start={}
 
-REDIS_URL=redis://localhost:${redis.port}
+REDIS_URL=redis://localhost:${{redis.port}}
 "#,
-    );
+        hook_write_env_lines()
+    ));
 
     ws.eph_ok(&["up", "redis"]).await;
     sleep(Duration::from_secs(1)).await;
@@ -429,7 +500,7 @@ async fn post_start_resolves_cross_service_refs() {
     // `worker`'s post-start reads REDIS_URL, which interpolates `redis`'s port.
     // Service iteration order is not deterministic, so under per-service hook
     // timing this would intermittently see an unresolved `${redis.port}`.
-    let ws = TestWorkspace::new(
+    let ws = TestWorkspace::new(&format!(
         r#"
 [redis]
 image=redis:7-alpine
@@ -438,17 +509,19 @@ port=6379
 [worker]
 image=redis:7-alpine
 port=6379
-post-start=printf '%s' "$REDIS_URL" > worker-saw
+post-start={}
 
-REDIS_URL=redis://localhost:${redis.port}
+REDIS_URL=redis://localhost:${{redis.port}}
 "#,
-    );
+        hook_write_redis_url("worker-saw")
+    ));
 
     ws.eph_ok(&["up"]).await;
     sleep(Duration::from_secs(1)).await;
 
     let captured = std::fs::read_to_string(ws.path().join("worker-saw"))
         .expect("worker post-start did not run");
+    let captured = captured.trim_end_matches(['\r', '\n']);
     assert!(
         !captured.contains("${"),
         "cross-service ref not resolved in post-start: {captured}"
@@ -457,7 +530,7 @@ REDIS_URL=redis://localhost:${redis.port}
     let env_map = ws.env_json().await;
     let redis_url = env_map.get("REDIS_URL").expect("REDIS_URL not found");
     assert_eq!(
-        &captured, redis_url,
+        captured, redis_url,
         "worker hook saw a stale or unresolved REDIS_URL"
     );
 
@@ -468,14 +541,15 @@ REDIS_URL=redis://localhost:${redis.port}
 /// restarted -- not only on fresh creation.
 #[tokio::test]
 async fn post_start_reruns_on_restart() {
-    let ws = TestWorkspace::new(
+    let ws = TestWorkspace::new(&format!(
         r#"
 [redis]
 image=redis:7-alpine
 port=6379
-post-start=printf 'x' >> ran-count
+post-start={}
 "#,
-    );
+        hook_append_x()
+    ));
 
     // Fresh create -> post-start runs once.
     ws.eph_ok(&["up", "redis"]).await;
@@ -488,7 +562,7 @@ post-start=printf 'x' >> ran-count
 
     let count = std::fs::read_to_string(ws.path().join("ran-count")).unwrap_or_default();
     assert_eq!(
-        count.len(),
+        count.matches('x').count(),
         2,
         "post-start should run on both create and restart, got {count:?}"
     );
@@ -500,14 +574,15 @@ post-start=printf 'x' >> ran-count
 /// post-start hooks.
 #[tokio::test]
 async fn up_skip_hooks_does_not_run_post_start() {
-    let ws = TestWorkspace::new(
+    let ws = TestWorkspace::new(&format!(
         r#"
 [redis]
 image=redis:7-alpine
 port=6379
-post-start=touch post-start-ran
+post-start={}
 "#,
-    );
+        hook_touch_marker()
+    ));
 
     ws.eph_ok(&["up", "--skip-hooks", "redis"]).await;
     sleep(Duration::from_secs(1)).await;
@@ -592,12 +667,15 @@ pre-stop=exit 1
     // rather than leaking the container).
     ws.write_file(
         ".eph",
-        r#"
+        &format!(
+            r#"
 [redis]
 image=redis:7-alpine
 port=6379
-pre-stop=true
+pre-stop={}
 "#,
+            hook_success()
+        ),
     );
     ws.eph_ok(&["down"]).await;
 }
@@ -684,16 +762,17 @@ port=6379
 /// A pre-stop hook should receive the same resolved environment as post-start.
 #[tokio::test]
 async fn pre_stop_hook_receives_resolved_env() {
-    let ws = TestWorkspace::new(
+    let ws = TestWorkspace::new(&format!(
         r#"
 [redis]
 image=redis:7-alpine
 port=6379
-pre-stop=printf '%s' "$REDIS_URL" > pre-stop-env
+pre-stop={}
 
-REDIS_URL=redis://localhost:${redis.port}
+REDIS_URL=redis://localhost:${{redis.port}}
 "#,
-    );
+        hook_write_redis_url("pre-stop-env")
+    ));
 
     ws.eph_ok(&["up", "redis"]).await;
     sleep(Duration::from_secs(1)).await;
@@ -710,6 +789,7 @@ REDIS_URL=redis://localhost:${redis.port}
 
     let captured = std::fs::read_to_string(ws.path().join("pre-stop-env"))
         .expect("pre-stop hook did not write pre-stop-env");
+    let captured = captured.trim_end_matches(['\r', '\n']);
     assert_eq!(
         captured, redis_url,
         "pre-stop hook saw a different REDIS_URL"
@@ -744,12 +824,13 @@ REDIS_URL=redis://localhost:${redis.port}
         .expect("REDIS_URL not found")
         .clone();
 
-    // The command is executed directly (no shell), so use `printenv` to read a
-    // single variable rather than relying on shell expansion.
-    let out = ws.eph_ok(&["run", "printenv", "REDIS_URL"]).await;
+    // The command is executed directly (no shell), so use the platform's
+    // environment-printing command rather than relying on eph to expand a shell
+    // expression.
+    let out = ws.eph_ok(&print_env_command("REDIS_URL")).await;
     assert_eq!(out.trim(), redis_url, "eph run did not inject REDIS_URL");
 
-    let port_out = ws.eph_ok(&["run", "printenv", "EPH_REDIS_PORT"]).await;
+    let port_out = ws.eph_ok(&print_env_command("EPH_REDIS_PORT")).await;
     let port = extract_port(&redis_url).expect("no port in REDIS_URL");
     assert_eq!(port_out.trim(), port.to_string(), "EPH_REDIS_PORT mismatch");
 
@@ -768,8 +849,8 @@ port=6379
     );
 
     // No `up` needed: `eph run` resolves whatever is running (nothing here) and
-    // still execs the command. `sh -c 'exit 7'` must surface as exit code 7.
-    let output = ws.eph(&["run", "sh", "-c", "exit 7"]).await;
+    // still execs the command. The child's exit code must surface unchanged.
+    let output = ws.eph(&exit_7_command()).await;
     assert_eq!(
         output.status.code(),
         Some(7),
