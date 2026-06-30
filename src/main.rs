@@ -70,6 +70,34 @@ enum Commands {
         skip_hooks: bool,
     },
 
+    /// Run the dev stack in the foreground for a Claude Desktop preview server.
+    ///
+    /// Brings every service up (running `post-start` hooks, e.g. seeding), then
+    /// foregrounds a `run=` service with eph's own stdin, stdout, and stderr
+    /// wired through to it, staying attached until it is stopped. On stop it tears
+    /// the stack down: `eph down` by default (keeps containers and volume data for
+    /// a fast restart), or `eph clean` with `--clean` (a full reset that also
+    /// drops the named-volume data).
+    ///
+    /// It is built for `.claude/launch.json`, whose preview configuration runs a
+    /// single foreground command and offers no separate setup or teardown hook:
+    /// point `runtimeExecutable` at `eph` with `runtimeArgs` of `["dev"]`. When
+    /// the preview server assigns the host port and passes it as `$PORT`, `eph
+    /// dev` binds the foreground app to that exact port so the preview connects.
+    ///
+    /// With no SERVICE the sole `run=` service is foregrounded; name one
+    /// explicitly when the `.eph` file defines more than one.
+    Dev {
+        /// The `run=` service to foreground (defaults to the only one).
+        #[arg(value_name = "SERVICE")]
+        service: Option<String>,
+
+        /// Tear down with `eph clean` (drop volumes and their data) instead of
+        /// the default `eph down` (keep them for a fast restart).
+        #[arg(long)]
+        clean: bool,
+    },
+
     /// Show status of services
     Status,
 
@@ -196,6 +224,7 @@ async fn main() -> Result<ExitCode> {
             .await
             .map(|()| ExitCode::SUCCESS),
         Commands::Clean { skip_hooks } => cmd_clean(skip_hooks).await.map(|()| ExitCode::SUCCESS),
+        Commands::Dev { service, clean } => cmd_dev(service, clean).await,
         Commands::Status => cmd_status().await.map(|()| ExitCode::SUCCESS),
         Commands::Env { format } => cmd_env(&format).await.map(|()| ExitCode::SUCCESS),
         Commands::Run { command } => cmd_run(command).await,
@@ -312,6 +341,195 @@ async fn cmd_clean(skip_hooks: bool) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Why [`cmd_dev`] stopped blocking in the foreground.
+enum DevStop {
+    /// A shutdown signal arrived: the preview server stopped us, or Ctrl-C.
+    Signal,
+    /// The foregrounded app process exited on its own (it crashed or finished),
+    /// carrying the wait result so the message can name how it ended.
+    AppExited(std::io::Result<std::process::ExitStatus>),
+}
+
+/// `eph dev`: bring the whole stack up, foreground a `run=` service for a Claude
+/// Desktop preview server, and tear it down when stopped.
+///
+/// The foreground app inherits eph's stdin/stdout/stderr (so it is interactive
+/// and its output streams straight through), and eph holds its process handle so
+/// it can wait on it directly. Returns a non-zero exit when the app exits on its
+/// own, so the preview server sees the dev server went down; a clean stop signal
+/// tears the stack down and exits zero.
+async fn cmd_dev(service: Option<String>, clean: bool) -> Result<ExitCode> {
+    let workspace = Workspace::find_from_cwd()?;
+    let eph = load_eph_file(&workspace)?;
+
+    // Decide which run= service to foreground before touching Docker, so a
+    // misconfigured request fails fast with a clear message.
+    let foreground = select_foreground_service(&eph, service.as_deref())?;
+
+    let mut manager = ServiceManager::new(workspace).await?;
+
+    // A preview server (Claude Desktop) assigns the host port and passes it as
+    // $PORT; bind the foreground app to exactly that port so the preview reaches
+    // it rather than a fresh random one.
+    if let Some(port) = preview_port() {
+        manager.pin_default_port(&foreground, port);
+    }
+
+    // Setup, in two steps so the foreground app inherits eph's stdio. First bring
+    // the backing services up (no hooks yet); then start the app in the
+    // foreground. `start_services` with an empty filter would start everything,
+    // so only call it when there is at least one backing service.
+    let backing: Vec<String> = eph
+        .services
+        .keys()
+        .filter(|name| **name != foreground)
+        .cloned()
+        .collect();
+    if !backing.is_empty() {
+        manager.start_services(&eph, &backing, true).await?;
+    }
+    let (fg, mut child) = manager.start_foreground(&eph, &foreground).await?;
+
+    // Everything is healthy now, so run post-start hooks (seeding) for every
+    // service, preserving the `eph up` rule that a hook may reference any
+    // service's assigned port.
+    manager.run_all_post_start(&eph).await?;
+
+    // eph's own chrome goes to stderr so the app keeps stdout to itself.
+    if let Some(port) = fg.port() {
+        eprintln!();
+        eprintln!("Serving '{foreground}' on http://localhost:{port}");
+    }
+    let teardown = if clean { "eph clean" } else { "eph down" };
+    eprintln!("Press Ctrl-C to stop ({teardown} on exit)");
+
+    // Block until either a stop signal or the app exiting on its own. `child.wait`
+    // reaps the process, so its exit is observed reliably (no zombie races).
+    let stop = tokio::select! {
+        () = wait_for_shutdown() => DevStop::Signal,
+        result = child.wait() => DevStop::AppExited(result),
+    };
+
+    match stop {
+        DevStop::Signal => {
+            eprintln!();
+            if clean {
+                manager.clean(&eph, false).await?;
+                eprintln!("Workspace cleaned");
+            } else {
+                manager.stop_all(&eph, false, false).await?;
+                eprintln!("Services stopped");
+            }
+            // Reap the foreground child we just tore down.
+            let _ = child.wait().await;
+            Ok(ExitCode::SUCCESS)
+        }
+        DevStop::AppExited(result) => {
+            // The app died rather than being stopped. Leave the stack up so its
+            // state survives for inspection, and report failure so the preview
+            // server sees the dev server went down.
+            let how = match result {
+                Ok(status) => format!("exited ({status})"),
+                Err(e) => format!("could not be waited on ({e})"),
+            };
+            eprintln!(
+                "dev server '{foreground}' {how}; backing services left up (`eph down` to stop)"
+            );
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// Read `$PORT` as a preview-server-assigned host port, if set and valid.
+///
+/// Claude Desktop's preview server picks a free port and passes it as `PORT`
+/// (its `autoPort` behavior); an empty or non-numeric value is ignored so a
+/// stray environment variable cannot wedge `eph dev` startup.
+fn preview_port() -> Option<u16> {
+    std::env::var("PORT").ok()?.trim().parse().ok()
+}
+
+/// Choose the `run=` service `eph dev` foregrounds.
+///
+/// With an explicit `requested` name, that service must exist and be a `run=`
+/// service. Otherwise the sole `run=` service is used; zero or several are an
+/// error whose message tells the caller how to proceed.
+fn select_foreground_service(eph: &EphFile, requested: Option<&str>) -> Result<String> {
+    if let Some(name) = requested {
+        let service = eph
+            .services
+            .get(name)
+            .with_context(|| format!("unknown service: {name}"))?;
+        if !matches!(service.source, ServiceSource::Command(_)) {
+            anyhow::bail!(
+                "service '{name}' is not a run= service, so `eph dev` cannot foreground it \
+                 (it runs a container, not a host process)"
+            );
+        }
+        return Ok(name.to_string());
+    }
+
+    let run_services: Vec<&String> = eph
+        .services
+        .iter()
+        .filter(|(_, svc)| matches!(svc.source, ServiceSource::Command(_)))
+        .map(|(name, _)| name)
+        .collect();
+
+    match run_services.as_slice() {
+        [] => anyhow::bail!(
+            "`eph dev` foregrounds a run= service, but this .eph defines none \
+             (add a [service] with run=)"
+        ),
+        [only] => Ok((*only).to_string()),
+        many => {
+            let names = many
+                .iter()
+                .map(|n| n.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "this .eph defines several run= services ({names}); \
+                 name the one to foreground: `eph dev <service>`"
+            )
+        }
+    }
+}
+
+/// Block until a shutdown signal arrives.
+///
+/// A Claude Desktop preview server stops the dev command by signaling it; this
+/// catches the platform's stop signals so `eph dev` can tear the stack down
+/// before exiting. On Unix that is SIGINT (Ctrl-C) and SIGTERM; on Windows it is
+/// Ctrl-C, console close, and system shutdown. A hard kill (SIGKILL /
+/// `TerminateProcess`) cannot be caught, so teardown is skipped and the stack is
+/// left up, recoverable with `eph down`.
+#[cfg(unix)]
+async fn wait_for_shutdown() {
+    use tokio::signal::unix::{SignalKind, signal};
+    // The handlers only fail to install on an unsupported platform or fd
+    // exhaustion, both fatal for a foreground server, so surface them as panics.
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    let mut interrupt = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = interrupt.recv() => {}
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_shutdown() {
+    use tokio::signal::windows::{ctrl_c, ctrl_close, ctrl_shutdown};
+    let mut interrupt = ctrl_c().expect("install Ctrl-C handler");
+    let mut close = ctrl_close().expect("install console-close handler");
+    let mut shutdown = ctrl_shutdown().expect("install shutdown handler");
+    tokio::select! {
+        _ = interrupt.recv() => {}
+        _ = close.recv() => {}
+        _ = shutdown.recv() => {}
+    }
 }
 
 async fn cmd_status() -> Result<()> {
@@ -706,4 +924,67 @@ fn load_eph_file(workspace: &Workspace) -> Result<EphFile> {
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     parser::parse(&contents).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_eph(input: &str) -> EphFile {
+        parser::parse(input).expect("test .eph should parse")
+    }
+
+    #[test]
+    fn dev_foreground_defaults_to_the_sole_run_service() {
+        let eph = parse_eph(
+            "[postgres]\nimage=postgres:16\nport=5432\n[web]\nrun=npm run dev\nport=auto\n",
+        );
+        assert_eq!(select_foreground_service(&eph, None).unwrap(), "web");
+    }
+
+    #[test]
+    fn dev_foreground_picks_the_named_run_service() {
+        let eph = parse_eph("[web]\nrun=npm run dev\nport=auto\n[worker]\nrun=npm run worker\n");
+        assert_eq!(
+            select_foreground_service(&eph, Some("worker")).unwrap(),
+            "worker"
+        );
+    }
+
+    #[test]
+    fn dev_foreground_rejects_a_container_service() {
+        let eph = parse_eph("[postgres]\nimage=postgres:16\nport=5432\n[web]\nrun=npm run dev\n");
+        let err = select_foreground_service(&eph, Some("postgres"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a run= service"), "got: {err}");
+    }
+
+    #[test]
+    fn dev_foreground_rejects_an_unknown_service() {
+        let eph = parse_eph("[web]\nrun=npm run dev\n");
+        let err = select_foreground_service(&eph, Some("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown service"), "got: {err}");
+    }
+
+    #[test]
+    fn dev_foreground_requires_a_run_service() {
+        let eph = parse_eph("[postgres]\nimage=postgres:16\nport=5432\n");
+        let err = select_foreground_service(&eph, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("defines none"), "got: {err}");
+    }
+
+    #[test]
+    fn dev_foreground_is_ambiguous_with_several_run_services() {
+        let eph = parse_eph("[web]\nrun=npm run dev\n[worker]\nrun=npm run worker\n");
+        let err = select_foreground_service(&eph, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("several run= services"), "got: {err}");
+        assert!(err.contains("web") && err.contains("worker"), "got: {err}");
+    }
 }

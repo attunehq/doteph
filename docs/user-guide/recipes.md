@@ -126,6 +126,86 @@ healthcheck=pg_isready -U dev
 These run only when the data volume is empty, so `eph clean` (which deletes the
 named volume) is how you trigger a re-seed.
 
+## Claude Desktop preview servers
+
+[Claude Desktop](https://code.claude.com/docs/en/desktop#configure-preview-servers)
+launches your dev server from `.claude/launch.json` and watches its port for the
+in-app preview. Each configuration runs a single foreground command and offers no
+separate setup or teardown hook, so backing services and seeding have nowhere to
+hang off. `eph dev` is one foreground process that brings the stack up, runs
+`post-start` (your seeding), foregrounds the app, and tears everything down when
+the preview server stops it.
+
+Model the app as a `run=` service with `port=auto`, alongside its backing
+services and seeding:
+
+```ini
+[postgres]
+image=postgres:16-alpine
+port=5432
+env.POSTGRES_USER=dev
+env.POSTGRES_PASSWORD=dev
+env.POSTGRES_DB=myapp
+healthcheck=pg_isready -U dev
+
+[web]
+run=npm run dev
+port=auto
+env.PORT=${web.port}
+healthcheck=curl -sf http://localhost:${web.port}/healthz
+post-start=npm run db:migrate
+
+DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
+```
+
+Then point the preview server at `eph dev`:
+
+```jsonc
+// .claude/launch.json
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web",
+      "runtimeExecutable": "eph",
+      "runtimeArgs": ["dev"],
+      "port": 3000,
+      "autoPort": true
+    }
+  ]
+}
+```
+
+How the pieces line up:
+
+- **`autoPort` and the port.** The preview server picks a free host port and
+  passes it as `$PORT`. `eph dev` binds the foreground app's `port=auto` to that
+  exact port, so the app's `${web.port}` (and the `healthcheck` and any
+  `${web.port}` env) all resolve to the port the preview is watching. Do not give
+  the app a fixed port as well.
+- **Setup runs once per launch.** `eph dev` does `eph up` first, so postgres is
+  healthy and `post-start` (migrate/seed) has run before the app starts.
+- **The app is interactive.** `eph dev` wires its own stdin, stdout, and stderr
+  straight through to the app, so the dev server's output reaches the preview
+  console live and anything the preview server writes to stdin reaches the app.
+  eph's own startup lines go to stderr to stay out of the app's stdout.
+- **Teardown on stop.** When Claude stops the preview server, `eph dev` runs
+  `eph down` (keeps the database for a fast relaunch). Claude Desktop restarts the
+  preview server during a session, so `down` is the default: a `clean` per restart
+  would re-create and re-seed every time. Use `eph dev --clean` (`runtimeArgs:
+  ["dev", "--clean"]`) only when you want a pristine database on every launch.
+- **`eph` must be on the app's PATH.** The desktop app does not always inherit
+  your shell `PATH` (notably a macOS Dock/Finder launch), so put `eph` somewhere
+  the app sees or use an absolute path in `runtimeExecutable`.
+
+If you would rather keep the app *out* of eph and let `launch.json` run it
+directly, model only the backing services in `.eph`, run `eph up` yourself, and
+launch the app through `eph run` so it still gets the resolved environment:
+`"runtimeExecutable": "eph", "runtimeArgs": ["run", "npm", "run", "dev"]`. Here
+`launch.json` owns the app's port and `eph run` passes `$PORT` through, but setup
+(`eph up`) and teardown (`eph down`) are no longer automatic, which is the manual
+work `eph dev` does for you.
+
 ## Multiple checkouts side by side
 
 This is what `eph` is built for. Clone the same repo twice:
