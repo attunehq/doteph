@@ -1420,20 +1420,57 @@ impl ServiceManager {
         }
 
         for name in &targets {
-            let service = &eph.services[*name];
-            if service.post_start.is_empty() {
-                continue;
-            }
-            info!("Running post-start hooks for {}", name);
-            let env = self.hook_env(eph, &resolved, service);
-            for cmd in &service.post_start {
-                self.run_hook(cmd, &env)
-                    .await
-                    .with_context(|| format!("post-start hook failed for service '{}'", name))?;
-            }
+            self.run_service_post_start(eph, &resolved, &eph.services[*name])
+                .await?;
         }
 
         Ok(running)
+    }
+
+    /// Run one service's `post-start` hooks against an already-resolved set of
+    /// running services.
+    ///
+    /// A no-op when the service declares no hooks. Shared by the `eph up` second
+    /// phase and by [`run_all_post_start`](Self::run_all_post_start), so the
+    /// seeding semantics (resolved environment injected, a failing hook aborts)
+    /// are identical however the service was brought up.
+    async fn run_service_post_start(
+        &self,
+        eph: &EphFile,
+        running: &HashMap<String, RunningService>,
+        service: &Service,
+    ) -> Result<()> {
+        if service.post_start.is_empty() {
+            return Ok(());
+        }
+        info!("Running post-start hooks for {}", service.name);
+        let env = self.hook_env(eph, running, service);
+        for cmd in &service.post_start {
+            self.run_hook(cmd, &env).await.with_context(|| {
+                format!("post-start hook failed for service '{}'", service.name)
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Run every declared service's `post-start` hooks once, after all services
+    /// are healthy.
+    ///
+    /// `eph dev` calls this once the backing services and the foreground app are
+    /// all up, preserving the `eph up` guarantee that a hook may reference any
+    /// service's assigned port (a seed whose `DATABASE_URL` interpolates
+    /// `${postgres.port}`, say). Hooks run in declaration order against a single
+    /// resolved snapshot of the running services.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any `post-start` hook fails.
+    pub async fn run_all_post_start(&self, eph: &EphFile) -> Result<()> {
+        let running = self.status().await?;
+        for service in eph.services.values() {
+            self.run_service_post_start(eph, &running, service).await?;
+        }
+        Ok(())
     }
 
     /// Start a single service, reusing an already-running instance if present.
@@ -1704,7 +1741,7 @@ impl ServiceManager {
                 .as_deref()
                 .map(|hc| resolve_against(hc, &running));
 
-            let (child, pid) = self.spawn_command(name, cmd, &env)?;
+            let (mut child, pid) = self.spawn_command(name, cmd, &env, false)?;
             info!(
                 "Started {} with PID {} (attempt {}/{})",
                 name, pid, attempt, max_attempts
@@ -1726,7 +1763,7 @@ impl ServiceManager {
                     healthcheck.as_deref(),
                     service.ready_timeout_secs,
                     &env,
-                    child,
+                    &mut child,
                     has_auto,
                 )
                 .await?
@@ -1786,45 +1823,64 @@ impl ServiceManager {
         bail!("service '{}' could not be started", name)
     }
 
-    /// Spawn a `run=` command with `env` overlaid on eph's environment, capturing
-    /// its stdout/stderr to the service's per-run log file.
+    /// Spawn a `run=` command with `env` overlaid on eph's environment.
     ///
     /// Returns the live child -- so the caller can watch for an early exit -- and
-    /// its PID. The child is not killed on drop, so once it is ready the caller
-    /// drops the handle and the process keeps running detached.
+    /// its PID. The child is not killed on drop.
     ///
-    /// Output is captured to a file rather than inherited from eph for two
-    /// reasons: it is what `eph logs` reads, and it avoids a pipe-inheritance
-    /// hang where a long-lived service holding eph's stdout/stderr write-ends
-    /// would block anything capturing eph's output after `eph up` returns. The
-    /// file is truncated per spawn so it reflects the current run; captured
-    /// output can contain secrets, so the dir and file are owner-only (0700/0600)
-    /// on Unix.
+    /// `foreground` selects the stdio wiring. Background services (the `eph up`
+    /// path) get a null stdin and capture stdout/stderr to a per-run file; the
+    /// foreground service (`eph dev`) inherits eph's own stdin/stdout/stderr so it
+    /// is interactive and its output streams straight through. The per-branch
+    /// comments explain why the background path must use a file and why that
+    /// reasoning does not bind `eph dev`.
     fn spawn_command(
         &self,
         name: &str,
         cmd: &str,
         env: &[(String, String)],
+        foreground: bool,
     ) -> Result<(tokio::process::Child, NonZeroU32)> {
-        let log_path = self.workspace.log_file_path(name)?;
-        if let Some(parent) = log_path.parent() {
-            create_private_dir(parent).with_context(|| {
-                format!("failed to create logs directory: {}", parent.display())
-            })?;
-        }
-        let log_file = create_private_log_file(&log_path)
-            .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
-        let log_file_err = log_file
-            .try_clone()
-            .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
-
         let mut command = proc::shell_command(cmd);
         command
             .current_dir(&self.workspace.path)
-            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log_file))
-            .stderr(Stdio::from(log_file_err));
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+
+        if foreground {
+            // `eph dev` hands the app eph's own stdin, stdout, and stderr so it is
+            // fully interactive and its output streams straight to the terminal or
+            // the preview server. The pipe-inheritance hang that forces the
+            // background path below to a file cannot happen here: eph stays
+            // attached, holding the child until teardown, rather than returning
+            // while the service keeps eph's stdout write-end open.
+            command
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+        } else {
+            // Capture stdout/stderr to a per-run file rather than inheriting eph's,
+            // for two reasons: it is what `eph logs` reads, and it avoids a
+            // pipe-inheritance hang where a long-lived service holding eph's
+            // stdout/stderr write-ends would block anything capturing eph's output
+            // after `eph up` returns. The file is truncated per spawn so it
+            // reflects the current run; captured output can contain secrets, so the
+            // dir and file are owner-only (0700/0600) on Unix.
+            let log_path = self.workspace.log_file_path(name)?;
+            if let Some(parent) = log_path.parent() {
+                create_private_dir(parent).with_context(|| {
+                    format!("failed to create logs directory: {}", parent.display())
+                })?;
+            }
+            let log_file = create_private_log_file(&log_path)
+                .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
+            let log_file_err = log_file
+                .try_clone()
+                .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log_file))
+                .stderr(Stdio::from(log_file_err));
+        }
         // Head the shell in its own process group (Unix) so teardown can signal
         // the whole tree it forks, not just this wrapper PID. A compound `run=`
         // command (`a && b`, a pipeline, a backgrounded child) otherwise leaves
@@ -1867,7 +1923,7 @@ impl ServiceManager {
         healthcheck: Option<&str>,
         ready_timeout_secs: Option<u64>,
         env: &[(String, String)],
-        mut child: tokio::process::Child,
+        child: &mut tokio::process::Child,
         detect_exit: bool,
     ) -> Result<ReadyOutcome> {
         let Some(healthcheck) = healthcheck else {
@@ -2250,6 +2306,126 @@ impl ServiceManager {
     /// file cannot be serialized or written.
     pub async fn save_state(&self) -> Result<()> {
         self.state.save(&self.workspace).await
+    }
+
+    /// Pin a `run=` service's default auto port to `port` for the next start.
+    ///
+    /// `eph dev` uses this when a Claude Desktop preview server has already
+    /// chosen the host port and passed it as `$PORT`: seeding it into the
+    /// remembered `auto_ports` makes [`start_shell_command`](Self::start_shell_command)
+    /// reuse that exact port (when it is free, which the preview server
+    /// guarantees by having picked it), so the app binds the port the preview is
+    /// watching instead of a fresh random one. It falls back to ordinary
+    /// auto-allocation if the port turns out to be taken, and is a no-op for a
+    /// fixed-port (`port=3000`) service, which has no auto port to reuse.
+    pub fn pin_default_port(&mut self, service: &str, port: u16) {
+        self.state
+            .auto_ports
+            .entry(service.to_string())
+            .or_default()
+            .insert("default".to_string(), port);
+    }
+
+    /// Start the foreground `run=` service for `eph dev`, inheriting eph's stdio.
+    ///
+    /// Unlike the backing `run=` path
+    /// ([`start_shell_command`](Self::start_shell_command)), this hands the app
+    /// eph's own stdin, stdout, and stderr, so it is fully interactive and its
+    /// output streams straight to the terminal or the preview server rather than
+    /// being captured to a log file. It returns the live child so the caller can
+    /// wait on it (and reap it) to notice when the app exits, rather than polling
+    /// a PID that a zombie would keep reading as alive.
+    ///
+    /// There is no port-conflict re-launch here (`detect_exit` is off): a
+    /// foreground app owns its streams, and when `eph dev` has pinned the preview
+    /// server's `$PORT` it must bind exactly that port, so a bind failure should
+    /// surface on the inherited stderr rather than silently retry elsewhere. Call
+    /// it after the backing services are up so the app's environment can already
+    /// interpolate their ports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `name` is not a `run=` service, the process cannot be
+    /// spawned, or it fails its healthcheck within the ready timeout.
+    pub async fn start_foreground(
+        &mut self,
+        eph: &EphFile,
+        name: &str,
+    ) -> Result<(RunningService, tokio::process::Child)> {
+        let service = eph
+            .services
+            .get(name)
+            .with_context(|| format!("unknown service: {name}"))?;
+        let ServiceSource::Command(cmd) = &service.source else {
+            bail!("service '{name}' is not a run= service, so `eph dev` cannot foreground it");
+        };
+
+        // Reuse the remembered auto port, which `eph dev` may have pinned to the
+        // preview server's $PORT (see `pin_default_port`). Snapshot the other
+        // running services so the app's env can interpolate their ports.
+        let prev_ports = self.state.auto_ports.get(name).cloned();
+        let others = self.status().await?;
+        let ports = allocate_ports(&service.ports, prev_ports.as_ref())?;
+
+        let mut running = others;
+        running.insert(
+            name.to_string(),
+            RunningService {
+                name: name.to_string(),
+                ports: ports.clone(),
+            },
+        );
+        let env = self.app_env(eph, &running, service);
+        let healthcheck = service
+            .healthcheck
+            .as_deref()
+            .map(|hc| resolve_against(hc, &running));
+
+        let (mut child, pid) = self.spawn_command(name, cmd, &env, true)?;
+        info!("Started {} (foreground) with PID {}", name, pid);
+
+        // Record before waiting so `eph status` and any teardown see the process
+        // even while it is still coming up.
+        self.state.services.insert(
+            name.to_string(),
+            ServiceStateEntry {
+                backend: Backend::Process { pid },
+                ports: ports.clone(),
+            },
+        );
+        if has_auto_port(&service.ports) {
+            self.state
+                .auto_ports
+                .insert(name.to_string(), ports.clone());
+        }
+
+        // Wait for readiness with no early-exit classification (`detect_exit =
+        // false`): there is no captured log to scan, and the foreground app does
+        // not get the port-conflict retry. A failed start drops the recorded PID
+        // so no stale entry is left behind.
+        if let Err(e) = self
+            .await_command_ready(
+                name,
+                healthcheck.as_deref(),
+                service.ready_timeout_secs,
+                &env,
+                &mut child,
+                false,
+            )
+            .await
+        {
+            self.state.services.remove(name);
+            return Err(e);
+        }
+        self.state.save(&self.workspace).await?;
+
+        Ok((
+            RunningService {
+                name: name.to_string(),
+                ports,
+            },
+            child,
+        ))
     }
 
     /// Return the services that are currently running.

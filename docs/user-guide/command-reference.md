@@ -104,6 +104,48 @@ Workspace cleaned:
 > failing hook aborts the reset before anything is removed. If a broken
 > `pre-stop` hook is wedging `clean`, pass `--skip-hooks` to reset anyway.
 
+## `eph dev [SERVICE] [--clean]`
+
+Run the whole dev stack in the foreground, built for a Claude Desktop preview
+server (see [Recipes](recipes.md#claude-desktop-preview-servers)). It brings
+every service up (running `post-start` hooks, e.g. seeding), foregrounds a
+`run=` service with eph's own stdin, stdout, and stderr wired through to it, and
+stays attached until it is stopped. On stop it tears the stack down.
+
+| Flag | Description |
+|------|-------------|
+| `--clean` | Tear down with `eph clean` (drop named volumes and their data) instead of the default `eph down` (keep them for a fast restart). |
+
+```sh
+eph dev            # foreground the sole run= service; eph down on stop
+eph dev web        # foreground a specific run= service by name
+eph dev --clean    # full reset (eph clean) on stop
+```
+
+- **Setup** is exactly `eph up`: start every service, wait for health, run
+  `post-start` hooks. A failing service or hook aborts before anything is
+  foregrounded.
+- **Foreground**: the chosen `run=` service inherits eph's stdin, stdout, and
+  stderr, so it is fully interactive and its output streams straight through
+  (during `eph dev` that output is not also captured to its `eph logs` file).
+  `eph dev` blocks until the app stops. With no `SERVICE`, the sole `run=`
+  service is used; name one when the `.eph` defines several. A `.eph` with no
+  `run=` service is an error. eph's own startup chrome goes to stderr so it does
+  not mingle with the app's stdout.
+- **`$PORT` override**: when the environment sets `PORT` (a preview server's
+  `autoPort` passes the host port it picked this way), the foreground app's
+  `port=auto` is bound to exactly that port so the preview connects to it. Give
+  the foreground app `port=auto` and read its `${service.port}`; do not also pin
+  a fixed port.
+- **Teardown on stop**: a stop signal (the preview server's, or Ctrl-C) runs
+  `eph down` by default, or `eph clean` with `--clean`, then exits zero. A hard
+  kill (`SIGKILL` / `TerminateProcess`) cannot be caught, so it skips teardown
+  and leaves the stack up, recoverable with `eph down`.
+- **App exit**: if the foregrounded app exits on its own (a crash), `eph dev`
+  leaves the backing services up and exits non-zero, so the preview server sees
+  the dev server went down. The app's own output already streamed to your
+  terminal, and `eph down` stops the rest.
+
 ## `eph status`
 
 Show the workspace and which services are running. Reconciles saved state

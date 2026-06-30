@@ -1486,3 +1486,130 @@ async fn skills_install_and_check_round_trip() {
         String::from_utf8_lossy(&listed.stdout)
     );
 }
+
+/// `eph dev` brings the stack up, foregrounds a `run=` service on the host port
+/// a preview server injects as `$PORT`, and on a stop signal tears the stack
+/// down and exits zero.
+///
+/// Unix-only: it delivers `SIGTERM`, the signal a Claude Desktop preview server
+/// uses to stop the dev command. Windows has no equivalent a test harness can
+/// deliver, and that gap (a hard kill skips teardown) is documented behavior.
+#[cfg(unix)]
+#[tokio::test]
+async fn dev_foregrounds_on_injected_port_and_tears_down_on_signal() {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    // A no-Docker run= service that just stays alive. port=auto means eph would
+    // pick a random host port unless `eph dev` honors the injected $PORT.
+    let ws = TestWorkspace::new("[web]\nrun=sleep 600\nport=auto\n");
+
+    // The host port a preview server would have chosen and passed as $PORT.
+    let port = {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    let eph_binary = env!("CARGO_BIN_EXE_eph");
+    let mut child = Command::new(eph_binary)
+        .arg("dev")
+        .current_dir(ws.path())
+        .env("PORT", port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn eph dev");
+
+    // Setup is done and the app is bound to exactly $PORT once status reports it.
+    // A random (unpinned) port would not match, so this also proves the $PORT
+    // override took effect.
+    let needle = format!(":{port}");
+    let mut bound = false;
+    for _ in 0..100 {
+        let out = ws.eph(&["status"]).await;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stdout.contains("web") && stdout.contains(&needle) {
+            bound = true;
+            break;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        bound,
+        "`eph dev` should bring 'web' up on the injected port {port}"
+    );
+
+    // Stop it the way a preview server does: a termination signal.
+    let pid = child.id().expect("dev child has a pid") as libc::pid_t;
+    // SAFETY: kill takes plain integers and has no memory-safety preconditions;
+    // SIGTERM to a live child is well-defined.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("eph dev should exit promptly after SIGTERM")
+        .expect("waiting on eph dev failed");
+    assert!(
+        status.success(),
+        "a signalled `eph dev` should tear down and exit zero, got {status:?}"
+    );
+
+    // The foregrounded service must be gone after the graceful teardown.
+    let after = ws.eph_ok(&["status"]).await;
+    assert!(
+        after.contains("No services running"),
+        "services should be torn down after `eph dev` is signalled; got:\n{after}"
+    );
+}
+
+/// `eph dev` forwards eph's stdin, stdout, and stderr to the foreground app, so
+/// it is fully interactive rather than reading from a captured log file.
+///
+/// Unix-only: it drives the child's stdio over pipes. `cat` copies stdin to
+/// stdout and exits at EOF, so a line written to `eph dev`'s stdin must come back
+/// on `eph dev`'s stdout, which proves both streams are inherited by the app.
+#[cfg(unix)]
+#[tokio::test]
+async fn dev_forwards_stdio_to_the_foreground_app() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::process::Command;
+
+    let ws = TestWorkspace::new("[web]\nrun=cat\nport=auto\n");
+
+    let eph_binary = env!("CARGO_BIN_EXE_eph");
+    let mut child = Command::new(eph_binary)
+        .arg("dev")
+        .current_dir(ws.path())
+        // eph's own chrome goes to stderr, so stdout carries only the app's bytes.
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn eph dev");
+
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    stdin
+        .write_all(b"marker-line\n")
+        .await
+        .expect("write stdin");
+    drop(stdin); // EOF, so `cat` flushes and exits, which ends `eph dev`.
+
+    // `eph dev` holds stdout open until it exits (just after `cat` does), so this
+    // reads to EOF once the whole thing has wound down.
+    let mut out = String::new();
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    tokio::time::timeout(Duration::from_secs(20), stdout.read_to_string(&mut out))
+        .await
+        .expect("reading eph dev stdout should not hang")
+        .expect("read stdout");
+    let _ = tokio::time::timeout(Duration::from_secs(20), child.wait()).await;
+
+    assert!(
+        out.contains("marker-line"),
+        "a line written to `eph dev` stdin should reach the app and stream back on \
+         stdout; got: {out:?}"
+    );
+}
