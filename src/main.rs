@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitCode};
 use tracing_subscriber::EnvFilter;
 
+mod watch;
+use watch::Watch;
+
 #[derive(Parser)]
 #[command(name = "eph")]
 #[command(about = "Ephemeral services per workspace - dotenv for services")]
@@ -87,6 +90,9 @@ enum Commands {
     ///
     /// With no SERVICE the sole `run=` service is foregrounded; name one
     /// explicitly when the `.eph` file defines more than one.
+    ///
+    /// Pass `--watch <glob>` (repeatable) to restart the whole stack when a
+    /// matching file changes: `eph dev --watch "**/*.rs" --watch "*.toml"`.
     Dev {
         /// The `run=` service to foreground (defaults to the only one).
         #[arg(value_name = "SERVICE")]
@@ -96,6 +102,17 @@ enum Commands {
         /// the default `eph down` (keep them for a fast restart).
         #[arg(long)]
         clean: bool,
+
+        /// Restart the whole dev stack when a file matching GLOB changes.
+        ///
+        /// Repeatable; each value is a glob relative to the workspace root, with
+        /// gitignore-style separators (`*` stays within a directory, `**` spans
+        /// them): `--watch "**/*.rs" --watch "*.toml"`. On a change eph tears the
+        /// stack down (pre-stop hooks and all) and brings it back up (post-start
+        /// hooks and all), so a restart is a full `eph down` + `eph dev`, not a
+        /// bare process bounce. Without `--watch` the stack never restarts.
+        #[arg(long = "watch", value_name = "GLOB")]
+        watch: Vec<String>,
     },
 
     /// Show status of services
@@ -224,7 +241,11 @@ async fn main() -> Result<ExitCode> {
             .await
             .map(|()| ExitCode::SUCCESS),
         Commands::Clean { skip_hooks } => cmd_clean(skip_hooks).await.map(|()| ExitCode::SUCCESS),
-        Commands::Dev { service, clean } => cmd_dev(service, clean).await,
+        Commands::Dev {
+            service,
+            clean,
+            watch,
+        } => cmd_dev(service, clean, watch).await,
         Commands::Status => cmd_status().await.map(|()| ExitCode::SUCCESS),
         Commands::Env { format } => cmd_env(&format).await.map(|()| ExitCode::SUCCESS),
         Commands::Run { command } => cmd_run(command).await,
@@ -350,6 +371,9 @@ enum DevStop {
     /// The foregrounded app process exited on its own (it crashed or finished),
     /// carrying the wait result so the message can name how it ended.
     AppExited(std::io::Result<std::process::ExitStatus>),
+    /// A watched file changed, carrying the workspace-relative path that matched,
+    /// so `eph dev` should restart the whole stack. Only reached with `--watch`.
+    FileChanged(PathBuf),
 }
 
 /// `eph dev`: bring the whole stack up, foreground a `run=` service for a Claude
@@ -360,8 +384,20 @@ enum DevStop {
 /// it can wait on it directly. Returns a non-zero exit when the app exits on its
 /// own, so the preview server sees the dev server went down; a clean stop signal
 /// tears the stack down and exits zero.
-async fn cmd_dev(service: Option<String>, clean: bool) -> Result<ExitCode> {
+///
+/// With one or more `watch` globs it stays running across restarts: when a
+/// matching file changes it tears the whole stack down (pre-stop hooks and all)
+/// and brings it back up (post-start hooks and all), then keeps watching. In
+/// watch mode an app that exits on its own (a crash) does not end the session:
+/// eph reports it and waits for the next change to restart, the way a dev-loop
+/// watcher should, since editing is exactly when the app is most likely to
+/// crash. Without `--watch` that same exit is reported as a failure and ends
+/// `eph dev`, so a preview server sees the dev server went down.
+async fn cmd_dev(service: Option<String>, clean: bool, watch: Vec<String>) -> Result<ExitCode> {
     let workspace = Workspace::find_from_cwd()?;
+    // The watcher matches globs relative to the workspace root, so capture it
+    // before `workspace` is moved into the manager.
+    let workspace_root = workspace.path.clone();
     let eph = load_eph_file(&workspace)?;
 
     // Decide which run= service to foreground before touching Docker, so a
@@ -377,75 +413,203 @@ async fn cmd_dev(service: Option<String>, clean: bool) -> Result<ExitCode> {
         manager.pin_default_port(&foreground, port);
     }
 
-    // Run every service's pre-start hooks before anything comes up, so codegen
-    // or other prep the app needs to compile finishes first. The backing/
-    // foreground split below drives startup by hand (bypassing `start_services`'
-    // interleaved pre-start), so this is where dev honors the hook.
-    manager.run_all_pre_start(&eph).await?;
+    // Start watching before the first bring-up so a change made while the stack
+    // is coming up is still caught the moment we reach the select loop. A
+    // malformed glob or an unwatchable root fails fast, before touching Docker.
+    let mut watcher = if watch.is_empty() {
+        None
+    } else {
+        Some(Watch::new(&workspace_root, &watch)?)
+    };
 
-    // Setup, in two steps so the foreground app inherits eph's stdio. First bring
-    // the backing services up (no hooks yet: pre-start already ran above,
-    // post-start is deferred to run_all_post_start); then start the app in the
-    // foreground. `start_services` with an empty filter would start everything,
-    // so only call it when there is at least one backing service.
+    // Restart loop: each pass brings the whole stack up, then blocks until it is
+    // stopped, the app exits, or (when watching) a file changes. Without a
+    // watcher the loop runs exactly once, matching the original single-shot `eph
+    // dev` behavior.
+    let mut first = true;
+    loop {
+        let mut child = dev_bring_up(&mut manager, &eph, &foreground).await?;
+
+        announce_serving(&manager, &foreground, clean, &watch, first).await;
+        first = false;
+
+        // Block until a stop signal, the app exiting on its own, or a watched
+        // file changing. `child.wait` reaps the process, so its exit is observed
+        // reliably (no zombie races). The watch arm is inert without `--watch`.
+        let stop = tokio::select! {
+            () = wait_for_shutdown() => DevStop::Signal,
+            result = child.wait() => DevStop::AppExited(result),
+            changed = next_change(&mut watcher), if watcher.is_some() => DevStop::FileChanged(changed),
+        };
+
+        match stop {
+            DevStop::Signal => {
+                final_teardown(&mut manager, &eph, clean).await?;
+                // Reap the foreground child we just tore down.
+                let _ = child.wait().await;
+                return Ok(ExitCode::SUCCESS);
+            }
+            DevStop::AppExited(result) => {
+                // Reap the process that exited on its own before deciding what to do.
+                let _ = child.wait().await;
+                let how = describe_exit(&result);
+
+                // Without a watcher this is the terminal preview-server contract:
+                // leave the stack up for inspection and report failure so the
+                // preview server sees the dev server went down.
+                let Some(watcher) = watcher.as_mut() else {
+                    eprintln!(
+                        "dev server '{foreground}' {how}; backing services left up (`eph down` to stop)"
+                    );
+                    return Ok(ExitCode::FAILURE);
+                };
+
+                // Watch mode: a crash should not end the session. Keep the backing
+                // services up and wait for the next change (or a stop signal) to
+                // restart, so saving a fix brings the app straight back.
+                eprintln!();
+                eprintln!("dev server '{foreground}' {how}; waiting for a change to restart");
+                tokio::select! {
+                    () = wait_for_shutdown() => {
+                        final_teardown(&mut manager, &eph, clean).await?;
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                    path = watcher.changed_or_pending() => {
+                        restart_banner(&path);
+                        // Fall through to the uniform full restart below.
+                        manager.stop_all(&eph, false, false).await?;
+                    }
+                }
+            }
+            DevStop::FileChanged(path) => {
+                // A restart is a full down + up, including hooks: stop the stack
+                // (pre-stop hooks and all), keeping containers and volume data for
+                // a fast restart, then loop to bring it back up. A change never
+                // drops volumes, even under `--clean`; that teardown is reserved
+                // for the final stop.
+                restart_banner(&path);
+                manager.stop_all(&eph, false, false).await?;
+                // Reap the foreground child torn down with the stack before the
+                // next pass spawns its replacement.
+                let _ = child.wait().await;
+            }
+        }
+    }
+}
+
+/// Tear the whole stack down on a final stop: `eph clean` (drop volumes and their
+/// data) with `--clean`, otherwise `eph down` (keep them for a fast restart).
+/// Shared by the stop-signal path and the watch-mode "crashed, then stopped" path
+/// so both honor `--clean` identically.
+async fn final_teardown(manager: &mut ServiceManager, eph: &EphFile, clean: bool) -> Result<()> {
+    eprintln!();
+    if clean {
+        manager.clean(eph, false).await?;
+        eprintln!("Workspace cleaned");
+    } else {
+        manager.stop_all(eph, false, false).await?;
+        eprintln!("Services stopped");
+    }
+    Ok(())
+}
+
+/// Describe how the foreground app ended, for the stderr chrome.
+fn describe_exit(result: &std::io::Result<std::process::ExitStatus>) -> String {
+    match result {
+        Ok(status) => format!("exited ({status})"),
+        Err(e) => format!("could not be waited on ({e})"),
+    }
+}
+
+/// Print the "restarting" banner naming the file that triggered it.
+fn restart_banner(path: &Path) {
+    eprintln!();
+    eprintln!("Change detected ({}); restarting dev stack", path.display());
+}
+
+/// Bring the whole `eph dev` stack up: pre-start hooks, backing services, the
+/// foreground app, then every post-start hook. Returns the live foreground child
+/// for the caller to wait on. Factored out of [`cmd_dev`] so the restart loop can
+/// rerun the exact same sequence, hooks and all, on every file change.
+async fn dev_bring_up(
+    manager: &mut ServiceManager,
+    eph: &EphFile,
+    foreground: &str,
+) -> Result<tokio::process::Child> {
+    // Run every service's pre-start hooks before anything comes up, so codegen or
+    // other prep the app needs to compile finishes first. The backing/foreground
+    // split below drives startup by hand (bypassing `start_services`' interleaved
+    // pre-start), so this is where dev honors the hook. It runs on every pass, so
+    // a watch-triggered restart re-runs pre-start along with the rest of the stack.
+    manager.run_all_pre_start(eph).await?;
+
+    // Two steps so the foreground app inherits eph's stdio. First bring the
+    // backing services up (no hooks yet: pre-start already ran above, post-start
+    // is deferred to run_all_post_start); then start the app in the foreground.
+    // `start_services` with an empty filter would start everything, so only call
+    // it when there is at least one backing service.
     let backing: Vec<String> = eph
         .services
         .keys()
-        .filter(|name| **name != foreground)
+        .filter(|name| *name != foreground)
         .cloned()
         .collect();
     if !backing.is_empty() {
-        manager.start_services(&eph, &backing, true).await?;
+        manager.start_services(eph, &backing, true).await?;
     }
-    let (fg, mut child) = manager.start_foreground(&eph, &foreground).await?;
+    let (_fg, child) = manager.start_foreground(eph, foreground).await?;
 
     // Everything is healthy now, so run post-start hooks (seeding) for every
     // service, preserving the `eph up` rule that a hook may reference any
     // service's assigned port.
-    manager.run_all_post_start(&eph).await?;
+    manager.run_all_post_start(eph).await?;
 
-    // eph's own chrome goes to stderr so the app keeps stdout to itself.
-    if let Some(port) = fg.port() {
+    Ok(child)
+}
+
+/// Print the "Serving ..." chrome to stderr (the app keeps stdout to itself).
+///
+/// The serving URL is reprinted on every restart so a watch-driven bounce shows
+/// where the fresh server is listening. The one-time hints (how to stop, and what
+/// is being watched) print only on the `first` pass to keep restart output terse.
+async fn announce_serving(
+    manager: &ServiceManager,
+    foreground: &str,
+    clean: bool,
+    watch: &[String],
+    first: bool,
+) {
+    // Read the freshly assigned port back from the running set rather than
+    // threading it out of the bring-up, so a restart on a new auto port is
+    // reported accurately.
+    let port = manager
+        .status()
+        .await
+        .ok()
+        .and_then(|running| running.get(foreground).and_then(RunningService::port));
+    if let Some(port) = port {
         eprintln!();
         eprintln!("Serving '{foreground}' on http://localhost:{port}");
     }
-    let teardown = if clean { "eph clean" } else { "eph down" };
-    eprintln!("Press Ctrl-C to stop ({teardown} on exit)");
-
-    // Block until either a stop signal or the app exiting on its own. `child.wait`
-    // reaps the process, so its exit is observed reliably (no zombie races).
-    let stop = tokio::select! {
-        () = wait_for_shutdown() => DevStop::Signal,
-        result = child.wait() => DevStop::AppExited(result),
-    };
-
-    match stop {
-        DevStop::Signal => {
-            eprintln!();
-            if clean {
-                manager.clean(&eph, false).await?;
-                eprintln!("Workspace cleaned");
-            } else {
-                manager.stop_all(&eph, false, false).await?;
-                eprintln!("Services stopped");
-            }
-            // Reap the foreground child we just tore down.
-            let _ = child.wait().await;
-            Ok(ExitCode::SUCCESS)
+    if first {
+        let teardown = if clean { "eph clean" } else { "eph down" };
+        eprintln!("Press Ctrl-C to stop ({teardown} on exit)");
+        if !watch.is_empty() {
+            eprintln!("Watching for changes: {}", watch.join(", "));
         }
-        DevStop::AppExited(result) => {
-            // The app died rather than being stopped. Leave the stack up so its
-            // state survives for inspection, and report failure so the preview
-            // server sees the dev server went down.
-            let how = match result {
-                Ok(status) => format!("exited ({status})"),
-                Err(e) => format!("could not be waited on ({e})"),
-            };
-            eprintln!(
-                "dev server '{foreground}' {how}; backing services left up (`eph down` to stop)"
-            );
-            Ok(ExitCode::FAILURE)
-        }
+    }
+}
+
+/// Await the next matching file change, or never resolve when not watching.
+///
+/// The `tokio::select!` precondition already gates the watch arm on
+/// `watcher.is_some()`, but this also parks forever if the watcher has shut down
+/// (its channel closed), so a dead watcher can never spuriously restart the
+/// stack. It only resolves with a real change.
+async fn next_change(watcher: &mut Option<Watch>) -> PathBuf {
+    match watcher {
+        Some(watch) => watch.changed_or_pending().await,
+        None => std::future::pending().await,
     }
 }
 
