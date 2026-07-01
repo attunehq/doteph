@@ -21,8 +21,13 @@ bollard = "0.21"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 futures-util = "0.3"
+# `eph dev --watch` compiles the user's globs into a matcher and watches the
+# workspace tree for changes: globset for gitignore-style glob matching, notify
+# for the cross-platform filesystem watch (inotify / FSEvents / ReadDirectoryChangesW).
+globset = "0.4"
 hex = "0.4"
 indexmap = { version = "2", features = ["serde"] }
+notify = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
