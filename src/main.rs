@@ -377,8 +377,15 @@ async fn cmd_dev(service: Option<String>, clean: bool) -> Result<ExitCode> {
         manager.pin_default_port(&foreground, port);
     }
 
+    // Run every service's pre-start hooks before anything comes up, so codegen
+    // or other prep the app needs to compile finishes first. The backing/
+    // foreground split below drives startup by hand (bypassing `start_services`'
+    // interleaved pre-start), so this is where dev honors the hook.
+    manager.run_all_pre_start(&eph).await?;
+
     // Setup, in two steps so the foreground app inherits eph's stdio. First bring
-    // the backing services up (no hooks yet); then start the app in the
+    // the backing services up (no hooks yet: pre-start already ran above,
+    // post-start is deferred to run_all_post_start); then start the app in the
     // foreground. `start_services` with an empty filter would start everything,
     // so only call it when there is at least one backing service.
     let backing: Vec<String> = eph

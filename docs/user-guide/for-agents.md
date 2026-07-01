@@ -41,9 +41,9 @@ DATABASE_URL=$(eph env -f json | jq -r .DATABASE_URL)
 
 | Command | Effect |
 |---------|--------|
-| `eph up [svc...]` | Start all / named services. Pulls/builds, waits for health, then runs `post-start` for every service on **every** `eph up`. A failing `post-start` aborts the `up`. `--skip-hooks` skips `post-start`. |
-| `eph down [--rm \| -r] [svc...]` | Stop all / named. `--rm` (alias `-r`) also removes containers. Compose is always fully torn down. A failing `pre-stop` aborts the `down`; `--skip-hooks` bypasses `pre-stop`. |
-| `eph clean` | Full reset: remove containers + named volumes + state. Deletes data. A failing `pre-stop` aborts it; `--skip-hooks` bypasses `pre-stop`. |
+| `eph up [svc...]` | Start all / named services. Runs each service's `pre-start` just before it is created, pulls/builds, waits for health, then runs `post-start` for every service. Both run on **every** `eph up`. A failing `pre-start` aborts the `up` before its service starts; a failing `post-start` aborts the `up`. `--skip-hooks` skips both. |
+| `eph down [--rm \| -r] [svc...]` | Stop all / named. `--rm` (alias `-r`) also removes containers. Compose is always fully torn down. Runs `pre-stop` before each service stops and `post-stop` after. A failing `pre-stop` aborts the `down` (service left running); a failing `post-stop` aborts the rest of teardown. `--skip-hooks` bypasses both. |
+| `eph clean` | Full reset: remove containers + named volumes + state. Deletes data. Runs `pre-stop` / `post-stop` like `eph down`; a failing hook aborts it; `--skip-hooks` bypasses both. |
 | `eph run <cmd>...` | Run a command in the workspace root with the resolved env + `EPH_*` metadata. Exits with the command's code. |
 | `eph logs [svc] [-f] [-n N]` | Show logs. No svc: all services interleaved, each line tagged `[name]`. One svc: raw. `run=` reads a captured log file; Docker/compose proxy `docker logs`. Shows even for stopped services. `-f` follows (all or one). |
 | `eph status` | Running services and ports. |
@@ -107,7 +107,7 @@ env`, with `${postgres.port}` filled in at runtime.
 | `command=` | Override container CMD (shell-word split, no shell). |
 | `healthcheck=` | image/dockerfile: no shell. run/compose: platform shell (`sh -c` / `cmd /C`). |
 | `ready-timeout=` | Seconds (default 30; compose 60). |
-| `post-start=` / `pre-stop=` | Host platform shell (`sh -c` / `cmd /C`) in workspace root; repeatable. Run with the resolved env + `EPH_*` metadata + the service's `env.X` injected. `post-start` runs on every `up` (after all services healthy); failure aborts `up`. `pre-stop` failure aborts `down`/`clean`. |
+| `pre-start=` / `post-start=` / `pre-stop=` / `post-stop=` | Lifecycle hooks. Host platform shell (`sh -c` / `cmd /C`) in workspace root; repeatable. Run with the resolved env + `EPH_*` metadata + the service's `env.X` injected. `pre-start` runs just before its service is created (no own port yet); `post-start` after all services healthy. Both run on every `up`; failure aborts `up`. `pre-stop` runs before a service stops (failure aborts `down`/`clean`, service left running); `post-stop` after it stops (failure aborts the rest of teardown). |
 
 ### Interpolation (resolved by `eph env`, running services only)
 

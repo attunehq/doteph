@@ -123,8 +123,10 @@ The four source types are covered in detail in
 | `volume=` | yes | A volume mount: `name:/path` (named) or `./host:/path` (bind). |
 | `healthcheck=` | no | Command that must succeed before the service is "ready". |
 | `ready-timeout=` | no | Seconds to wait for the `healthcheck` (default 30; 60 for compose). Ignored when no `healthcheck` is set. |
+| `pre-start=` | yes | Command run before the service is created. |
 | `post-start=` | yes | Command run after the service becomes healthy. |
 | `pre-stop=` | yes | Command run before the service is stopped. |
+| `post-stop=` | yes | Command run after the service has stopped. |
 | `expose.<name>=` | yes | For `compose=`: expose a port for interpolation. |
 
 "Repeatable" means you can list the property multiple times and all values are
@@ -216,11 +218,29 @@ ready. `ready-timeout` defaults to 30 seconds (60 for compose).
 
 ## Lifecycle hooks
 
-`post-start=` runs after a service is healthy; `pre-stop=` runs before it stops.
-Both run on the host through the platform shell (`sh -c` on Unix, `cmd /C` on
-Windows), in the workspace root, and both are repeatable and run in order:
+Four hooks bracket a service's life, in this order:
+
+| Hook | Runs | Typical use |
+|------|------|-------------|
+| `pre-start=` | before the service is created | codegen, a generated config the service reads |
+| `post-start=` | after the service is healthy | migrations, seeding |
+| `pre-stop=` | before the service stops | backup, drain |
+| `post-stop=` | after the service has stopped | cleanup eph cannot do itself |
+
+All four run on the host through the platform shell (`sh -c` on Unix, `cmd /C` on
+Windows), in the workspace root, and each is repeatable and runs in order:
 
 ```ini
+[api]
+run=./bin/server
+port=auto
+# Codegen the server needs to compile, before it boots.
+pre-start=go generate ./...
+post-start=./scripts/seed.sh
+pre-stop=./scripts/drain.sh
+# Tear down a scratch bucket eph never created and cannot clean up.
+post-stop=./scripts/drop-scratch-bucket.sh
+
 [postgres]
 image=postgres:16-alpine
 env.POSTGRES_USER=dev
@@ -251,12 +271,18 @@ which runs an arbitrary command with these variables set.
 
 Important behavior:
 
-- `post-start` runs on **every** `eph up`, for every service, regardless of
-  whether the container was freshly created or an existing one was restarted.
-  Write hooks to be idempotent (a migration that no-ops when applied, an
-  `INSERT ... ON CONFLICT` seed); for one-off or destructive work use
-  [`eph run`](command-reference.md#eph-run-cmd) instead. A failing `post-start`
-  aborts `eph up`.
+- `pre-start` and `post-start` run on **every** `eph up`, for every service,
+  regardless of whether the container was freshly created or an existing one was
+  restarted. Write hooks to be idempotent (a migration that no-ops when applied,
+  an `INSERT ... ON CONFLICT` seed); for one-off or destructive work use
+  [`eph run`](command-reference.md#eph-run-cmd) instead. A failing `pre-start`
+  aborts `eph up` before the service it precedes is created; a failing
+  `post-start` aborts `eph up`.
+- `pre-start` runs **before** its service exists, so it cannot reference that
+  service's own port. It does see any service already up at that point: within a
+  single `eph up`, backing services (`image`/`dockerfile`/`compose`) start before
+  `run=` apps, so a `run=` app's `pre-start` can reach a database's assigned
+  port. Use it for prep the service depends on, such as codegen.
 - `post-start` hooks run only after **every** service in the same `eph up` is
   healthy, so a hook may reference any other service's assigned port through a
   top-level variable (for example a `DATABASE_URL` that interpolates
@@ -264,8 +290,16 @@ Important behavior:
 - A failing `pre-stop` hook aborts the `eph down` / `eph clean` and leaves the
   service running, so a backup or drain that fails is not silently skipped. Fix
   the hook and retry, or pass `--skip-hooks` to tear down without running it.
-- `eph up --skip-hooks` likewise brings services up without running their
-  `post-start` hooks.
+- `post-stop` runs **after** the service has stopped, for cleanup eph cannot do
+  itself (deleting a scratch directory, tearing down an external resource the
+  service registered). It sees the same pre-teardown environment as `pre-stop`,
+  so it can still reference the now-stopped service's port. A failing `post-stop`
+  aborts the rest of the teardown; because the service is already stopped, a
+  later `eph down` will not re-run it, so fix the cleanup and run it by hand (or
+  pass `--skip-hooks`).
+- `eph up --skip-hooks` brings services up without running their `pre-start` or
+  `post-start` hooks; `eph down --skip-hooks` / `eph clean --skip-hooks` tear
+  down without running `pre-stop` or `post-stop`.
 
 See [Core Concepts](concepts.md#the-service-lifecycle) for the full lifecycle.
 

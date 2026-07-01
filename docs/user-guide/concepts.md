@@ -133,19 +133,22 @@ are tracked by process ID: an alive process is reused, otherwise it is
 respawned. **`compose`** services delegate to `docker compose up -d` on every
 `eph up` (which is itself idempotent).
 
-Once **every** service in the same `eph up` is healthy, eph runs `post-start`
-hooks in a second phase, regardless of which start path each service took.
-Deferring hooks this way means a hook can reference any other service's assigned
-port (for example a migration whose `DATABASE_URL` interpolates
-`${postgres.port}`), and hooks run with eph's resolved environment injected (see
+Each service runs its `pre-start` hooks just before it is created, so prep the
+service depends on (codegen a Go server needs to compile, a generated config a
+container mounts) finishes first. Then, once **every** service in the same
+`eph up` is healthy, eph runs `post-start` hooks in a second phase, regardless of
+which start path each service took. Deferring `post-start` this way means such a
+hook can reference any other service's assigned port (for example a migration
+whose `DATABASE_URL` interpolates `${postgres.port}`); every hook runs with eph's
+resolved environment injected (see
 [The `.eph` file](eph-file.md#hook-environment)).
 
-> **`post-start` runs on every `eph up`**, not only on fresh creation. Write
-> hooks to be idempotent -- a migration that no-ops when already applied, an
-> `INSERT ... ON CONFLICT` seed. A failing `post-start` aborts the `up`. For
+> **`pre-start` and `post-start` run on every `eph up`**, not only on fresh
+> creation. Write hooks to be idempotent -- a migration that no-ops when already
+> applied, an `INSERT ... ON CONFLICT` seed. A failing `pre-start` aborts the
+> `up` before its service starts; a failing `post-start` aborts the `up`. For
 > one-off or non-idempotent work, run it explicitly with
-> [`eph run`](command-reference.md#eph-run-cmd) instead of wiring it into
-> `post-start`.
+> [`eph run`](command-reference.md#eph-run-cmd) instead of wiring it into a hook.
 
 The three levels of teardown:
 
@@ -159,6 +162,12 @@ The three levels of teardown:
 containers but keeps named-volume data (and forces a fresh create next time).
 `eph clean` is the full reset and **deletes the data in named volumes** - use it
 when you want to start completely fresh.
+
+Teardown is bracketed by hooks the same way startup is: each service runs its
+`pre-stop` hooks before it stops (a backup or drain) and its `post-stop` hooks
+after (cleanup eph cannot do itself). A failing `pre-stop` leaves the service
+running so you can retry; a failing `post-stop` aborts the rest of the teardown
+but the service is already stopped. Both are skippable with `--skip-hooks`.
 
 > Bind mounts (host paths starting with `.` or `/`) are never deleted by
 > `eph clean` - only Docker named volumes are.
