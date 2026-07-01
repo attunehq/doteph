@@ -110,7 +110,7 @@ Workspace cleaned:
 > broken `pre-stop` or `post-stop` hook is wedging `clean`, pass `--skip-hooks`
 > to reset anyway.
 
-## `eph dev [SERVICE] [--clean]`
+## `eph dev [SERVICE] [--clean] [--watch GLOB]...`
 
 Run the whole dev stack in the foreground, built for a Claude Desktop preview
 server (see [Recipes](recipes.md#claude-desktop-preview-servers)). It brings
@@ -121,11 +121,13 @@ stays attached until it is stopped. On stop it tears the stack down.
 | Flag | Description |
 |------|-------------|
 | `--clean` | Tear down with `eph clean` (drop named volumes and their data) instead of the default `eph down` (keep them for a fast restart). |
+| `--watch GLOB` | Restart the whole stack when a file matching GLOB changes. Repeatable; globs are relative to the workspace root with gitignore-style separators. |
 
 ```sh
 eph dev            # foreground the sole run= service; eph down on stop
 eph dev web        # foreground a specific run= service by name
 eph dev --clean    # full reset (eph clean) on stop
+eph dev --watch "**/*.rs" --watch "*.toml"   # restart on source changes
 ```
 
 - **Setup** mirrors `eph up`, driving the backing/foreground split by hand: run
@@ -157,6 +159,23 @@ eph dev --clean    # full reset (eph clean) on stop
   leaves the backing services up and exits non-zero, so the preview server sees
   the dev server went down. The app's own output already streamed to your
   terminal, and `eph down` stops the rest.
+- **`--watch`**: each `--watch` value is a glob (repeatable) matched against
+  paths relative to the workspace root, using gitignore-style separators: `*`
+  stays within a directory and `**` spans them, so `*.toml` matches a top-level
+  `Cargo.toml` while `**/*.rs` matches a `.rs` file at any depth. When a matching
+  file changes, eph tears the whole stack down (running `pre-stop` and
+  `post-stop` hooks) and brings it back up (running `pre-start` and `post-start`
+  hooks), so a restart is a full `eph down` + `eph dev`, not a bare process
+  bounce, and every lifecycle hook fires just as it would on a manual restart. A
+  restart always keeps volumes for speed, even under `--clean`; that reset is
+  reserved for the final stop. Changes are debounced, so one save is one restart,
+  and git's own churn under `.git` never triggers one. Without any `--watch` the
+  stack never restarts.
+  In watch mode an app that exits on its own (a crash) does not end the session:
+  eph reports it and waits for the next change to restart, since editing is when
+  the app is most likely to crash. That differs from plain `eph dev`, where the
+  same exit is reported as a failure and ends the command so a preview server
+  sees the dev server went down.
 
 ## `eph status`
 
