@@ -83,7 +83,9 @@ enum Commands {
     /// single foreground command and offers no separate setup or teardown hook:
     /// point `runtimeExecutable` at `eph` with `runtimeArgs` of `["dev"]`. When
     /// the preview server assigns the host port and passes it as `$PORT`, `eph
-    /// dev` binds the foreground app to that exact port so the preview connects.
+    /// dev` opens that port only after `post-start` hooks finish and forwards it to
+    /// the app, so the preview (which watches the port) does not go live until
+    /// seeding is done rather than the instant the server can serve a health check.
     ///
     /// With no SERVICE the sole `run=` service is foregrounded; name one
     /// explicitly when the `.eph` file defines more than one.
@@ -370,12 +372,15 @@ async fn cmd_dev(service: Option<String>, clean: bool) -> Result<ExitCode> {
 
     let mut manager = ServiceManager::new(workspace).await?;
 
-    // A preview server (Claude Desktop) assigns the host port and passes it as
-    // $PORT; bind the foreground app to exactly that port so the preview reaches
-    // it rather than a fresh random one.
-    if let Some(port) = preview_port() {
-        manager.pin_default_port(&foreground, port);
-    }
+    // A preview server (Claude Desktop) assigns a host port, passes it as $PORT,
+    // then polls it and reveals the app the instant it accepts a connection. We
+    // deliberately do NOT let the app bind that port itself: if it did, the
+    // preview would go live as soon as the server could answer its health check,
+    // which is *before* the post-start seed runs (often ~30s later), leaving the
+    // agent staring at an empty app. Instead the app binds its own internal port,
+    // and eph opens $PORT only after post-start hooks finish (the gate below), so
+    // "the preview is ready" reliably means "seeding is done".
+    let gate_port = preview_port();
 
     // Run every service's pre-start hooks before anything comes up, so codegen
     // or other prep the app needs to compile finishes first. The backing/
@@ -404,8 +409,31 @@ async fn cmd_dev(service: Option<String>, clean: bool) -> Result<ExitCode> {
     // service's assigned port.
     manager.run_all_post_start(&eph).await?;
 
-    // eph's own chrome goes to stderr so the app keeps stdout to itself.
-    if let Some(port) = fg.port() {
+    // Seeding is done, so open the preview-facing gate. Binding $PORT here, and
+    // not one step earlier, is the whole point: the preview server watches this
+    // port, so it only now sees the app as ready. The app is on its own internal
+    // port; the gate forwards each connection to it. A bind failure (for example
+    // $PORT already taken) surfaces here, before we advertise the URL.
+    let gate = match gate_port {
+        // If the app happened to land on the preview's exact port, there is
+        // nothing to forward and nothing to hold closed; serve it directly.
+        Some(gp) if fg.port() == Some(gp) => None,
+        Some(gp) => {
+            let app_port = fg.port().context(
+                "eph dev received a preview $PORT but the foreground service exposes no port",
+            )?;
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", gp))
+                .await
+                .with_context(|| format!("failed to bind preview port {gp} for `eph dev`"))?;
+            Some(tokio::spawn(serve_port_gate(listener, app_port)))
+        }
+        None => None,
+    };
+
+    // eph's own chrome goes to stderr so the app keeps stdout to itself. Advertise
+    // the gate port when there is one (that is what the preview connects to),
+    // otherwise the app's own port.
+    if let Some(port) = gate_port.or_else(|| fg.port()) {
         eprintln!();
         eprintln!("Serving '{foreground}' on http://localhost:{port}");
     }
@@ -418,6 +446,13 @@ async fn cmd_dev(service: Option<String>, clean: bool) -> Result<ExitCode> {
         () = wait_for_shutdown() => DevStop::Signal,
         result = child.wait() => DevStop::AppExited(result),
     };
+
+    // Stop forwarding: the app is going away (torn down below, or already exited),
+    // so drop the gate to close $PORT and let the preview observe the server go
+    // down rather than hanging on a port that no longer reaches anything.
+    if let Some(handle) = gate {
+        handle.abort();
+    }
 
     match stop {
         DevStop::Signal => {
@@ -456,6 +491,36 @@ async fn cmd_dev(service: Option<String>, clean: bool) -> Result<ExitCode> {
 /// stray environment variable cannot wedge `eph dev` startup.
 fn preview_port() -> Option<u16> {
     std::env::var("PORT").ok()?.trim().parse().ok()
+}
+
+/// Forward every connection on the preview-facing gate `listener` to the
+/// foreground app at `127.0.0.1:app_port`, copying bytes in both directions until
+/// either side closes.
+///
+/// `eph dev` binds the gate only after post-start hooks finish, so a Claude
+/// Desktop preview server (which polls the gate port and reveals the app the
+/// instant it connects) does not see the app as ready until seeding is done.
+/// Keeping the app on its own internal port and forwarding is what lets eph hold
+/// that port closed without the app needing to know anything about it. The
+/// forwarding is a plain byte splice, so it is transparent to HTTP keep-alive,
+/// Server-Sent Events, and websockets alike.
+///
+/// Runs until aborted (on teardown). A connection that cannot reach the app is
+/// dropped on its own, and a transient accept error is skipped, so one bad
+/// connection can never take the whole gate down.
+async fn serve_port_gate(listener: tokio::net::TcpListener, app_port: u16) {
+    loop {
+        let Ok((mut inbound, _)) = listener.accept().await else {
+            continue;
+        };
+        tokio::spawn(async move {
+            let Ok(mut outbound) = tokio::net::TcpStream::connect(("127.0.0.1", app_port)).await
+            else {
+                return;
+            };
+            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+        });
+    }
 }
 
 /// Choose the `run=` service `eph dev` foregrounds.
@@ -993,5 +1058,79 @@ mod tests {
             .to_string();
         assert!(err.contains("several run= services"), "got: {err}");
         assert!(err.contains("web") && err.contains("worker"), "got: {err}");
+    }
+
+    /// The gate is a transparent forwarder: a client that reaches the gate port is
+    /// really talking to the app, in both directions. Uses a loopback echo server
+    /// as the stand-in app and drives a full request/response through the gate.
+    #[tokio::test]
+    async fn port_gate_forwards_bytes_both_ways() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        // Stand-in "app": an echo server on a free loopback port.
+        let app = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let app_port = app.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = app.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 64];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        // Gate on its own free port, forwarding to the echo server.
+        let gate = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let gate_port = gate.local_addr().unwrap().port();
+        let handle = tokio::spawn(serve_port_gate(gate, app_port));
+
+        // Writing to the gate and reading back should round-trip through the app.
+        let mut conn = TcpStream::connect(("127.0.0.1", gate_port)).await.unwrap();
+        conn.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        conn.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ping");
+
+        handle.abort();
+    }
+
+    /// A gate whose app never came up (or has gone away) must not wedge or panic:
+    /// it accepts the client and then closes it when the upstream connect fails.
+    #[tokio::test]
+    async fn port_gate_drops_client_when_app_is_unreachable() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        // Reserve a port for a "dead app" and immediately free it, so connects to
+        // it are refused.
+        let dead = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+
+        let gate = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let gate_port = gate.local_addr().unwrap().port();
+        let handle = tokio::spawn(serve_port_gate(gate, dead_port));
+
+        // The gate accepts, fails to reach the app, and closes the client, so the
+        // read returns EOF (0 bytes) rather than hanging.
+        let mut conn = TcpStream::connect(("127.0.0.1", gate_port)).await.unwrap();
+        let mut buf = [0u8; 8];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(
+            n, 0,
+            "expected the gate to close a client it cannot forward"
+        );
+
+        handle.abort();
     }
 }

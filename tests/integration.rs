@@ -1834,21 +1834,22 @@ async fn skills_install_and_check_round_trip() {
     );
 }
 
-/// `eph dev` brings the stack up, foregrounds a `run=` service on the host port
-/// a preview server injects as `$PORT`, and on a stop signal tears the stack
-/// down and exits zero.
+/// `eph dev` brings the stack up, foregrounds a `run=` service, opens the host
+/// port a preview server injects as `$PORT` as a readiness gate to it, and on a
+/// stop signal tears the stack down and exits zero.
 ///
 /// Unix-only: it delivers `SIGTERM`, the signal a Claude Desktop preview server
 /// uses to stop the dev command. Windows has no equivalent a test harness can
 /// deliver, and that gap (a hard kill skips teardown) is documented behavior.
 #[cfg(unix)]
 #[tokio::test]
-async fn dev_foregrounds_on_injected_port_and_tears_down_on_signal() {
+async fn dev_gates_injected_port_and_tears_down_on_signal() {
     use std::process::Stdio;
     use tokio::process::Command;
 
-    // A no-Docker run= service that just stays alive. port=auto means eph would
-    // pick a random host port unless `eph dev` honors the injected $PORT.
+    // A no-Docker run= service that just stays alive. port=auto means the app gets
+    // its own internal host port; `eph dev` opens the injected $PORT as a gate that
+    // forwards to it.
     let ws = TestWorkspace::new("[web]\nrun=sleep 600\nport=auto\n");
 
     // The host port a preview server would have chosen and passed as $PORT.
@@ -1867,23 +1868,36 @@ async fn dev_foregrounds_on_injected_port_and_tears_down_on_signal() {
         .spawn()
         .expect("spawn eph dev");
 
-    // Setup is done and the app is bound to exactly $PORT once status reports it.
-    // A random (unpinned) port would not match, so this also proves the $PORT
-    // override took effect.
-    let needle = format!(":{port}");
-    let mut bound = false;
+    // The gate is opened only after setup and post-start finish, so once $PORT
+    // accepts a connection the whole readiness sequence has run. A random,
+    // ungated port would never accept here, which is what proves the $PORT gate
+    // took effect (rather than the app binding some other port and $PORT staying
+    // closed).
+    let mut gated = false;
     for _ in 0..100 {
-        let out = ws.eph(&["status"]).await;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if stdout.contains("web") && stdout.contains(&needle) {
-            bound = true;
+        let connected = tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::net::TcpStream::connect(("127.0.0.1", port)),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+        if connected {
+            gated = true;
             break;
         }
         sleep(Duration::from_millis(200)).await;
     }
     assert!(
-        bound,
-        "`eph dev` should bring 'web' up on the injected port {port}"
+        gated,
+        "`eph dev` should open the injected preview port {port} once ready"
+    );
+
+    // The app itself is up on its own internal port, reported by status.
+    let status = String::from_utf8_lossy(&ws.eph(&["status"]).await.stdout).into_owned();
+    assert!(
+        status.contains("web"),
+        "`eph dev` should report the foreground app 'web' running; got:\n{status}"
     );
 
     // Stop it the way a preview server does: a termination signal.

@@ -181,11 +181,12 @@ ad-hoc queries) -- unlike `post-start`, it runs every time you invoke it.
 
 `eph dev` runs the whole stack in the foreground for a Claude Desktop preview
 server (`.claude/launch.json`), which launches one command and watches its port
-but has no setup or teardown hook. `eph dev` fills both: it brings every service
-up (running `pre-start` then `post-start`, e.g. codegen then seeding), foregrounds
-a `run=` app with eph's own stdin, stdout, and stderr wired through to it, and on
-stop tears the stack down -- `eph down` by default, or `eph clean` with `--clean`
-(each running `pre-stop` then `post-stop`).
+but has no setup or teardown hook. `eph dev` fills both: it runs
+`pre-start` hooks (e.g. codegen), brings every service up, foregrounds a `run=`
+app with eph's own stdin, stdout, and stderr wired through to it, runs
+`post-start` (seeding), and on stop tears the stack down -- `eph down` by
+default, or `eph clean` with `--clean` (each running `pre-stop` then
+`post-stop`).
 
 ```jsonc
 // .claude/launch.json -- point the preview server at eph dev
@@ -197,9 +198,12 @@ stop tears the stack down -- `eph down` by default, or `eph clean` with `--clean
 }
 ```
 
-- Model the app as a `run=` service with `port=auto`. `eph dev` binds it to the
-  `$PORT` the preview server injects (its `autoPort`), so the preview connects to
-  the right port. Do not also give the app a fixed port.
+- Model the app as a `run=` service with `port=auto`. The app runs on its own
+  internal port; `eph dev` opens the `$PORT` the preview server injects (its
+  `autoPort`) as a forwarding gate to the app, but only *after* `post-start`
+  hooks finish. Since the preview watches `$PORT`, it does not see the app as
+  ready until seeding is done, not the instant the server can answer a health
+  check. Do not also give the app a fixed port.
 - With no SERVICE the sole `run=` service is foregrounded; `eph dev <service>`
   picks one when the `.eph` defines several.
 - Teardown defaults to `eph down` (keeps data for a fast relaunch, since Claude

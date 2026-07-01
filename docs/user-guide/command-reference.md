@@ -128,11 +128,12 @@ eph dev web        # foreground a specific run= service by name
 eph dev --clean    # full reset (eph clean) on stop
 ```
 
-- **Setup** mirrors `eph up`: run every service's `pre-start` hooks, start every
-  service, wait for health, then run `post-start` hooks. (Because `dev` drives
-  the backing/foreground split itself, all `pre-start` hooks run up front rather
-  than interleaved per service.) A failing service or hook aborts before anything
-  is foregrounded.
+- **Setup** mirrors `eph up`, driving the backing/foreground split by hand: run
+  every service's `pre-start` hooks up front (rather than interleaved per
+  service), bring the backing services up and wait for health, foreground the
+  chosen `run=` app, then run every service's `post-start` hooks. A failing
+  service or hook aborts the command. `post-start` runs once the app is up so a
+  seed can reach it, and (see `$PORT` below) before the preview port is opened.
 - **Foreground**: the chosen `run=` service inherits eph's stdin, stdout, and
   stderr, so it is fully interactive and its output streams straight through
   (during `eph dev` that output is not also captured to its `eph logs` file).
@@ -140,11 +141,14 @@ eph dev --clean    # full reset (eph clean) on stop
   service is used; name one when the `.eph` defines several. A `.eph` with no
   `run=` service is an error. eph's own startup chrome goes to stderr so it does
   not mingle with the app's stdout.
-- **`$PORT` override**: when the environment sets `PORT` (a preview server's
-  `autoPort` passes the host port it picked this way), the foreground app's
-  `port=auto` is bound to exactly that port so the preview connects to it. Give
-  the foreground app `port=auto` and read its `${service.port}`; do not also pin
-  a fixed port.
+- **`$PORT` override and the readiness gate**: when the environment sets `PORT` (a
+  preview server's `autoPort` passes the host port it picked this way), `eph dev`
+  keeps the app on its own internal `port=auto` and opens `$PORT` as a forwarding
+  gate to it, but only *after* `post-start` hooks finish. Because the preview
+  server watches `$PORT`, it cannot see the app as ready until seeding is done,
+  instead of the moment the server can answer its health check. Give the
+  foreground app `port=auto` and read its `${service.port}`; do not also pin a
+  fixed port.
 - **Teardown on stop**: a stop signal (the preview server's, or Ctrl-C) runs
   `eph down` by default, or `eph clean` with `--clean`, then exits zero. A hard
   kill (`SIGKILL` / `TerminateProcess`) cannot be caught, so it skips teardown
