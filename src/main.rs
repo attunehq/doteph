@@ -596,9 +596,7 @@ async fn dev_bring_up(
             let app_port = fg.port().context(
                 "eph dev received a preview $PORT but the foreground service exposes no port",
             )?;
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", gp))
-                .await
-                .with_context(|| format!("failed to bind preview port {gp} for `eph dev`"))?;
+            let listener = bind_preview_gate(gp)?;
             Some(tokio::spawn(serve_port_gate(listener, app_port)))
         }
         None => None,
@@ -665,6 +663,41 @@ async fn next_change(watcher: &mut Option<Watch>) -> PathBuf {
 /// stray environment variable cannot wedge `eph dev` startup.
 fn preview_port() -> Option<u16> {
     std::env::var("PORT").ok()?.trim().parse().ok()
+}
+
+/// Bind the preview-facing gate on loopback `port` with `SO_REUSEADDR`.
+///
+/// `eph dev` reopens this port on every bring-up, so a `--watch` restart rebinds
+/// the same fixed `$PORT` moments after the previous gate was torn down. The
+/// abort-and-await in the restart loop releases the old gate's *listening* socket,
+/// but the in-flight connections it forwarded run on detached tasks whose sockets
+/// can outlive it in `TIME_WAIT`. Without `SO_REUSEADDR` a fresh bind then races
+/// them: on Windows (mio deliberately omits the option there) and some BSDs that
+/// bind fails with `EADDRINUSE`, which would propagate out and kill the dev
+/// session mid-edit. tokio's default `bind` does not set the option, so build the
+/// listener by hand. The port is loopback-only, so the option's Windows
+/// address-hijacking caveat does not apply.
+fn bind_preview_gate(port: u16) -> Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Socket, Type};
+
+    let addr: std::net::SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, None)
+        .context("failed to create the preview gate socket")?;
+    socket
+        .set_reuse_address(true)
+        .context("failed to set SO_REUSEADDR on the preview gate socket")?;
+    socket
+        .bind(&addr.into())
+        .with_context(|| format!("failed to bind preview port {port} for `eph dev`"))?;
+    socket
+        .listen(1024)
+        .with_context(|| format!("failed to listen on preview port {port} for `eph dev`"))?;
+    // tokio requires the std listener to be non-blocking before it adopts it.
+    socket
+        .set_nonblocking(true)
+        .context("failed to make the preview gate socket non-blocking")?;
+    tokio::net::TcpListener::from_std(socket.into())
+        .context("failed to register the preview gate listener with tokio")
 }
 
 /// Forward every connection on the preview-facing gate `listener` to the
@@ -1306,5 +1339,45 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    /// Regression: a `--watch` restart must be able to rebind the same fixed
+    /// `$PORT` immediately after the previous gate is torn down, even while an
+    /// old forwarded connection still lingers on that port. Without SO_REUSEADDR
+    /// (see `bind_preview_gate`) that rebind fails on Windows with `EADDRINUSE`
+    /// and kills the dev session mid-edit. Mirrors the loop's abort-then-rebind.
+    #[tokio::test]
+    async fn preview_gate_rebinds_the_same_port_after_teardown() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        // A stand-in app whose port the gate forwards to; it need not accept, the
+        // OS completes the connect into its backlog, which is enough to keep the
+        // forwarded connection (and its socket on the gate port) alive.
+        let app = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let app_port = app.local_addr().unwrap().port();
+
+        // Reserve a free port to act as the fixed preview `$PORT`, then free it so
+        // the gate can take it.
+        let probe = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // First gate generation on the fixed port, with a live client so a
+        // connection socket is bound to that port when we tear the gate down.
+        let listener = bind_preview_gate(port).expect("first gate bind");
+        let handle = tokio::spawn(serve_port_gate(listener, app_port));
+        let _client = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("client connects to the gate");
+
+        // Tear the gate down exactly as cmd_dev's restart path does.
+        handle.abort();
+        let _ = handle.await;
+
+        // The next bring-up must rebind the same port right away. This is the
+        // assertion that would fail on Windows without SO_REUSEADDR.
+        let rebound = bind_preview_gate(port)
+            .expect("gate must rebind the same $PORT immediately after teardown");
+        drop(rebound);
     }
 }
