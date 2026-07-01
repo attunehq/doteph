@@ -184,20 +184,30 @@ With no health check, `eph` waits a fixed 500 ms and proceeds.
 
 ## Lifecycle hooks
 
-- `post-start` runs on the host via the platform shell (`sh -c` / `cmd /C`), in
-  the workspace directory, in a
-  **second phase** of `eph up`: every targeted service is first brought to a
-  healthy state, then every service's `post-start` hooks run. Deferring hooks
-  this way lets a hook reference any other service's resolved port. Hooks run on
-  **every** `eph up` regardless of source type or start path (fresh create,
-  restart, reused), so they are expected to be idempotent. A failing hook aborts
-  `up`.
+Four hooks bracket a service, all run on the host via the platform shell (`sh -c`
+/ `cmd /C`) in the workspace directory:
+
+- `pre-start` runs just before a service is created, in phase 1 of `eph up`, so
+  prep the service depends on (codegen, a generated config) finishes first. It
+  sees the services already up at that point (backing services start before `run=`
+  apps) but not its own not-yet-assigned port. A failing hook aborts `up` before
+  the service starts.
+- `post-start` runs in a **second phase** of `eph up`: every targeted service is
+  first brought to a healthy state, then every service's `post-start` hooks run.
+  Deferring hooks this way lets a hook reference any other service's resolved
+  port. `pre-start` and `post-start` both run on **every** `eph up` regardless of
+  source type or start path (fresh create, restart, reused), so they are expected
+  to be idempotent. A failing `post-start` aborts `up`.
 - `pre-stop` runs before a service stops; a failing hook is propagated and aborts
   `eph down` / `eph clean`, leaving the service running so the hook can be fixed
   and retried (the process/Compose teardown that follows is still best-effort).
-- Both hooks receive eph's resolved environment (the `eph env` variables, `EPH_*`
-  metadata, and the service's own `env.X`); the same environment is exposed to
-  arbitrary commands by `eph run`.
+- `post-stop` runs after a service has stopped, for cleanup eph cannot do itself.
+  It sees the same pre-teardown snapshot as `pre-stop`. A failing hook is
+  propagated and aborts the rest of teardown; because the service is already
+  stopped, a later `down` will not re-run it.
+- All four hooks receive eph's resolved environment (the `eph env` variables,
+  `EPH_*` metadata, and the service's own `env.X`); the same environment is
+  exposed to arbitrary commands by `eph run`.
 
 ## Teardown levels
 

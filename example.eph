@@ -41,6 +41,11 @@ port.web=8025
 run=npm run dev
 port=auto
 env.PORT=${web.port}
+# pre-start runs before the dev server boots: regenerate the typed API client
+# the app imports at startup. post-stop runs after the server stops: clean up a
+# scratch upload dir eph never created and cannot remove on its own.
+pre-start=npm run codegen
+post-stop=rm -rf .cache/uploads
 
 # =============================================================================
 # Environment Variables

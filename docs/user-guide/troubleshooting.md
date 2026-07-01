@@ -81,27 +81,33 @@ port=5432   # this whole thing is the value, and fails to parse
 Symptoms: `invalid port number at line N`, or an image/URL that mysteriously has
 ` # ...` appended. Move the comment to its own line above.
 
-## `post-start` ran again and broke (or duplicated data)
+## `pre-start` or `post-start` ran again and broke (or duplicated data)
 
-`post-start` hooks run on **every** `eph up`, including when a stopped container
-is restarted -- not just on first creation. A hook that is not idempotent (a
-plain `INSERT` seed, a one-shot setup script) will repeat its effect and may
-fail or duplicate rows on the second `eph up`.
+`pre-start` and `post-start` hooks run on **every** `eph up`, including when a
+stopped container is restarted -- not just on first creation. A hook that is not
+idempotent (a plain `INSERT` seed, a one-shot setup script) will repeat its
+effect and may fail or duplicate rows on the second `eph up`.
 
 Fixes:
 
 - Make the hook idempotent: a migration that no-ops when already applied, an
-  `INSERT ... ON CONFLICT DO NOTHING` seed, `CREATE TABLE IF NOT EXISTS`.
-- Move one-off or destructive work out of `post-start` and run it explicitly
+  `INSERT ... ON CONFLICT DO NOTHING` seed, `CREATE TABLE IF NOT EXISTS`,
+  codegen that overwrites its output in place.
+- Move one-off or destructive work out of the hook and run it explicitly
   with [`eph run`](command-reference.md#eph-run-cmd) when you actually want it.
 
-## `eph down` or `eph clean` fails on a `pre-stop` hook
+## `eph down` or `eph clean` fails on a `pre-stop` or `post-stop` hook
 
 A failing `pre-stop` hook **aborts** the teardown and leaves the service running,
 so the hook (a backup, a drain) can be fixed and retried rather than silently
-skipped. If a broken `pre-stop` is wedging teardown:
+skipped. A failing `post-stop` hook (cleanup that runs after the service stops)
+also aborts the rest of the teardown, but its own service is already stopped, so
+a re-run of `eph down` will not run that `post-stop` again. If a broken hook is
+wedging teardown:
 
-- Fix the hook and re-run `eph down` / `eph clean`.
+- Fix the hook and re-run `eph down` / `eph clean`. A `pre-stop` will retry; a
+  `post-stop` whose service already stopped must be run by hand (for example with
+  [`eph run`](command-reference.md#eph-run-cmd)).
 - Or skip the hooks for this teardown: `eph down --skip-hooks` /
   `eph clean --skip-hooks`.
 

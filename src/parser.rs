@@ -75,10 +75,14 @@ pub struct Service {
     pub env: HashMap<String, String>,
     /// Volume mounts (host:container format)
     pub volumes: Vec<String>,
+    /// Commands to run before the service is started
+    pub pre_start: Vec<String>,
     /// Commands to run after service is ready
     pub post_start: Vec<String>,
     /// Commands to run before stopping the service
     pub pre_stop: Vec<String>,
+    /// Commands to run after the service has stopped
+    pub post_stop: Vec<String>,
     /// Health check command
     pub healthcheck: Option<String>,
     /// Timeout in seconds to wait for service to be ready
@@ -144,8 +148,10 @@ struct ServiceBuilder {
     ports: Vec<PortMapping>,
     env: HashMap<String, String>,
     volumes: Vec<String>,
+    pre_start: Vec<String>,
     post_start: Vec<String>,
     pre_stop: Vec<String>,
+    post_stop: Vec<String>,
     healthcheck: Option<String>,
     ready_timeout_secs: Option<u64>,
     build_context: Option<String>,
@@ -187,8 +193,10 @@ impl ServiceBuilder {
             ports: self.ports,
             env: self.env,
             volumes: self.volumes,
+            pre_start: self.pre_start,
             post_start: self.post_start,
             pre_stop: self.pre_stop,
+            post_stop: self.post_stop,
             healthcheck: self.healthcheck,
             ready_timeout_secs: self.ready_timeout_secs,
             build_context: self.build_context,
@@ -392,11 +400,17 @@ fn parse_service_property(
         "volume" => {
             service.volumes.push(value.to_string());
         }
+        "pre-start" => {
+            service.pre_start.push(value.to_string());
+        }
         "post-start" => {
             service.post_start.push(value.to_string());
         }
         "pre-stop" => {
             service.pre_stop.push(value.to_string());
+        }
+        "post-stop" => {
+            service.post_stop.push(value.to_string());
         }
         "healthcheck" => {
             service.healthcheck = Some(value.to_string());
@@ -611,6 +625,30 @@ post-start=cargo sqlx fixtures load
         let result = parse(input).unwrap();
         let pg = result.services.get("postgres").unwrap();
         assert_eq!(pg.post_start.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_all_lifecycle_hooks() {
+        // Each hook accumulates in declaration order, independently of the others.
+        let input = r#"
+[api]
+run=./server
+pre-start=go generate ./...
+pre-start=sqlc generate
+post-start=./scripts/seed.sh
+pre-stop=./scripts/drain.sh
+post-stop=rm -rf ./tmp/scratch
+post-stop=./scripts/deregister.sh
+"#;
+        let result = parse(input).unwrap();
+        let api = result.services.get("api").unwrap();
+        assert_eq!(api.pre_start, ["go generate ./...", "sqlc generate"]);
+        assert_eq!(api.post_start, ["./scripts/seed.sh"]);
+        assert_eq!(api.pre_stop, ["./scripts/drain.sh"]);
+        assert_eq!(
+            api.post_stop,
+            ["rm -rf ./tmp/scratch", "./scripts/deregister.sh"]
+        );
     }
 
     #[test]

@@ -54,7 +54,8 @@ pub use workspace::Workspace;
   pair of surrounding quotes is stripped (`strip_quotes`).
 - Inside a section, `parse_service_property` interprets known keys (`image`,
   `dockerfile`, `compose`, `run`, `command`, `port`, `port.<name>`, `env.<KEY>`,
-  `volume`, `post-start`, `pre-stop`, `healthcheck`, `ready-timeout`, `context`,
+  `volume`, `pre-start`, `post-start`, `pre-stop`, `post-stop`, `healthcheck`,
+  `ready-timeout`, `context`,
   `expose.<name>`). `port`/`ready-timeout`/named-port/expose values are parsed as
   numbers and error on bad input.
 - An **unknown** key inside a section: if it looks like an env var name
@@ -114,19 +115,27 @@ engine.
 **`ServiceManager`** owns the `Workspace`, a `DockerClient`, and the loaded
 `ServiceState`:
 
-- `start_services` is the entry point and runs in two phases: phase 1 brings each
-  target to a healthy state via `create_service`, saves state, then phase 2 runs
-  every target's `post-start` hooks with the resolved environment. `start_all` is
-  a thin wrapper with an empty filter. A `skip_hooks` flag (CLI `--skip-hooks`)
-  short-circuits phase 2.
+- `start_services` is the entry point and runs in two phases: phase 1 walks the
+  targets in `start_order`, running each service's `pre-start` hooks (via
+  `run_service_pre_start`) just before bringing it to a healthy state with
+  `create_service`, then saves state; phase 2 runs every target's `post-start`
+  hooks with the resolved environment. A `resolved` map, seeded from `status` and
+  grown as each service comes up, is threaded through both phases so a `pre-start`
+  hook sees the services already up and phase 2 reuses the same snapshot.
+  `start_all` is a thin wrapper with an empty filter. A `skip_hooks` flag (CLI
+  `--skip-hooks`) short-circuits both hook phases.
 - `create_service` is the idempotent core that produces a healthy `RunningService`
   (no hooks). For `run=` services it first probes the tracked PID (a native
   liveness check via `proc::is_alive`) to
   avoid spawning duplicates. For Docker services it checks for an existing
   container: running -> reuse; stopped -> restart; absent -> create fresh via the
-  matching source path. `post-start` is **not** run here -- it runs in phase 2 of
-  `start_services` for every target, on every `eph up`, so hooks must be
-  idempotent.
+  matching source path. Hooks are **not** run here -- `pre-start` runs in phase 1
+  just before this call and `post-start` in phase 2 of `start_services`, for
+  every target, on every `eph up`, so hooks must be idempotent.
+- `run_all_pre_start` / `run_all_post_start` run every service's `pre-start` /
+  `post-start` hooks in one pass; `eph dev`, which drives the backing/foreground
+  split by hand, uses them to bracket its startup (`pre-start` up front, then
+  `post-start` once the foregrounded app is healthy).
 - `wait_for_healthy` polls `exec_in_container` (image/dockerfile) on a 1s
   interval under a `tokio::time::timeout`; no health check means a 500 ms sleep.
   `start_shell_command` and `start_compose` have their own host-side
@@ -135,7 +144,10 @@ engine.
 - `stop_service` takes the loaded `EphFile` and a snapshot of running services,
   runs `pre-stop` with the resolved environment (a failure is **propagated**,
   aborting teardown, unless `skip_hooks` / CLI `--skip-hooks`), then stops by
-  source type: Docker (stop, optionally remove), `run` (graceful terminate via
+  source type, then runs `post-stop` against the same pre-teardown snapshot (also
+  propagated on failure, but the service is already stopped so it will not re-run
+  on a later `down`). Stopping goes by source type: Docker (stop, optionally
+  remove), `run` (graceful terminate via
   `proc::terminate`, wait, then `proc::force_kill`), or compose (`docker compose
   down`). For `run`, teardown targets the whole process tree the shell spawned,
   not just the wrapper PID, so a compound command's children are not orphaned: on

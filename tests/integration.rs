@@ -66,6 +66,41 @@ fn hook_success() -> &'static str {
     "ver >NUL"
 }
 
+/// A hook that creates the named marker file (its existence is the signal).
+#[cfg(unix)]
+fn hook_touch(file: &str) -> String {
+    format!("touch {file}")
+}
+
+#[cfg(windows)]
+fn hook_touch(file: &str) -> String {
+    format!("type nul > {file}")
+}
+
+/// A hook that appends `marker` to `file`, used to record the order in which the
+/// lifecycle steps ran.
+#[cfg(unix)]
+fn hook_append(marker: &str, file: &str) -> String {
+    format!("printf '{marker}' >> {file}")
+}
+
+#[cfg(windows)]
+fn hook_append(marker: &str, file: &str) -> String {
+    format!("echo {marker}>> {file}")
+}
+
+/// A `run=` command that records `marker` in `file` and then stays alive, so a
+/// hook's write to the same file can be ordered against the service starting.
+#[cfg(unix)]
+fn run_append_and_wait(marker: &str, file: &str) -> String {
+    format!("printf '{marker}' >> {file}; sleep 30")
+}
+
+#[cfg(windows)]
+fn run_append_and_wait(marker: &str, file: &str) -> String {
+    format!("echo {marker}>> {file}& ping -n 30 127.0.0.1 >NUL")
+}
+
 #[cfg(unix)]
 fn print_env_command(name: &str) -> Vec<&str> {
     vec!["run", "printenv", name]
@@ -424,6 +459,163 @@ DEBUG=true
 // ============================================================================
 // Lifecycle Hook Tests
 // ============================================================================
+
+/// A `pre-start` hook runs before its service is created.
+#[tokio::test]
+async fn pre_start_hook_runs() {
+    let ws = TestWorkspace::new(&format!(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+pre-start={}
+"#,
+        hook_touch("pre-start-ran")
+    ));
+
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    assert!(
+        ws.path().join("pre-start-ran").exists(),
+        "pre-start hook did not run"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// A `pre-start` hook runs *before* the service it precedes boots. The `run=`
+/// app and the hook both append to one file, so the recorded order proves the
+/// hook ran first.
+#[tokio::test]
+async fn pre_start_runs_before_service() {
+    let ws = TestWorkspace::new(&format!(
+        r#"
+[app]
+run={}
+pre-start={}
+"#,
+        run_append_and_wait("app", "order"),
+        hook_append("pre", "order")
+    ));
+
+    ws.eph_ok(&["up", "app"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let order = std::fs::read_to_string(ws.path().join("order"))
+        .expect("neither the hook nor the app wrote order");
+    let pre = order.find("pre");
+    let app = order.find("app");
+    assert!(
+        matches!((pre, app), (Some(p), Some(a)) if p < a),
+        "pre-start should run before the service started, got: {order:?}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// A `pre-start` hook sees eph's resolved environment, the same way `post-start`
+/// does. Because it runs before its own service, a backing service it references
+/// (started earlier in start order) still resolves.
+#[tokio::test]
+async fn pre_start_hook_receives_resolved_env() {
+    let ws = TestWorkspace::new(&format!(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+
+[app]
+run={}
+pre-start={}
+
+REDIS_URL=redis://localhost:${{redis.port}}
+"#,
+        run_append_and_wait("app", "order"),
+        hook_write_redis_url("pre-start-env")
+    ));
+
+    ws.eph_ok(&["up"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let redis_url = ws
+        .env_json()
+        .await
+        .get("REDIS_URL")
+        .expect("REDIS_URL not found")
+        .clone();
+
+    let captured = std::fs::read_to_string(ws.path().join("pre-start-env"))
+        .expect("pre-start hook did not write pre-start-env");
+    let captured = captured.trim_end_matches(['\r', '\n']);
+    assert_eq!(
+        captured, redis_url,
+        "pre-start hook saw a stale or unresolved REDIS_URL"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// A failing `pre-start` hook aborts `eph up` before the service it precedes is
+/// created, so the service never comes up.
+#[tokio::test]
+async fn pre_start_failure_aborts_up() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+pre-start=exit 1
+"#,
+    );
+
+    let out = ws.eph(&["up", "redis"]).await;
+    assert!(
+        !out.status.success(),
+        "up should fail when a pre-start hook fails"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("pre-start hook failed"),
+        "expected a pre-start failure message, got: {stderr}"
+    );
+
+    // The service must not have started: a failing pre-start aborts before create.
+    let status = ws.eph_ok(&["status"]).await;
+    assert!(
+        !status.contains("localhost:"),
+        "service should not be running after a failed pre-start: {status}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// `eph up --skip-hooks` brings services up without running their `pre-start`
+/// hooks.
+#[tokio::test]
+async fn up_skip_hooks_does_not_run_pre_start() {
+    let ws = TestWorkspace::new(&format!(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+pre-start={}
+"#,
+        hook_touch("pre-start-ran")
+    ));
+
+    ws.eph_ok(&["up", "--skip-hooks", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let status = ws.eph_ok(&["status"]).await;
+    assert!(status.contains("redis") && status.contains("localhost:"));
+    assert!(
+        !ws.path().join("pre-start-ran").exists(),
+        "pre-start should be skipped with --skip-hooks"
+    );
+
+    ws.eph_ok(&["down", "redis"]).await;
+}
 
 #[tokio::test]
 async fn post_start_hook_runs() {
@@ -793,6 +985,161 @@ REDIS_URL=redis://localhost:${{redis.port}}
     assert_eq!(
         captured, redis_url,
         "pre-stop hook saw a different REDIS_URL"
+    );
+}
+
+/// A `post-stop` hook runs after its service is stopped, during `eph down`.
+#[tokio::test]
+async fn post_stop_hook_runs() {
+    let ws = TestWorkspace::new(&format!(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+post-stop={}
+"#,
+        hook_touch("post-stop-ran")
+    ));
+
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    // The hook must not run at startup, only on teardown.
+    assert!(
+        !ws.path().join("post-stop-ran").exists(),
+        "post-stop should not run during up"
+    );
+
+    ws.eph_ok(&["down"]).await;
+    assert!(
+        ws.path().join("post-stop-ran").exists(),
+        "post-stop hook did not run on down"
+    );
+}
+
+/// A `post-stop` hook sees the same resolved environment as `pre-stop`: the
+/// pre-teardown snapshot, so the now-stopped service's port still resolves.
+#[tokio::test]
+async fn post_stop_hook_receives_resolved_env() {
+    let ws = TestWorkspace::new(&format!(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+post-stop={}
+
+REDIS_URL=redis://localhost:${{redis.port}}
+"#,
+        hook_write_redis_url("post-stop-env")
+    ));
+
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let redis_url = ws
+        .env_json()
+        .await
+        .get("REDIS_URL")
+        .expect("REDIS_URL not found")
+        .clone();
+
+    ws.eph_ok(&["down"]).await;
+
+    let captured = std::fs::read_to_string(ws.path().join("post-stop-env"))
+        .expect("post-stop hook did not write post-stop-env");
+    let captured = captured.trim_end_matches(['\r', '\n']);
+    assert_eq!(
+        captured, redis_url,
+        "post-stop hook saw a different REDIS_URL"
+    );
+}
+
+/// A failing `post-stop` hook aborts the teardown with a clear message. The
+/// service is already stopped by the time the hook runs.
+#[tokio::test]
+async fn post_stop_failure_aborts_down() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+post-stop=exit 1
+"#,
+    );
+
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let out = ws.eph(&["down"]).await;
+    assert!(
+        !out.status.success(),
+        "down should fail when a post-stop hook fails"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("post-stop hook failed"),
+        "expected a post-stop failure message, got: {stderr}"
+    );
+
+    // The service was still stopped even though the hook failed afterward.
+    let status = ws.eph_ok(&["status"]).await;
+    assert!(
+        status.contains("stopped") || status.contains("No services running"),
+        "service should be stopped after a post-stop failure: {status}"
+    );
+}
+
+/// `--skip-hooks` lets teardown bypass a failing `post-stop` hook.
+#[tokio::test]
+async fn down_skip_hooks_bypasses_failing_post_stop() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+post-stop=exit 1
+"#,
+    );
+
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let failed = ws.eph(&["down"]).await;
+    assert!(!failed.status.success(), "down should fail on the bad hook");
+
+    ws.eph_ok(&["down", "--skip-hooks"]).await;
+    let status = ws.eph_ok(&["status"]).await;
+    assert!(
+        status.contains("stopped") || status.contains("No services running"),
+        "service should be stopped after --skip-hooks down: {status}"
+    );
+}
+
+/// A failing `post-stop` hook on a service that never started must not break
+/// `eph down`: like `pre-stop`, it is gated on the pre-teardown snapshot.
+#[tokio::test]
+async fn post_stop_skipped_for_non_running_service() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+
+[never_started]
+image=redis:7-alpine
+port=6379
+post-stop=exit 1
+"#,
+    );
+
+    ws.eph_ok(&["up", "redis"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let out = ws.eph(&["down"]).await;
+    assert!(
+        out.status.success(),
+        "down should not run post-stop for a non-running service: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

@@ -3,8 +3,8 @@
 `eph` is a developer tool that, by design, executes commands and manages Docker
 containers based on the contents of a workspace's `.eph` file. Specifically, it:
 
-- runs shell commands from `.eph` (`run=`, `post-start=`, `pre-stop=`, and
-  `healthcheck=`) on your machine,
+- runs shell commands from `.eph` (`run=`, the `pre-start=` / `post-start=` /
+  `pre-stop=` / `post-stop=` lifecycle hooks, and `healthcheck=`) on your machine,
 - starts, stops, and removes Docker containers and named volumes,
 - publishes container ports (bound to `127.0.0.1`), and
 - reads and prints environment values (`eph env`) and persists service state to
