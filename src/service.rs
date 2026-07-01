@@ -2400,24 +2400,6 @@ impl ServiceManager {
         self.state.save(&self.workspace).await
     }
 
-    /// Pin a `run=` service's default auto port to `port` for the next start.
-    ///
-    /// `eph dev` uses this when a Claude Desktop preview server has already
-    /// chosen the host port and passed it as `$PORT`: seeding it into the
-    /// remembered `auto_ports` makes [`start_shell_command`](Self::start_shell_command)
-    /// reuse that exact port (when it is free, which the preview server
-    /// guarantees by having picked it), so the app binds the port the preview is
-    /// watching instead of a fresh random one. It falls back to ordinary
-    /// auto-allocation if the port turns out to be taken, and is a no-op for a
-    /// fixed-port (`port=3000`) service, which has no auto port to reuse.
-    pub fn pin_default_port(&mut self, service: &str, port: u16) {
-        self.state
-            .auto_ports
-            .entry(service.to_string())
-            .or_default()
-            .insert("default".to_string(), port);
-    }
-
     /// Start the foreground `run=` service for `eph dev`, inheriting eph's stdio.
     ///
     /// Unlike the backing `run=` path
@@ -2429,11 +2411,11 @@ impl ServiceManager {
     /// a PID that a zombie would keep reading as alive.
     ///
     /// There is no port-conflict re-launch here (`detect_exit` is off): a
-    /// foreground app owns its streams, and when `eph dev` has pinned the preview
-    /// server's `$PORT` it must bind exactly that port, so a bind failure should
-    /// surface on the inherited stderr rather than silently retry elsewhere. Call
-    /// it after the backing services are up so the app's environment can already
-    /// interpolate their ports.
+    /// foreground app owns its streams, so a bind failure should surface on the
+    /// inherited stderr rather than silently retry on a different port (which
+    /// would leave the app unreachable at the port `eph dev` expects to gate).
+    /// Call it after the backing services are up so the app's environment can
+    /// already interpolate their ports.
     ///
     /// # Errors
     ///
@@ -2452,9 +2434,9 @@ impl ServiceManager {
             bail!("service '{name}' is not a run= service, so `eph dev` cannot foreground it");
         };
 
-        // Reuse the remembered auto port, which `eph dev` may have pinned to the
-        // preview server's $PORT (see `pin_default_port`). Snapshot the other
-        // running services so the app's env can interpolate their ports.
+        // Reuse the remembered auto port so the app's URL stays stable across
+        // restarts. Snapshot the other running services so the app's env can
+        // interpolate their ports.
         let prev_ports = self.state.auto_ports.get(name).cloned();
         let others = self.status().await?;
         let ports = allocate_ports(&service.ports, prev_ports.as_ref())?;

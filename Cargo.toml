@@ -32,6 +32,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 shell-words = "1"
+# `eph dev` reopens the preview `$PORT` gate on every bring-up, so a `--watch`
+# restart rebinds the same fixed port right after the old gate was torn down.
+# tokio's default listener does not set SO_REUSEADDR (mio omits it on Windows),
+# which makes that rebind race the old connections' lingering sockets. socket2
+# builds the gate listener with SO_REUSEADDR so the rebind is race-free.
+socket2 = "0.6"
 # Native PID liveness + termination so `run=` services work without a POSIX
 # `kill` (Windows has none). Only the process-inspection surface is needed, so
 # the default features (disks, network, components, users) are turned off.

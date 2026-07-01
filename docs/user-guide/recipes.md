@@ -179,12 +179,20 @@ Then point the preview server at `eph dev`:
 How the pieces line up:
 
 - **`autoPort` and the port.** The preview server picks a free host port and
-  passes it as `$PORT`. `eph dev` binds the foreground app's `port=auto` to that
-  exact port, so the app's `${web.port}` (and the `healthcheck` and any
-  `${web.port}` env) all resolve to the port the preview is watching. Do not give
-  the app a fixed port as well.
-- **Setup runs once per launch.** `eph dev` does `eph up` first, so postgres is
-  healthy and `post-start` (migrate/seed) has run before the app starts.
+  passes it as `$PORT`, then polls it and reveals the app the instant it accepts a
+  connection. `eph dev` runs the app on its own internal `port=auto` and opens
+  `$PORT` as a forwarding gate to it, so `${web.port}` (and the `healthcheck` and
+  any `${web.port}` env) resolve to the app's real port. Do not give the app a
+  fixed port as well.
+- **The preview waits for seeding, not just for the port.** The gate is the point:
+  `eph dev` opens `$PORT` only *after* `post-start` hooks run, so the preview
+  cannot go live while a slow seed is still filling the database. Without it the
+  app would bind `$PORT` itself and the preview would show an empty app the moment
+  the server could answer its health check, often tens of seconds before the seed
+  finished.
+- **Setup runs once per launch.** `eph dev` brings the backing services up, starts
+  the app, then runs every service's `post-start` (migrate/seed) before opening the
+  gate, so the first thing the preview sees is a seeded app.
 - **The app is interactive.** `eph dev` wires its own stdin, stdout, and stderr
   straight through to the app, so the dev server's output reaches the preview
   console live and anything the preview server writes to stdin reaches the app.
