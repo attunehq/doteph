@@ -30,7 +30,9 @@ impl Workspace {
     ///
     /// The path is canonicalized, so the resulting [`id`](Self::id) is stable
     /// regardless of how the directory was addressed (relative path, symlink,
-    /// etc.).
+    /// etc.). On Windows the canonical form omits the extended-length `\\?\`
+    /// prefix (via `dunce`) whenever a plain `C:\...` path exists, so the stored
+    /// path is one Docker and the display code can use directly.
     ///
     /// # Errors
     ///
@@ -49,7 +51,11 @@ impl Workspace {
     /// # }
     /// ```
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().canonicalize().with_context(|| {
+        // dunce::canonicalize, not std's: on Windows std returns the
+        // extended-length `\\?\C:\...` form, which Docker rejects as a bind-mount
+        // source and which leaks into display output. dunce yields a plain
+        // `C:\...` path whenever one exists. On Unix it is std::fs::canonicalize.
+        let path = dunce::canonicalize(path.as_ref()).with_context(|| {
             format!(
                 "failed to resolve workspace path: {}",
                 path.as_ref().display()

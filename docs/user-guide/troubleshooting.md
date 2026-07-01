@@ -168,6 +168,35 @@ When you run under WSL, `eph` is a Linux process, so its state directory is the
 `%LOCALAPPDATA%` path. The `%LOCALAPPDATA%` location applies only to a native
 Windows build.
 
+### Relative bind mounts on Windows
+
+A relative host bind mount (`volume=./seed:/docker-entrypoint-initdb.d`) resolves
+against the workspace root, which eph now stores as a plain `C:\...` path. Older
+builds (up to v0.3.1) stored the canonical path in Windows' extended-length
+`\\?\C:\...` form and forwarded it to Docker as the bind source; the daemon
+rejects that form with a garbled error:
+
+```
+Error: failed to create container
+Caused by:
+    Docker responded with status code 500: \?\C%!(EXTRA string=is not a valid Windows path)
+```
+
+If you hit this, update eph: relative binds now resolve to a source Docker
+accepts. Two knock-on notes:
+
+- **Workspace IDs changed on Windows.** The ID is derived from the workspace
+  path, and dropping the `\\?\` prefix changes it. Containers, named volumes, and
+  the state directory from an older build live under the previous ID, so eph no
+  longer sees them. Run `docker ps -a` / `docker volume ls` and remove any
+  leftover `eph-<old-short-id>-*` containers and volumes by hand, then
+  `eph up` fresh. Named volumes did work before this fix, so this cleanup only
+  matters if you had services running under an older build.
+- **Very long workspace paths.** If the workspace sits deep enough that it has no
+  ordinary `C:\...` representation, the path keeps the `\\?\` prefix and eph
+  rejects the bind mount up front with a clear message rather than passing an
+  unusable source to Docker. Move the workspace to a shorter path.
+
 ## Getting more detail
 
 `eph -v <command>` enables debug logging (to stderr). For a service's own

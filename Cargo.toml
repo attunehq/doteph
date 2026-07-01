@@ -20,6 +20,12 @@ anyhow = "1"
 bollard = "0.21"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+# Canonicalizing a workspace path with std on Windows yields the extended-length
+# `\\?\C:\...` form. Docker's Windows volume parser rejects that as a bind-mount
+# source, and it also leaks into display output. dunce::canonicalize returns a
+# plain `C:\...` path whenever one exists (the common case), keeping the verbatim
+# prefix only for paths that genuinely require it. On Unix it is std::fs::canonicalize.
+dunce = "1"
 futures-util = "0.3"
 # `eph dev --watch` compiles the user's globs into a matcher and watches the
 # workspace tree for changes: globset for gitignore-style glob matching, notify
