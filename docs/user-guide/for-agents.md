@@ -37,12 +37,65 @@ Prefer `eph env -f json` for parsing:
 DATABASE_URL=$(eph env -f json | jq -r .DATABASE_URL)
 ```
 
+## Prewarm dependency services on session start
+
+If the `.eph` file defines roles (a `roles_order` and a `role=` on every service),
+you can bring up just the **dependency tier** without starting the first-party app.
+This is the recommended agent integration: a Claude Code **SessionStart hook** that
+prewarms the databases and caches, injects their connection env, and leaves the app
+alone (starting it could bind preview ports or trigger side effects the agent did
+not ask for).
+
+The hook runs `eph up --role dep` (substitute your actual dependency role name),
+then appends `eph env` to the file named by `$CLAUDE_ENV_FILE`, which Claude Code
+sources so later Bash tool calls inherit `DATABASE_URL` and friends:
+
+```sh
+#!/usr/bin/env bash
+# SessionStart hook: prewarm dependency services and inject their env.
+eph up --role dep >/dev/null 2>&1 || exit 0
+[ -n "$CLAUDE_ENV_FILE" ] && eph env >> "$CLAUDE_ENV_FILE"
+```
+
+Wire it in `.claude/settings.json` (project scope, so everyone opening the
+repo/worktree gets it):
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [ { "type": "command", "command": ".claude/hooks/eph-prewarm.sh" } ]
+      }
+    ]
+  }
+}
+```
+
+Notes:
+
+- `eph up` is idempotent, so a later `eph up` or `eph dev` reuses the prewarmed
+  dependency services instead of restarting them. `eph dev` on exit leaves the tier
+  it adopted running, so it stays warm for the next command.
+- `--role dep` brings up the dependency role and its dependency closure only, never
+  the `app`. Add `--skip-hooks` if you want to prewarm without running `post-start`
+  seeding; the plain form above runs it.
+- There is no `eph hooks install`: roles are user-defined names, so substitute your
+  own dependency role. For a personal, cross-repo version put the same block in
+  `~/.claude/settings.json` instead.
+- Optional: a `SessionEnd` hook running `eph down --role dep` cleans the tier when a
+  session ends. The default is to leave it warm for reuse.
+
+See [Recipes](recipes.md#prewarm-dependency-services-on-claude-code-session-start)
+for the full write-up.
+
 ## Command cheat sheet
 
 | Command | Effect |
 |---------|--------|
-| `eph up [svc...]` | Start all / named services. Runs each service's `pre-start` just before it is created, pulls/builds, waits for health, then runs `post-start` for every service. Both run on **every** `eph up`. A failing `pre-start` aborts the `up` before its service starts; a failing `post-start` aborts the `up`. `--skip-hooks` skips both. |
-| `eph down [--rm \| -r] [svc...]` | Stop all / named. `--rm` (alias `-r`) also removes containers. Compose is always fully torn down. Runs `pre-stop` before each service stops and `post-stop` after. A failing `pre-stop` aborts the `down` (service left running); a failing `post-stop` aborts the rest of teardown. `--skip-hooks` bypasses both. |
+| `eph up [svc...] [--role R]...` | Start all / named services. `--role R` (repeatable) adds a role plus its dependency closure (needs a `roles_order`); combines with names. Runs each service's `pre-start` just before it is created, pulls/builds, waits for health, then runs `post-start` for every service. Both run on **every** `eph up`. A failing `pre-start` aborts the `up` before its service starts; a failing `post-start` aborts the `up`. `--skip-hooks` skips both. |
+| `eph down [--rm \| -r] [svc...] [--role R]...` | Stop all / named. `--role R` (repeatable) adds a role plus everything that depends on it. `--rm` (alias `-r`) also removes containers. Compose is always fully torn down. Runs `pre-stop` before each service stops and `post-stop` after. A failing `pre-stop` aborts the `down` (service left running); a failing `post-stop` aborts the rest of teardown. `--skip-hooks` bypasses both. |
 | `eph clean` | Full reset: remove containers + named volumes + state. Deletes data. Runs `pre-stop` / `post-stop` like `eph down`; a failing hook aborts it; `--skip-hooks` bypasses both. |
 | `eph run <cmd>...` | Run a command in the workspace root with the resolved env + `EPH_*` metadata. Exits with the command's code. |
 | `eph logs [svc] [-f] [-n N]` | Show logs. No svc: all services interleaved, each line tagged `[name]`. One svc: raw. `run=` reads a captured log file; Docker/compose proxy `docker logs`. Shows even for stopped services. `-f` follows (all or one). |

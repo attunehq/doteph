@@ -24,13 +24,23 @@ service names, starts only those.
 
 | Flag | Description |
 |------|-------------|
+| `--role ROLE` | Bring up this role and everything it depends on (its forward/dependency closure). Repeatable. Requires a `roles_order`; combines with any SERVICE names. |
 | `--skip-hooks` | Bring services up healthy but do not run their `pre-start` or `post-start` hooks. |
 
 ```sh
 eph up                 # all services
 eph up postgres redis  # just these two
+eph up --role dep      # the dep tier and its dependencies (e.g. prewarm the database)
+eph up --role app      # the app plus every role it depends on
 eph up --skip-hooks    # start everything but skip pre-start/post-start (e.g. codegen, migrations)
 ```
+
+- `--role ROLE` (repeatable) selects a role and its **dependency closure**: the
+  role plus every role it transitively depends on, since a role cannot run without
+  the roles below it. `--role app` with `roles_order=dep,app` starts both `dep` and
+  `app`; `--role dep` starts only `dep`. It combines with positional SERVICE names,
+  starting the union. Using `--role` on a file that defines no `roles_order` is an
+  error saying so. See [Roles and ordering](eph-file.md#roles-and-ordering).
 
 - Idempotent: a running service is reused; a stopped-but-present container is
   restarted; otherwise a fresh container is created.
@@ -60,6 +70,7 @@ already stopped.
 
 | Flag | Description |
 |------|-------------|
+| `--role ROLE` | Stop this role and everything that depends on it (its reverse/dependent closure), in reverse start order. Repeatable. Requires a `roles_order`; combines with any SERVICE names. |
 | `-r`, `--rm` | Also remove the stopped containers (not just stop them). |
 | `--skip-hooks` | Stop without running `pre-stop` or `post-stop` hooks (escape hatch for a broken hook). |
 
@@ -67,8 +78,17 @@ already stopped.
 eph down               # stop all, keep containers
 eph down --rm          # stop all and remove containers
 eph down postgres      # stop just postgres
+eph down --role dep    # stop the dep tier and everything that depends on it
 eph down --skip-hooks  # stop without running pre-stop/post-stop hooks
 ```
+
+- `--role ROLE` (repeatable) selects a role and its **dependent closure**: the role
+  plus every role that transitively depends on it, torn down in reverse start order,
+  because a dependency cannot be removed while the roles that need it are still up.
+  With `roles_order=dep,app`, `eph down --role dep` stops both `app` and `dep`. It
+  combines with positional SERVICE names, and requires a `roles_order` (an error
+  otherwise). `eph down` is otherwise absolute: it stops exactly what it targets,
+  with no ownership logic. See [Roles and ordering](eph-file.md#roles-and-ordering).
 
 Without `--rm`, containers and their data remain for a fast restart. With
 `--rm`, containers are removed (named-volume data is kept); the next `eph up`
@@ -116,11 +136,13 @@ Run the whole dev stack in the foreground, built for a Claude Desktop preview
 server (see [Recipes](recipes.md#claude-desktop-preview-servers)). It brings
 every service up (running `post-start` hooks, e.g. seeding), foregrounds a
 `run=` service with eph's own stdin, stdout, and stderr wired through to it, and
-stays attached until it is stopped. On stop it tears the stack down.
+stays attached until it is stopped. On stop it tears down only the services it
+brought up itself, leaving any that were already running when it started (a
+prewarmed dependency tier, typically) up.
 
 | Flag | Description |
 |------|-------------|
-| `--clean` | Tear down with `eph clean` (drop named volumes and their data) instead of the default `eph down` (keep them for a fast restart). |
+| `--clean` | On the final stop, tear the **whole** workspace down with `eph clean` (drop named volumes and their data), rather than the default of stopping only the services `eph dev` brought up and keeping the rest. |
 | `--watch GLOB` | Restart the whole stack when a file matching GLOB changes. Repeatable; globs are relative to the workspace root with gitignore-style separators. |
 
 ```sh
@@ -151,10 +173,14 @@ eph dev --watch "**/*.rs" --watch "*.toml"   # restart on source changes
   instead of the moment the server can answer its health check. Give the
   foreground app `port=auto` and read its `${service.port}`; do not also pin a
   fixed port.
-- **Teardown on stop**: a stop signal (the preview server's, or Ctrl-C) runs
-  `eph down` by default, or `eph clean` with `--clean`, then exits zero. A hard
-  kill (`SIGKILL` / `TerminateProcess`) cannot be caught, so it skips teardown
-  and leaves the stack up, recoverable with `eph down`.
+- **Teardown on stop**: a stop signal (the preview server's, or Ctrl-C) stops only
+  the services `eph dev` brought up, then exits zero. `eph dev` snapshots what was
+  already running at startup (a simple in-memory record, no persisted refcount) and
+  leaves those services up, so a dependency tier a SessionStart hook prewarmed stays
+  warm for the next command. With `--clean` it instead runs `eph clean` and
+  bulldozes the whole workspace, volumes included. A hard kill (`SIGKILL` /
+  `TerminateProcess`) cannot be caught, so it skips teardown and leaves the stack
+  up, recoverable with `eph down`.
 - **App exit**: if the foregrounded app exits on its own (a crash), `eph dev`
   leaves the backing services up and exits non-zero, so the preview server sees
   the dev server went down. The app's own output already streamed to your
@@ -163,12 +189,13 @@ eph dev --watch "**/*.rs" --watch "*.toml"   # restart on source changes
   paths relative to the workspace root, using gitignore-style separators: `*`
   stays within a directory and `**` spans them, so `*.toml` matches a top-level
   `Cargo.toml` while `**/*.rs` matches a `.rs` file at any depth. When a matching
-  file changes, eph tears the whole stack down (running `pre-stop` and
-  `post-stop` hooks) and brings it back up (running `pre-start` and `post-start`
-  hooks), so a restart is a full `eph down` + `eph dev`, not a bare process
-  bounce, and every lifecycle hook fires just as it would on a manual restart. A
-  restart always keeps volumes for speed, even under `--clean`; that reset is
-  reserved for the final stop. Changes are debounced, so one save is one restart,
+  file changes, eph tears down the services it brought up (running `pre-stop` and
+  `post-stop` hooks) and brings them back up (running `pre-start` and `post-start`
+  hooks), so a restart is a full down + up, not a bare process bounce, and every
+  lifecycle hook fires just as it would on a manual restart. Only the services
+  `eph dev` brought up are bounced: an adopted, already-running dependency tier
+  stays hot across restarts. A restart always keeps volumes for speed, even under
+  `--clean`; that reset is reserved for the final stop. Changes are debounced, so one save is one restart,
   and git's own churn under `.git` never triggers one. Without any `--watch` the
   stack never restarts.
   In watch mode an app that exits on its own (a crash) does not end the session:

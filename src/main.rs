@@ -46,6 +46,12 @@ enum Commands {
         #[arg(value_name = "SERVICE")]
         services: Vec<String>,
 
+        /// Bring up only these roles and everything they depend on. Repeatable
+        /// (`--role dep --role app`). Requires a `roles_order` in the `.eph` file.
+        /// Combines with any SERVICE names (their union is started).
+        #[arg(long = "role", value_name = "ROLE")]
+        roles: Vec<String>,
+
         /// Bring services up healthy but do not run their post-start hooks
         #[arg(long = "skip-hooks")]
         skip_hooks: bool,
@@ -56,6 +62,12 @@ enum Commands {
         /// Specific services to stop (defaults to all)
         #[arg(value_name = "SERVICE")]
         services: Vec<String>,
+
+        /// Stop only these roles and everything that depends on them. Repeatable
+        /// (`--role dep`). Requires a `roles_order` in the `.eph` file. Combines
+        /// with any SERVICE names (their union is stopped).
+        #[arg(long = "role", value_name = "ROLE")]
+        roles: Vec<String>,
 
         /// Remove containers after stopping them (instead of just stopping)
         #[arg(short = 'r', long = "rm")]
@@ -231,15 +243,17 @@ async fn main() -> Result<ExitCode> {
     match cli.command {
         Commands::Up {
             services,
+            roles,
             skip_hooks,
-        } => cmd_up(services, skip_hooks)
+        } => cmd_up(services, roles, skip_hooks)
             .await
             .map(|()| ExitCode::SUCCESS),
         Commands::Down {
             services,
+            roles,
             rm,
             skip_hooks,
-        } => cmd_down(services, rm, skip_hooks)
+        } => cmd_down(services, roles, rm, skip_hooks)
             .await
             .map(|()| ExitCode::SUCCESS),
         Commands::Clean { skip_hooks } => cmd_clean(skip_hooks).await.map(|()| ExitCode::SUCCESS),
@@ -280,9 +294,55 @@ async fn main() -> Result<ExitCode> {
     }
 }
 
-async fn cmd_up(service_filter: Vec<String>, skip_hooks: bool) -> Result<()> {
+/// Which direction a `--role` selection resolves in: `Up` pulls in each role's
+/// dependencies, `Down` pulls in each role's dependents. See
+/// [`resolve_service_selection`].
+#[derive(Clone, Copy)]
+enum Direction {
+    Up,
+    Down,
+}
+
+/// Turn a command's positional SERVICE names and `--role` values into the set of
+/// service names to act on.
+///
+/// Positional names are validated against the file and taken as-is. Each `--role`
+/// expands to its services plus, in the requested direction, the services it
+/// depends on (`Up`) or that depend on it (`Down`). The two are unioned, order
+/// preserved and duplicates dropped, so `eph up web --role dep` starts `web` and
+/// the whole dependency tier. An empty result means "act on everything", matching
+/// a bare `eph up` / `eph down`.
+fn resolve_service_selection(
+    eph: &EphFile,
+    services: Vec<String>,
+    roles: &[String],
+    dir: Direction,
+) -> Result<Vec<String>> {
+    for name in &services {
+        if !eph.services.contains_key(name) {
+            anyhow::bail!("unknown service: {}", name);
+        }
+    }
+    let mut names = services;
+    if !roles.is_empty() {
+        let from_roles = match dir {
+            Direction::Up => eph.services_for_roles_up(roles)?,
+            Direction::Down => eph.services_for_roles_down(roles)?,
+        };
+        for name in from_roles {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    Ok(names)
+}
+
+async fn cmd_up(services: Vec<String>, roles: Vec<String>, skip_hooks: bool) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
+
+    let service_filter = resolve_service_selection(&eph, services, &roles, Direction::Up)?;
 
     let mut manager = ServiceManager::new(workspace).await?;
 
@@ -307,35 +367,33 @@ async fn cmd_up(service_filter: Vec<String>, skip_hooks: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_down(service_filter: Vec<String>, rm: bool, skip_hooks: bool) -> Result<()> {
+async fn cmd_down(
+    services: Vec<String>,
+    roles: Vec<String>,
+    rm: bool,
+    skip_hooks: bool,
+) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
+
+    let targets = resolve_service_selection(&eph, services, &roles, Direction::Down)?;
 
     let mut manager = ServiceManager::new(workspace).await?;
 
     let action = if rm { "stopped and removed" } else { "stopped" };
 
-    if service_filter.is_empty() {
+    if targets.is_empty() {
         manager.stop_all(&eph, rm, skip_hooks).await?;
         println!("All services {}", action);
     } else {
-        // Snapshot running services once so pre-stop hooks see the full
-        // environment as it was before teardown began.
-        let running = manager.status().await?;
-        for name in &service_filter {
-            let service = eph
-                .services
-                .get(name)
-                .with_context(|| format!("unknown service: {}", name))?;
-            manager
-                .stop_service(name, service, rm, &eph, &running, skip_hooks)
-                .await?;
+        // Tear the subset down in reverse start order (dependents before the
+        // dependencies they need), persisting the dropped state entries.
+        manager
+            .stop_selected(&eph, &targets, rm, skip_hooks)
+            .await?;
+        for name in &targets {
             println!("{} {}", if rm { "Removed" } else { "Stopped" }, name);
         }
-        // Persist so the stopped services are dropped from state.json, not just
-        // from the in-memory copy. stop_all already saves; a targeted down must
-        // too, or the file keeps stale entries until the next `eph status`.
-        manager.save_state().await?;
     }
 
     Ok(())
@@ -408,6 +466,22 @@ async fn cmd_dev(service: Option<String>, clean: bool, watch: Vec<String>) -> Re
 
     let mut manager = ServiceManager::new(workspace).await?;
 
+    // Services already running before `eph dev` starts (typically dependency
+    // services a SessionStart hook prewarmed with `eph up --role=<dep>`) are
+    // adopted, not owned: eph dev reuses them and must leave them running when it
+    // tears down. Everything else it brings up itself and is responsible for
+    // stopping. Snapshotting here, before the first bring-up, is the whole
+    // ownership model: no persisted refcount required. `--clean` overrides this
+    // and bulldozes everything, since it is an explicit full-reset request.
+    let brought_up: Vec<String> = {
+        let already_running = manager.status().await?;
+        eph.services
+            .keys()
+            .filter(|name| !already_running.contains_key(*name))
+            .cloned()
+            .collect()
+    };
+
     // A preview server (Claude Desktop) assigns a host port, passes it as $PORT,
     // then polls it and reveals the app the instant it accepts a connection. We
     // deliberately do NOT let the app bind that port itself: if it did, the
@@ -459,7 +533,7 @@ async fn cmd_dev(service: Option<String>, clean: bool, watch: Vec<String>) -> Re
 
         match stop {
             DevStop::Signal => {
-                final_teardown(&mut manager, &eph, clean).await?;
+                final_teardown(&mut manager, &eph, clean, &brought_up).await?;
                 // Reap the foreground child we just tore down.
                 let _ = child.wait().await;
                 return Ok(ExitCode::SUCCESS);
@@ -486,24 +560,27 @@ async fn cmd_dev(service: Option<String>, clean: bool, watch: Vec<String>) -> Re
                 eprintln!("dev server '{foreground}' {how}; waiting for a change to restart");
                 tokio::select! {
                     () = wait_for_shutdown() => {
-                        final_teardown(&mut manager, &eph, clean).await?;
+                        final_teardown(&mut manager, &eph, clean, &brought_up).await?;
                         return Ok(ExitCode::SUCCESS);
                     }
                     path = watcher.changed_or_pending() => {
                         restart_banner(&path);
                         // Fall through to the uniform full restart below.
-                        manager.stop_all(&eph, false, false).await?;
+                        manager.stop_selected(&eph, &brought_up, false, false).await?;
                     }
                 }
             }
             DevStop::FileChanged(path) => {
                 // A restart is a full down + up, including hooks: stop the stack
                 // (pre-stop hooks and all), keeping containers and volume data for
-                // a fast restart, then loop to bring it back up. A change never
-                // drops volumes, even under `--clean`; that teardown is reserved
-                // for the final stop.
+                // a fast restart, then loop to bring it back up. Only the services
+                // eph dev brought up are bounced; adopted prewarmed dependencies
+                // stay up across the restart. A change never drops volumes, even
+                // under `--clean`; that teardown is reserved for the final stop.
                 restart_banner(&path);
-                manager.stop_all(&eph, false, false).await?;
+                manager
+                    .stop_selected(&eph, &brought_up, false, false)
+                    .await?;
                 // Reap the foreground child torn down with the stack before the
                 // next pass spawns its replacement.
                 let _ = child.wait().await;
@@ -512,17 +589,26 @@ async fn cmd_dev(service: Option<String>, clean: bool, watch: Vec<String>) -> Re
     }
 }
 
-/// Tear the whole stack down on a final stop: `eph clean` (drop volumes and their
-/// data) with `--clean`, otherwise `eph down` (keep them for a fast restart).
-/// Shared by the stop-signal path and the watch-mode "crashed, then stopped" path
-/// so both honor `--clean` identically.
-async fn final_teardown(manager: &mut ServiceManager, eph: &EphFile, clean: bool) -> Result<()> {
+/// Tear the stack down on a final stop.
+///
+/// With `--clean` this bulldozes the whole workspace (`eph clean`: drop every
+/// service and its volume data), the explicit full-reset path. Without it, only
+/// the services `eph dev` brought up are stopped (`brought_up`), leaving any it
+/// adopted (a session hook's prewarmed dependencies) running for a fast restart
+/// or the next command. Shared by the stop-signal path and the watch-mode
+/// "crashed, then stopped" path so both honor `--clean` identically.
+async fn final_teardown(
+    manager: &mut ServiceManager,
+    eph: &EphFile,
+    clean: bool,
+    brought_up: &[String],
+) -> Result<()> {
     eprintln!();
     if clean {
         manager.clean(eph, false).await?;
         eprintln!("Workspace cleaned");
     } else {
-        manager.stop_all(eph, false, false).await?;
+        manager.stop_selected(eph, brought_up, false, false).await?;
         eprintln!("Services stopped");
     }
     Ok(())
@@ -1036,7 +1122,19 @@ async fn cmd_check() -> Result<()> {
             ServiceSource::Compose(path) => format!("compose: {}", path),
             ServiceSource::Command(cmd) => format!("command: {}", cmd),
         };
-        println!("  {} ({})", name, source);
+        match &svc.role {
+            Some(role) => println!("  {} [{}] ({})", name, role, source),
+            None => println!("  {} ({})", name, source),
+        }
+    }
+
+    // In roles mode, show the tiers and the resulting bring-up order so the
+    // dependency-vs-app split (and what `--role` will select) is visible at a
+    // glance without running Docker.
+    if eph.roles_order.is_some() {
+        let order: Vec<&str> = eph.start_order().iter().map(|s| s.as_str()).collect();
+        println!();
+        println!("Bring-up order: {}", order.join(", "));
     }
 
     Ok(())

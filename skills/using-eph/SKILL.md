@@ -110,6 +110,86 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
   hooks run on the host via `sh -c` with eph's resolved environment injected (see
   below).
 
+## Roles: dependency services vs the app
+
+A `.eph` file can split its services into tiers with a `role=` on each service
+and a top-level `roles_order`. The usual split is dependency services (Postgres,
+Redis, object storage: things the code talks to, safe to start eagerly) from the
+first-party app you are building (start it on demand; it may bind preview ports
+or run side effects). Roles let you bring up one tier without the other.
+
+```ini
+roles_order=dep,app            # dep services come up before the app
+
+[postgres]
+image=postgres:16
+role=dep
+
+[web]
+run=npm run dev
+port=auto
+role=app
+```
+
+- `roles_order=dep,app` is the linear form: each role depends on the one before
+  it. For a graph (a `worker` that needs `dep` but not `app`), use a section
+  instead, where each line is `role=dependencies` and a bare `role=` is a root:
+
+  ```ini
+  [roles_order]
+  dep=
+  app=dep
+  worker=dep
+  ```
+
+- Roles are all-or-nothing: once any service has a `role=`, a `roles_order` is
+  required, every service must declare a role listed in it, every listed role
+  must have a service, and the graph must be acyclic. `eph check` reports any
+  violation. A file with no roles at all keeps the old behavior (declaration
+  order, `run=` services last), so nothing needs roles.
+- Bring-up follows the role graph (dependencies first); teardown reverses it.
+- `eph up --role <ROLE>` starts that role **and everything it depends on**, and
+  nothing else. Repeatable, and it unions with any positional service names.
+  `eph up --role dep` starts just the dependency tier. `eph down --role <ROLE>`
+  tears down that role and everything that depends on it.
+
+## Prewarm dependency services at session start
+
+Because `eph up --role dep` starts the dependency tier without the app, it is the
+natural thing to run from a Claude Code **SessionStart hook**: the databases and
+caches come up known-good and their connection env is ready before your first
+command, so you never hit "the service isn't running" and restart your work. A
+later `eph up` or `eph dev` reuses those already-running services, and `eph dev`
+leaves them up when it exits (it tears down only the app it started).
+
+```sh
+#!/usr/bin/env bash
+# .claude/hooks/eph-prewarm.sh: prewarm deps and inject their connection env.
+# $CLAUDE_ENV_FILE is sourced by Claude Code, so later Bash tool calls in the
+# session inherit DATABASE_URL, REDIS_URL, and the rest.
+test -f .eph || exit 0
+eph up --role dep || exit 0
+[ -n "$CLAUDE_ENV_FILE" ] && eph env >> "$CLAUDE_ENV_FILE"
+```
+
+```json
+// .claude/settings.json: run it on session start (project scope: everyone in
+// the repo/worktree gets it). Use ~/.claude/settings.json for a personal one.
+{
+  "hooks": {
+    "SessionStart": [
+      { "matcher": "startup|resume",
+        "hooks": [ { "type": "command", "command": ".claude/hooks/eph-prewarm.sh" } ] }
+    ]
+  }
+}
+```
+
+Substitute your own dependency role name for `dep`. To also seed on prewarm, drop
+the default (post-start hooks run); to prewarm bare, add `--skip-hooks`. If you
+want the tier torn down when a session ends, add a `SessionEnd` hook running
+`eph down --role dep`; the default is to leave it warm for the next session.
+
 ## Lifecycle hooks see eph's environment
 
 Four hooks bracket a service, in order: `pre-start` (before it is created),
@@ -209,6 +289,10 @@ default, or `eph clean` with `--clean` (each running `pre-stop` then
 - Teardown defaults to `eph down` (keeps data for a fast relaunch, since Claude
   restarts the server during a session). Use `eph dev --clean` (`runtimeArgs:
   ["dev", "--clean"]`) for a pristine reset on every launch.
+- `eph dev` tears down only the services it actually started. Any that were
+  already running when it launched (a dependency tier a SessionStart hook
+  prewarmed) are left up, so the deps stay hot across `eph dev` runs. `--clean`
+  overrides this and bulldozes everything.
 - A hard kill (not a normal stop) skips teardown and leaves services up,
   recoverable with `eph down`. If the app crashes on its own, `eph dev` leaves
   services up for inspection (`eph logs <service>`) and exits non-zero.

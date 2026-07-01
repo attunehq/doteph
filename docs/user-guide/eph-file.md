@@ -111,6 +111,7 @@ The four source types are covered in detail in
 
 | Property | Repeatable | Description |
 |----------|:----------:|-------------|
+| `role=` | no | The role (tier) this service belongs to, a free-form name you choose (e.g. `dep`, `app`). Optional, but once any service sets it every service must, and a `roles_order` must list the roles (see [Roles and ordering](#roles-and-ordering)). |
 | `image=` | no | Docker image to pull and run. |
 | `dockerfile=` | no | Path to a Dockerfile to build (relative to workspace). |
 | `context=` | no | Build context for `dockerfile=` (defaults to the Dockerfile's directory). |
@@ -302,6 +303,95 @@ Important behavior:
   down without running `pre-stop` or `post-stop`.
 
 See [Core Concepts](concepts.md#the-service-lifecycle) for the full lifecycle.
+
+## Roles and ordering
+
+A `role=` tags a service with a tier, and `roles_order` orders those tiers. The
+usual split is dependency services (a `dep` tier: databases, caches, queues) that
+must be up before the first-party app (an `app` tier) can talk to them. Naming the
+tiers lets you bring up one on its own, for example `eph up --role dep` to prewarm
+the backing services without starting the app. See
+[Core Concepts](concepts.md#dependency-services-vs-the-app) for the model.
+
+```ini
+roles_order=dep,app
+
+[postgres]
+image=postgres:16-alpine
+role=dep
+port=5432
+
+[web]
+run=npm run dev
+role=app
+port=auto
+```
+
+### Legacy mode vs roles mode
+
+A file is in **legacy mode** when no service declares a `role=` and there is no
+`roles_order`. Ordering is unchanged from before roles existed: services start in
+declaration order with `run=` services deferred to the end, and teardown reverses
+that. Existing `.eph` files need no changes.
+
+A file is in **roles mode** the moment any service declares a `role=` or a
+`roles_order` is present. Roles mode then requires all of the following, checked at
+parse time (by `eph check` and before any `eph up`):
+
+- a `roles_order` is present (linear or section form);
+- every service declares a `role`;
+- every service's role is listed in `roles_order`;
+- every role in `roles_order` is backed by at least one service;
+- every dependency edge names a known role;
+- the role graph is acyclic.
+
+A violation is a hard parse error naming the offending service or role, so a
+half-specified graph never reaches `eph up`.
+
+### `roles_order`
+
+`roles_order` is the dependency graph over roles. "Depends on" means "must come up
+first": if `app` depends on `dep`, `dep` starts before `app`, and requesting `app`
+pulls `dep` in with it. Write it in one of two forms. Declaring both is an error.
+
+**Linear form** (top-level key). A comma-separated chain where each role depends on
+the one before it:
+
+```ini
+roles_order=dep,app
+```
+
+This reads "app depends on dep": `dep` comes up first, then `app`. Extend the chain
+with more roles (`roles_order=dep,cache,app`) when every tier depends on the whole
+tier before it.
+
+**DAG form** (a reserved `[roles_order]` section). One `role=dep1,dep2` line per
+role, spelling out each role's dependencies explicitly. A bare `role=` (empty value)
+declares a root that depends on nothing. Every role must appear as a key here, roots
+included:
+
+```ini
+[roles_order]
+dep=
+app=dep
+worker=dep
+```
+
+Here both `app` and `worker` depend on `dep`, but not on each other, so a `worker`
+that needs the database but not the app can start without it. Use the DAG form when
+a role needs some but not all of the others; use the linear form for a straight
+chain. The section may appear anywhere in the file, including before the services it
+names.
+
+### Ordering in roles mode
+
+In roles mode the role graph is the single source of truth for order. Bring-up is
+the topological order of the graph (dependencies first), with services grouped by
+role and declaration order preserved within a role. Teardown is the exact reverse.
+
+The legacy "`run=` services start last" heuristic is off in roles mode. A `run=`
+service tagged as a dependency role comes up before the app that needs it, exactly
+where the graph places it: the role, not the source type, decides order.
 
 ## Interpolation
 

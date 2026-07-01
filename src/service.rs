@@ -12,7 +12,7 @@ use bollard::query_parameters::{
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -568,19 +568,16 @@ async fn wait_until_ready<T>(
     }
 }
 
-/// The order services are brought up in: declaration order, but with `run=`
-/// (command) services moved to the end so a managed app starts after the
-/// backing services it can reference (e.g. `${postgres.port}`). The sort is
-/// stable, so declaration order is preserved within each group.
+/// The order services are brought up in.
 ///
-/// This is the single source of truth for start sequencing: `start_services`
+/// Delegates to [`EphFile::start_order`], the single source of truth for start
+/// sequencing: in roles mode it is the role graph's topological order, and in
+/// legacy mode declaration order with `run=` services last. `start_services`
 /// uses it to pick the phase-1 order, and `stop_all` / `clean` tear down in its
 /// reverse, so a dependent is always stopped before the dependency it relies on
 /// (its `pre-stop` hook sees the dependency still up).
 fn start_order(eph: &EphFile) -> Vec<&String> {
-    let mut names: Vec<&String> = eph.services.keys().collect();
-    names.sort_by_key(|name| matches!(eph.services[*name].source, ServiceSource::Command(_)));
-    names
+    eph.start_order()
 }
 
 /// Whether a dead process's captured `log` names a port conflict, matched
@@ -1394,11 +1391,15 @@ impl ServiceManager {
                     bail!("unknown service: {}", name);
                 }
             }
-            let mut targets: Vec<&String> = filter.iter().collect();
-            targets.sort_by_key(|name| {
-                matches!(eph.services[*name].source, ServiceSource::Command(_))
-            });
-            targets
+            // Keep the requested subset, but bring them up in the global start
+            // order (topological in roles mode, command-last in legacy mode)
+            // rather than the order the names were passed, so a filtered `eph up`
+            // still respects dependencies.
+            let wanted: HashSet<&str> = filter.iter().map(String::as_str).collect();
+            start_order(eph)
+                .into_iter()
+                .filter(|name| wanted.contains(name.as_str()))
+                .collect()
         };
 
         // Phase 1: run each target's pre-start hook, then create or reuse it,
@@ -2197,6 +2198,38 @@ impl ServiceManager {
                 .await?;
         }
         self.state.services.clear();
+        self.state.save(&self.workspace).await?;
+        Ok(())
+    }
+
+    /// Stop a specific subset of services, in the reverse of the start order, so
+    /// a dependent is always stopped before the dependency it relies on (its
+    /// `pre-stop` hook still sees that dependency up).
+    ///
+    /// Used by a filtered `eph down` (explicit service names or `--role`) and by
+    /// `eph dev` to tear down only the services it brought up while leaving any
+    /// that were already running (a session hook's prewarmed dependencies) in
+    /// place. Names not in `targets` are skipped; names in `targets` that are not
+    /// running are a harmless no-op.
+    pub async fn stop_selected(
+        &mut self,
+        eph: &EphFile,
+        targets: &[String],
+        remove: bool,
+        skip_hooks: bool,
+    ) -> Result<()> {
+        let wanted: HashSet<&str> = targets.iter().map(String::as_str).collect();
+        // Snapshot running services once so every pre-stop/post-stop hook sees the
+        // full environment as it was before teardown began.
+        let running = self.status().await?;
+        for name in start_order(eph).into_iter().rev() {
+            if !wanted.contains(name.as_str()) {
+                continue;
+            }
+            let service = &eph.services[name];
+            self.stop_service(name, service, remove, eph, &running, skip_hooks)
+                .await?;
+        }
         self.state.save(&self.workspace).await?;
         Ok(())
     }
@@ -3428,6 +3461,38 @@ image=redis:7
             .map(|s| s.as_str())
             .collect();
         assert_eq!(teardown, ["app", "redis", "postgres"]);
+    }
+
+    /// In roles mode, `start_order` follows the role graph rather than the
+    /// source-based heuristic: a `run=` service tagged as a dependency (a mock
+    /// server, say) comes up before the app even though the legacy rule would
+    /// defer every `run=` service to the end.
+    #[test]
+    fn start_order_follows_roles_over_the_run_last_heuristic() {
+        let eph = crate::parser::parse(
+            r#"
+roles_order=dep,app
+
+[web]
+run=./serve
+port=auto
+role=app
+
+[postgres]
+image=postgres:16
+role=dep
+
+[mock-auth]
+run=./mock-auth
+role=dep
+"#,
+        )
+        .unwrap();
+
+        // Both dep services (including the run= mock) precede the run= app, in
+        // declaration order within the dep role.
+        let order: Vec<&str> = start_order(&eph).iter().map(|s| s.as_str()).collect();
+        assert_eq!(order, ["postgres", "mock-auth", "web"]);
     }
 
     #[tokio::test]
