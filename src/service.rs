@@ -497,30 +497,69 @@ fn parse_command_override(
 /// service (via [`Workspace::volume_name`]) so two workspaces, or two services,
 /// never collide on a shared volume. A spec without a `:<container_path>` half
 /// is passed through unchanged, so Docker reports the malformed mount itself.
-fn resolve_volume_spec(spec: &str, workspace: &Workspace, service_name: &str) -> String {
+///
+/// # Errors
+///
+/// Returns an error if the resolved host source is a Windows extended-length
+/// (`\\?\`) path that Docker cannot use as a mount source (see
+/// [`reject_verbatim_bind_source`]), or if a relative source resolves to a path
+/// that is not valid UTF-8.
+fn resolve_volume_spec(spec: &str, workspace: &Workspace, service_name: &str) -> Result<String> {
     if spec.starts_with('/') || spec.starts_with('.') {
         // Host-path bind mount.
         let parts: Vec<&str> = spec.splitn(2, ':').collect();
         if parts.len() == 2 {
             let host_path = if parts[0].starts_with('.') {
-                workspace.path.join(parts[0]).to_string_lossy().to_string()
+                let joined = workspace.path.join(parts[0]);
+                // to_str, not to_string_lossy: a lossy replacement in a bind
+                // source would silently mount the wrong host path.
+                joined
+                    .to_str()
+                    .with_context(|| {
+                        format!("bind mount source {} is not valid UTF-8", joined.display())
+                    })?
+                    .to_string()
             } else {
                 parts[0].to_string()
             };
-            format!("{}:{}", host_path, parts[1])
+            reject_verbatim_bind_source(&host_path)?;
+            Ok(format!("{}:{}", host_path, parts[1]))
         } else {
-            spec.to_string()
+            Ok(spec.to_string())
         }
     } else {
         // Named volume, namespaced to the workspace + service.
         let parts: Vec<&str> = spec.splitn(2, ':').collect();
         if parts.len() == 2 {
             let volume_name = workspace.volume_name(service_name, parts[0]);
-            format!("{}:{}", volume_name, parts[1])
+            Ok(format!("{}:{}", volume_name, parts[1]))
         } else {
-            spec.to_string()
+            Ok(spec.to_string())
         }
     }
+}
+
+/// Reject a Windows extended-length ("verbatim") bind-mount source.
+///
+/// Docker's Windows volume parser rejects the `\\?\C:\...` and `\\?\UNC\...`
+/// forms that `std`'s canonicalization emits, responding with a garbled
+/// `\?\C%!(EXTRA string=is not a valid Windows path)` (the `%!(EXTRA ...)` is an
+/// upstream moby `fmt` artifact). eph normalizes the workspace root away from
+/// that form in [`Workspace::from_path`] via `dunce::canonicalize`, so this only
+/// fires for a path long enough to have no ordinary Win32 representation: the
+/// root keeps its `\\?\` prefix and a relative bind resolved against it inherits
+/// it. Fail closed with an actionable message rather than forwarding a source the
+/// daemon will only reject cryptically.
+fn reject_verbatim_bind_source(source: &str) -> Result<()> {
+    if source.starts_with(r"\\?\") {
+        bail!(
+            "bind mount source `{source}` is a Windows extended-length (\\\\?\\) path, \
+             which Docker cannot use as a mount source. This happens when the workspace \
+             path is long enough to require that prefix; move the workspace to a shorter \
+             path and run eph again."
+        );
+    }
+    Ok(())
 }
 
 /// Poll `probe` until it yields a result or `timeout_dur` elapses, sleeping
@@ -1152,7 +1191,7 @@ impl DockerClient {
             .volumes
             .iter()
             .map(|v| resolve_volume_spec(v, workspace, &service.name))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let host_config = HostConfig {
             port_bindings: Some(port_bindings),
@@ -3145,7 +3184,7 @@ mod tests {
         // A bare name is namespaced to `eph-<short_id>-<service>-<name>` so two
         // workspaces or services never share a volume.
         assert_eq!(
-            resolve_volume_spec("data:/var/lib/postgresql/data", &ws, "db"),
+            resolve_volume_spec("data:/var/lib/postgresql/data", &ws, "db").unwrap(),
             "eph-abcd1234-db-data:/var/lib/postgresql/data"
         );
     }
@@ -3155,7 +3194,7 @@ mod tests {
         let ws = test_workspace("/ws");
         // An absolute host path is a bind mount used verbatim (not namespaced).
         assert_eq!(
-            resolve_volume_spec("/host/path:/in/container", &ws, "db"),
+            resolve_volume_spec("/host/path:/in/container", &ws, "db").unwrap(),
             "/host/path:/in/container"
         );
     }
@@ -3169,7 +3208,7 @@ mod tests {
             PathBuf::from("/ws").join("./data").to_string_lossy()
         );
         assert_eq!(
-            resolve_volume_spec("./data:/in/container", &ws, "db"),
+            resolve_volume_spec("./data:/in/container", &ws, "db").unwrap(),
             expected
         );
     }
@@ -3179,9 +3218,49 @@ mod tests {
         let ws = test_workspace("/ws");
         // No `:<container_path>` half: passed through unchanged (Docker reports
         // the malformed mount). Holds for both the named and host-path branches.
-        assert_eq!(resolve_volume_spec("justaname", &ws, "db"), "justaname");
-        assert_eq!(resolve_volume_spec("/abs/only", &ws, "db"), "/abs/only");
-        assert_eq!(resolve_volume_spec("./rel/only", &ws, "db"), "./rel/only");
+        assert_eq!(
+            resolve_volume_spec("justaname", &ws, "db").unwrap(),
+            "justaname"
+        );
+        assert_eq!(
+            resolve_volume_spec("/abs/only", &ws, "db").unwrap(),
+            "/abs/only"
+        );
+        assert_eq!(
+            resolve_volume_spec("./rel/only", &ws, "db").unwrap(),
+            "./rel/only"
+        );
+    }
+
+    #[test]
+    fn resolve_volume_spec_relative_bind_against_plain_windows_root_is_clean() {
+        // Regression for #44: with the workspace path normalized to a plain
+        // `C:\...` form (as dunce::canonicalize now yields), a relative bind
+        // resolves to a source Docker accepts, with no `\\?\` prefix.
+        let ws = test_workspace(r"C:\Users\me\project");
+        let resolved = resolve_volume_spec("./seed:/docker-entrypoint-initdb.d", &ws, "postgres")
+            .expect("plain Windows root must resolve cleanly");
+        assert!(
+            !resolved.starts_with(r"\\?\"),
+            "resolved source must not carry the extended-length prefix: {resolved}"
+        );
+        assert!(resolved.ends_with(":/docker-entrypoint-initdb.d"));
+    }
+
+    #[test]
+    fn resolve_volume_spec_rejects_verbatim_relative_source() {
+        // Regression for #44: if the workspace path could not be normalized (a
+        // genuine long path keeps the `\\?\` prefix), a relative bind that
+        // resolves onto it is rejected here with an actionable error rather than
+        // forwarded to Docker, which would reject it cryptically.
+        let ws = test_workspace(r"\\?\C:\Users\me\project");
+        let err = resolve_volume_spec("./seed:/in/container", &ws, "db")
+            .expect_err("a verbatim source must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("extended-length"),
+            "error should explain the extended-length path: {msg}"
+        );
     }
 
     #[test]

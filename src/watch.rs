@@ -67,8 +67,10 @@ impl Watch {
 
         // Match against the canonical root so `strip_prefix` succeeds regardless
         // of how the caller spelled the path or how the OS reports events.
-        let root = root
-            .canonicalize()
+        // dunce::canonicalize matches Workspace::from_path: on Windows it avoids
+        // the extended-length `\\?\` prefix, so the root here lines up with the
+        // stored workspace path and with the paths notify reports.
+        let root = dunce::canonicalize(root)
             .with_context(|| format!("resolving watch root {}", root.display()))?;
 
         let (tx, rx) = mpsc::unbounded_channel();
