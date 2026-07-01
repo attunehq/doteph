@@ -214,6 +214,108 @@ launch the app through `eph run` so it still gets the resolved environment:
 (`eph up`) and teardown (`eph down`) are no longer automatic, which is the manual
 work `eph dev` does for you.
 
+## Prewarm dependency services on Claude Code session start
+
+When an agent opens a worktree, its dev services are usually not running, and the
+dependency tier (databases, caches) is the slow, known-good part to start: image
+pulls, migrations, seeds. Warm it once on session start and reuse it. A Claude Code
+**SessionStart hook** can bring up just the dependency tier and inject its
+connection env before the agent's first command, without starting the first-party
+app (which could bind preview ports or cause surprising side effects).
+
+This needs a `.eph` file that uses [roles](eph-file.md#roles-and-ordering): tag the
+backing services `role=dep`, the app `role=app`, and declare `roles_order=dep,app`.
+
+```ini
+roles_order=dep,app
+
+[postgres]
+image=postgres:16-alpine
+role=dep
+port=5432
+env.POSTGRES_USER=dev
+env.POSTGRES_PASSWORD=dev
+env.POSTGRES_DB=myapp
+healthcheck=pg_isready -U dev
+post-start=npm run db:migrate
+
+[web]
+run=npm run dev
+role=app
+port=auto
+env.PORT=${web.port}
+
+DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
+```
+
+The hook script runs `eph up --role dep` (which starts the `dep` tier and its
+dependency closure, never the app), then appends `eph env` to the file named by
+`$CLAUDE_ENV_FILE`. Claude Code sources that file, so subsequent Bash tool calls
+inherit `DATABASE_URL` and the rest:
+
+```sh
+#!/usr/bin/env bash
+# .claude/hooks/eph-prewarm.sh
+# SessionStart hook: prewarm dependency services and inject their env.
+eph up --role dep >/dev/null 2>&1 || exit 0
+[ -n "$CLAUDE_ENV_FILE" ] && eph env >> "$CLAUDE_ENV_FILE"
+```
+
+Make it executable (`chmod +x .claude/hooks/eph-prewarm.sh`) and wire it in
+`.claude/settings.json` so it applies to everyone who opens the repo or a worktree
+of it:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [ { "type": "command", "command": ".claude/hooks/eph-prewarm.sh" } ]
+      }
+    ]
+  }
+}
+```
+
+How it behaves:
+
+- **The app is left alone.** `--role dep` resolves to the dependency role and its
+  dependency closure only. The `run=` app never starts, so no preview port is bound
+  and no app-side side effects fire on session start.
+- **The tier is reused, not restarted.** `eph up` is idempotent (see
+  [Core Concepts](concepts.md#the-service-lifecycle)), so when you later run
+  `eph up` or `eph dev`, the already-running dependency services are reused. `eph
+  dev` on exit tears down only the app it foregrounded and leaves the prewarmed tier
+  running, so it stays warm across sessions and dev runs.
+- **Seeding is included.** The plain `eph up --role dep` runs each dependency's
+  `post-start` (migrations, seeds). Add `--skip-hooks` if you want the services up
+  without seeding.
+- **No install command.** Roles are names you choose, so there is deliberately no
+  `eph hooks install`: copy the recipe and substitute your dependency role name. For
+  a personal version that follows you across repos, put the same `SessionStart`
+  block in `~/.claude/settings.json` instead of the project file.
+- **Optional cleanup on exit.** To stop the tier when a session ends rather than
+  leaving it warm, add a `SessionEnd` hook running `eph down --role dep`. Leaving it
+  running (the default here) is usually what you want, so the next session reuses it.
+
+## Bring up only one tier
+
+Once a `.eph` file defines [roles](eph-file.md#roles-and-ordering), `--role` starts
+or stops a tier and its closure without naming individual services:
+
+```sh
+eph up --role dep      # dependency services (+ anything they depend on), not the app
+eph up --role app      # the app plus every role it depends on (here: dep, then app)
+eph down --role dep    # stop the dep tier AND everything that depends on it
+```
+
+`eph up --role` resolves the **dependency** closure (the role plus what it needs
+below it); `eph down --role` resolves the **dependent** closure (the role plus
+everything above it that would break without it), torn down in reverse start order.
+Both combine with positional service names. This is what the prewarm hook above uses
+to start the backing tier alone.
+
 ## Multiple checkouts side by side
 
 This is what `eph` is built for. Clone the same repo twice:

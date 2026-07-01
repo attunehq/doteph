@@ -1,8 +1,8 @@
 # Core Concepts
 
-This page explains the model behind `eph`. Once these five ideas click -
-workspaces, isolation, automatic ports, persisted state, and the lifecycle -
-the commands and the file format are obvious.
+This page explains the model behind `eph`. Once these ideas click (workspaces,
+isolation, automatic ports, persisted state, the lifecycle, and the split between
+dependency services and the app), the commands and the file format are obvious.
 
 ## Workspaces
 
@@ -177,6 +177,41 @@ but the service is already stopped. Both are skippable with `--skip-hooks`.
 > which removes the compose containers either way. `eph clean` removes only the
 > named volumes declared with `volume=` in your `.eph` file; volumes declared
 > inside a Compose file are left to `docker compose`.
+
+## Dependency services vs the app
+
+Most stacks split in two: **dependency services** (databases, caches, queues, mail
+catchers) that your app talks to, and the **first-party app** you are building.
+The dependency tier is stable and can run ahead of time; the app is what you
+restart constantly and want to control precisely.
+
+`role=` names that split, and `roles_order` orders it. Tag the backing services
+`role=dep` and the app `role=app`, then declare `roles_order=dep,app` ("app depends
+on dep"). Now the two tiers are addressable:
+
+- **Start order follows the graph.** `eph up` brings the `dep` tier up first and
+  waits for it healthy, then the app, so the app's `DATABASE_URL` resolves the
+  moment it starts. Teardown reverses that. This replaces the legacy "start `run=`
+  services last" rule with an explicit ordering you control.
+- **You can bring up one tier.** `eph up --role dep` starts the dependency services
+  and everything they depend on, without touching the app. `eph up --role app`
+  starts the app and pulls its dependencies in with it (see
+  [Command Reference](command-reference.md#eph-up-service)).
+
+The motivating case is prewarming. A dependency tier is known-good and slow to
+build (image pulls, migrations, seeds), so warming it once and reusing it beats
+starting it per task. A Claude Code SessionStart hook can run `eph up --role dep`
+and inject the resolved connection env before an agent's first command, leaving the
+app for later. Because `eph up` is idempotent, a later `eph up` or `eph dev` reuses
+the already-running dependency services rather than restarting them, and `eph dev`
+on exit leaves the tier it adopted running. See
+[For Agents](for-agents.md#prewarm-dependency-services-on-session-start) for the
+recipe.
+
+A file that uses no `role=` and no `roles_order` stays in **legacy mode** and
+behaves exactly as before: declaration order, `run=` services last. Roles are
+opt-in. Full rules are in
+[The `.eph` File](eph-file.md#roles-and-ordering).
 
 ## Next
 

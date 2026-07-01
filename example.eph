@@ -1,11 +1,31 @@
 # Example .eph file for a typical web application
 
 # =============================================================================
+# Roles: dependency services vs the first-party app
+# =============================================================================
+
+# `roles_order` splits the stack into tiers and orders them. Here the backing
+# services (`dep`) come up before the app (`app`). The linear form below is
+# shorthand for "app depends on dep"; a `[roles_order]` section can spell out a
+# full dependency graph instead (e.g. a worker that needs `dep` but not `app`).
+#
+# Once roles exist you can bring up one tier on its own: `eph up --role dep`
+# starts the dependency services (and anything they depend on) without touching
+# the app. A Claude Code SessionStart hook can use that to prewarm the databases
+# and caches so they are known-good and their connection env is ready the moment
+# a session opens, leaving the app for you to start with `eph up` or `eph dev`
+# when you actually want it. A later `eph dev` reuses the already-running
+# dependency services and, on exit, tears down only the app it started, leaving
+# the prewarmed tier hot.
+roles_order=dep,app
+
+# =============================================================================
 # Services
 # =============================================================================
 
 [postgres]
 image=postgres:16-alpine
+role=dep
 port=5432
 env.POSTGRES_USER=dev
 env.POSTGRES_PASSWORD=dev
@@ -16,11 +36,13 @@ post-start=cargo sqlx migrate run
 
 [redis]
 image=redis:7-alpine
+role=dep
 port=6379
 healthcheck=redis-cli ping
 
 [minio]
 image=minio/minio
+role=dep
 port.api=9000
 port.console=9001
 env.MINIO_ROOT_USER=minioadmin
@@ -30,15 +52,17 @@ volume=miniodata:/data
 
 [mailhog]
 image=mailhog/mailhog
+role=dep
 port.smtp=1025
 port.web=8025
 
 # The app you are building. eph allocates a free host port (so two checkouts
 # never collide on 3000), injects it as PORT, and re-launches on a fresh port if
-# the process dies on a port conflict. Backing services above start first, so
+# the process dies on a port conflict. The `dep` tier above starts first, so
 # DATABASE_URL etc. are already set in this process's environment.
 [web]
 run=npm run dev
+role=app
 port=auto
 env.PORT=${web.port}
 # pre-start runs before the dev server boots: regenerate the typed API client

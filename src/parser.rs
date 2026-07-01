@@ -43,6 +43,221 @@ pub struct EphFile {
     /// declaration order so start sequencing and command output are
     /// reproducible (the parser preserves section order end to end).
     pub services: IndexMap<String, Service>,
+    /// The role dependency graph, when the file uses roles.
+    ///
+    /// `None` in "legacy mode" (no service declares a `role=` and there is no
+    /// `roles_order`), where ordering falls back to declaration order with `run=`
+    /// services last. `Some` in "roles mode", where it is the single source of
+    /// truth for bring-up order: services are grouped by role, roles are brought
+    /// up in topological order of this graph, and teardown is the exact reverse.
+    /// The parser guarantees the graph is consistent with the services (every
+    /// service role is a node, every node has at least one service, every edge
+    /// points at a known role, no cycles).
+    pub roles_order: Option<RolesOrder>,
+}
+
+/// The role dependency graph for a `.eph` file in "roles mode".
+///
+/// Written either as a linear top-level `roles_order=a,b,c` (sugar: `b` depends
+/// on `a`, `c` on `b`) or as a `[roles_order]` section giving each role's
+/// dependencies explicitly (`app=dep,cache`, a bare `dep=` for a root). Both
+/// desugar to this adjacency list. "Depends on" means "must come up first": an
+/// edge `app -> dep` orders `dep` before `app` and pulls `dep` in whenever `app`
+/// is requested.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RolesOrder {
+    /// Each role mapped to the roles it depends on. Keys are every role in the
+    /// graph (roots included, with an empty dependency list), kept in declaration
+    /// order so the topological sort is a deterministic, stable tie-break.
+    pub deps: IndexMap<String, Vec<String>>,
+}
+
+impl RolesOrder {
+    /// The roles in topological order: every role appears after all the roles it
+    /// depends on. Ties (roles with no ordering constraint between them) break by
+    /// declaration order, so the result is deterministic.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming a role involved in a dependency cycle. The parser
+    /// calls this during validation, so a `RolesOrder` that escaped parsing is
+    /// always acyclic and this cannot fail at runtime.
+    pub fn topo_roles(&self) -> Result<Vec<String>> {
+        let mut ordered: Vec<String> = Vec::with_capacity(self.deps.len());
+        // Kahn-style, but scanning in declaration order each round so ties break
+        // deterministically. n is tiny (a handful of roles), so the simple
+        // O(n^2) scan is not worth optimizing.
+        while ordered.len() < self.deps.len() {
+            let next = self.deps.keys().find(|role| {
+                !ordered.contains(*role) && self.deps[*role].iter().all(|dep| ordered.contains(dep))
+            });
+            match next {
+                Some(role) => ordered.push(role.clone()),
+                None => {
+                    let stuck: Vec<&str> = self
+                        .deps
+                        .keys()
+                        .filter(|r| !ordered.contains(*r))
+                        .map(String::as_str)
+                        .collect();
+                    bail!(
+                        "roles_order has a dependency cycle among: {}",
+                        stuck.join(", ")
+                    );
+                }
+            }
+        }
+        Ok(ordered)
+    }
+
+    /// The transitive closure of `roles` over their dependencies: every requested
+    /// role plus everything it (transitively) depends on. This is the set brought
+    /// up by `eph up --role=<role>`, since a role cannot run without the roles it
+    /// depends on.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a requested role is not part of the graph.
+    pub fn forward_closure(&self, roles: &[String]) -> Result<Vec<String>> {
+        self.closure(roles, |role| {
+            self.deps.get(role).cloned().unwrap_or_default()
+        })
+    }
+
+    /// The transitive closure of `roles` over their dependents: every requested
+    /// role plus everything that (transitively) depends on it. This is the set
+    /// torn down by `eph down --role=<role>`, since a dependency cannot be removed
+    /// while the roles that need it are still up.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a requested role is not part of the graph.
+    pub fn reverse_closure(&self, roles: &[String]) -> Result<Vec<String>> {
+        self.closure(roles, |role| {
+            self.deps
+                .iter()
+                .filter(|(_, deps)| deps.iter().any(|d| d == role))
+                .map(|(r, _)| r.clone())
+                .collect()
+        })
+    }
+
+    /// Shared transitive-closure walk. `neighbors` yields the roles to follow
+    /// from a given role (its dependencies for the forward closure, its
+    /// dependents for the reverse). Validates that every seed role exists.
+    fn closure<F>(&self, roles: &[String], neighbors: F) -> Result<Vec<String>>
+    where
+        F: Fn(&str) -> Vec<String>,
+    {
+        for role in roles {
+            if !self.deps.contains_key(role) {
+                bail!(
+                    "unknown role '{}' (known roles: {})",
+                    role,
+                    self.deps.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+        let mut seen: Vec<String> = Vec::new();
+        let mut stack: Vec<String> = roles.to_vec();
+        while let Some(role) = stack.pop() {
+            if seen.contains(&role) {
+                continue;
+            }
+            seen.push(role.clone());
+            stack.extend(neighbors(&role));
+        }
+        Ok(seen)
+    }
+}
+
+impl EphFile {
+    /// The order services are brought up in.
+    ///
+    /// In roles mode this is the topological order of the role graph (roles
+    /// grouped, dependencies first), with services inside a role kept in
+    /// declaration order. In legacy mode (no roles) it is declaration order with
+    /// `run=` services deferred to the end, so a managed app starts after the
+    /// backing services it references. Teardown is the exact reverse either way.
+    ///
+    /// This is the single source of truth for start sequencing across the
+    /// codebase; `service.rs` calls it rather than re-deriving order.
+    #[must_use]
+    pub fn start_order(&self) -> Vec<&String> {
+        match &self.roles_order {
+            Some(order) => {
+                // Safe to unwrap: the parser rejected cycles, so a parsed
+                // `EphFile` always has an acyclic graph.
+                let topo = order
+                    .topo_roles()
+                    .expect("roles_order validated acyclic at parse time");
+                let mut names: Vec<&String> = Vec::with_capacity(self.services.len());
+                for role in &topo {
+                    for (name, svc) in &self.services {
+                        if svc.role.as_deref() == Some(role.as_str()) {
+                            names.push(name);
+                        }
+                    }
+                }
+                names
+            }
+            None => {
+                let mut names: Vec<&String> = self.services.keys().collect();
+                names.sort_by_key(|name| {
+                    matches!(self.services[*name].source, ServiceSource::Command(_))
+                });
+                names
+            }
+        }
+    }
+
+    /// The service names to bring up for `eph up --role=<roles>`: every service
+    /// whose role is in the forward (dependency) closure of `roles`, returned in
+    /// bring-up order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file does not use roles, or if a requested role is
+    /// not defined.
+    pub fn services_for_roles_up(&self, roles: &[String]) -> Result<Vec<String>> {
+        let order = self.roles_order.as_ref().context(
+            "this .eph file does not define roles, so `--role` cannot be used; \
+             pass service names instead, or add a `roles_order`",
+        )?;
+        let role_set = order.forward_closure(roles)?;
+        Ok(self.services_in_role_set(&role_set))
+    }
+
+    /// The service names to tear down for `eph down --role=<roles>`: every service
+    /// whose role is in the reverse (dependent) closure of `roles`, returned in
+    /// bring-up order (the caller stops in reverse).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file does not use roles, or if a requested role is
+    /// not defined.
+    pub fn services_for_roles_down(&self, roles: &[String]) -> Result<Vec<String>> {
+        let order = self.roles_order.as_ref().context(
+            "this .eph file does not define roles, so `--role` cannot be used; \
+             pass service names instead, or add a `roles_order`",
+        )?;
+        let role_set = order.reverse_closure(roles)?;
+        Ok(self.services_in_role_set(&role_set))
+    }
+
+    /// Service names whose role is in `role_set`, in bring-up order.
+    fn services_in_role_set(&self, role_set: &[String]) -> Vec<String> {
+        self.start_order()
+            .into_iter()
+            .filter(|name| {
+                self.services[*name]
+                    .role
+                    .as_ref()
+                    .is_some_and(|r| role_set.contains(r))
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 /// An environment variable definition.
@@ -67,6 +282,17 @@ pub struct EnvVar {
 pub struct Service {
     /// Service name (matches section header)
     pub name: String,
+    /// The role this service belongs to, if any (`role=` in the `.eph` file).
+    ///
+    /// `None` means the service is unclassified. A file with no roles anywhere
+    /// (and no `roles_order`) behaves exactly as it did before roles existed:
+    /// declaration order, `run=` services last. Once any service declares a role
+    /// the file is in "roles mode", where every service must have a role that
+    /// appears in [`EphFile::roles_order`] and that ordering drives start
+    /// sequencing instead of the source-based heuristic. The parser enforces this
+    /// invariant, so a `Service` seen at runtime is either wholly unclassified or
+    /// part of a fully specified role graph.
+    pub role: Option<String>,
     /// How to start this service
     pub source: ServiceSource,
     /// Port mappings (container ports that will be mapped to random host ports)
@@ -144,6 +370,7 @@ pub struct PortMapping {
 #[derive(Default)]
 struct ServiceBuilder {
     name: String,
+    role: Option<String>,
     source: Option<ServiceSource>,
     ports: Vec<PortMapping>,
     env: HashMap<String, String>,
@@ -189,6 +416,7 @@ impl ServiceBuilder {
         }
         Ok(Service {
             name: self.name,
+            role: self.role,
             source,
             ports: self.ports,
             env: self.env,
@@ -247,6 +475,14 @@ pub fn parse(input: &str) -> Result<EphFile> {
     let mut index_by_name: HashMap<String, usize> = HashMap::new();
     let mut current_service: Option<usize> = None;
 
+    // The role graph, accumulated from whichever form the file uses. The linear
+    // `roles_order=a,b,c` key and the `[roles_order]` section are mutually
+    // exclusive; `roles_order_dag` holds the section form's adjacency list, and
+    // `in_roles_order` tracks whether we are currently inside that section.
+    let mut roles_order_linear: Option<Vec<String>> = None;
+    let mut roles_order_dag: Option<IndexMap<String, Vec<String>>> = None;
+    let mut in_roles_order = false;
+
     for (line_num, line) in input.lines().enumerate() {
         let line_num = line_num + 1; // 1-indexed
         let line = line.trim();
@@ -262,6 +498,22 @@ pub fn parse(input: &str) -> Result<EphFile> {
             if name.is_empty() {
                 bail!("empty section name at line {}", line_num);
             }
+            // `[roles_order]` is a reserved section, not a service: its lines are
+            // `role=dependencies` edges rather than service properties.
+            if name == "roles_order" {
+                if roles_order_linear.is_some() {
+                    bail!(
+                        "line {}: cannot use both a top-level `roles_order=` and a \
+                         [roles_order] section; pick one",
+                        line_num
+                    );
+                }
+                roles_order_dag.get_or_insert_with(IndexMap::new);
+                current_service = None;
+                in_roles_order = true;
+                continue;
+            }
+            in_roles_order = false;
             let index = *index_by_name.entry(name.to_string()).or_insert_with(|| {
                 builders.push(ServiceBuilder {
                     name: name.to_string(),
@@ -283,6 +535,43 @@ pub fn parse(input: &str) -> Result<EphFile> {
 
         // Remove optional quotes from value
         let value = strip_quotes(value);
+
+        // Inside `[roles_order]`, every line is a `role=dep1,dep2` edge (an empty
+        // value declares a root that depends on nothing). Role names are
+        // free-form, so a key here is never reinterpreted as an env var the way a
+        // service-section key can be: declare top-level env vars outside the
+        // section (before the first section, or after the services).
+        if in_roles_order {
+            let dag = roles_order_dag
+                .as_mut()
+                .expect("dag is initialized on entering [roles_order]");
+            if dag.contains_key(key) {
+                bail!(
+                    "line {}: duplicate role '{}' in [roles_order]",
+                    line_num,
+                    key
+                );
+            }
+            dag.insert(key.to_string(), split_roles(value));
+            continue;
+        }
+
+        // A top-level `roles_order=a,b,c` is the linear shorthand for the graph.
+        // It is mutually exclusive with the `[roles_order]` section.
+        if current_service.is_none() && key == "roles_order" {
+            if roles_order_dag.is_some() {
+                bail!(
+                    "line {}: cannot use both a top-level `roles_order=` and a \
+                     [roles_order] section; pick one",
+                    line_num
+                );
+            }
+            if roles_order_linear.is_some() {
+                bail!("line {}: duplicate top-level `roles_order=`", line_num);
+            }
+            roles_order_linear = Some(split_roles_checked(value, line_num)?);
+            continue;
+        }
 
         if let Some(index) = current_service {
             // We're inside a service section - try to parse as service property
@@ -331,7 +620,153 @@ pub fn parse(input: &str) -> Result<EphFile> {
         services.insert(service.name.clone(), service);
     }
 
-    Ok(EphFile { env_vars, services })
+    // Collapse the two spellings into one graph: the linear form desugars into an
+    // adjacency list (each role depends on the one before it), the section form
+    // is already one. Then check the graph and the services agree before handing
+    // back an `EphFile`, so "roles mode" is either fully specified or absent.
+    let roles_order = match (roles_order_linear, roles_order_dag) {
+        (Some(linear), None) => Some(RolesOrder {
+            deps: desugar_linear_order(&linear),
+        }),
+        (None, Some(deps)) => Some(RolesOrder { deps }),
+        (None, None) => None,
+        // The parse loop rejects declaring both, so this pair cannot occur.
+        (Some(_), Some(_)) => unreachable!("both roles_order forms present"),
+    };
+    validate_roles(&services, roles_order.as_ref())?;
+
+    Ok(EphFile {
+        env_vars,
+        services,
+        roles_order,
+    })
+}
+
+/// Split a comma-separated role list (`a, b ,c`), trimming each entry and
+/// dropping empties, into owned role names. Used for both the linear
+/// `roles_order=` value and a `[roles_order]` line's dependency list.
+fn split_roles(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Like [`split_roles`], but rejects a repeated role. Used for the linear
+/// `roles_order=a,b,c` form, where a duplicate is a mistake: it would desugar to
+/// a role depending on itself (a cycle) and, more usefully, almost always means a
+/// typo. The list is short, so the quadratic scan is fine.
+fn split_roles_checked(value: &str, line_num: usize) -> Result<Vec<String>> {
+    let roles = split_roles(value);
+    for (i, role) in roles.iter().enumerate() {
+        if roles[..i].contains(role) {
+            bail!(
+                "line {}: duplicate role '{}' in roles_order",
+                line_num,
+                role
+            );
+        }
+    }
+    Ok(roles)
+}
+
+/// Desugar the linear `roles_order=a,b,c` form into an adjacency list: `a` is a
+/// root, and every later role depends on the one immediately before it, so the
+/// chain topologically sorts back to the written order and `--role=c` pulls in
+/// `a` and `b`. Declaration order is preserved in the returned map.
+fn desugar_linear_order(roles: &[String]) -> IndexMap<String, Vec<String>> {
+    let mut deps = IndexMap::with_capacity(roles.len());
+    let mut prev: Option<&String> = None;
+    for role in roles {
+        let edges = prev.map(|p| vec![p.clone()]).unwrap_or_default();
+        deps.insert(role.clone(), edges);
+        prev = Some(role);
+    }
+    deps
+}
+
+/// Enforce the "roles mode" invariants tying the role graph to the services.
+///
+/// A file is in roles mode when any service declares a `role=` or a `roles_order`
+/// is present; the two must then be fully consistent. This is where the mutual
+/// completeness the format promises is checked, so nothing downstream has to
+/// cope with a half-specified graph:
+///
+/// - a `roles_order` requires every service to declare a role, and vice versa;
+/// - every service role, and every dependency edge, names a role in the graph;
+/// - every role in the graph has at least one service; and
+/// - the graph is acyclic.
+///
+/// In legacy mode (no roles anywhere) there is nothing to check.
+fn validate_roles(
+    services: &IndexMap<String, Service>,
+    roles_order: Option<&RolesOrder>,
+) -> Result<()> {
+    let any_role = services.values().any(|s| s.role.is_some());
+    let Some(order) = roles_order else {
+        // No graph. Legal only if no service is tagged either.
+        if any_role {
+            bail!(
+                "services declare a `role=` but the file has no `roles_order`; add a \
+                 top-level `roles_order=...` or a [roles_order] section listing the roles"
+            );
+        }
+        return Ok(());
+    };
+
+    if order.deps.is_empty() {
+        bail!("roles_order is empty; list at least one role");
+    }
+
+    // Every service must be tagged, and with a role the graph knows.
+    for service in services.values() {
+        let Some(role) = &service.role else {
+            bail!(
+                "service '{}' has no `role=`, but this file uses `roles_order`; every \
+                 service must declare a role when roles_order is set",
+                service.name
+            );
+        };
+        if !order.deps.contains_key(role) {
+            bail!(
+                "service '{}' has role '{}', which is not listed in roles_order (known \
+                 roles: {})",
+                service.name,
+                role,
+                order.deps.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+
+    // Every edge must point at a known role, and every role must be backed by at
+    // least one service (an empty role is almost certainly a typo).
+    for (role, deps) in &order.deps {
+        for dep in deps {
+            if !order.deps.contains_key(dep) {
+                bail!(
+                    "roles_order: role '{}' depends on unknown role '{}'",
+                    role,
+                    dep
+                );
+            }
+        }
+        if !services
+            .values()
+            .any(|s| s.role.as_deref() == Some(role.as_str()))
+        {
+            bail!(
+                "roles_order lists role '{}', but no service declares it",
+                role
+            );
+        }
+    }
+
+    // Reject cycles up front so `topo_roles` is infallible everywhere else.
+    order.topo_roles()?;
+
+    Ok(())
 }
 
 /// Returns `true` if `key` looks like an environment variable name, i.e. a
@@ -387,6 +822,8 @@ fn parse_service_property(
         "compose" => service.source = Some(ServiceSource::Compose(value.to_string())),
         // Shell command to run (non-Docker)
         "run" => service.source = Some(ServiceSource::Command(value.to_string())),
+        // The role this service belongs to (see `Service::role`).
+        "role" => service.role = Some(value.to_string()),
         // Container command override (for use with image/dockerfile)
         "command" => service.command_override = Some(value.to_string()),
         "port" => {
@@ -847,5 +1284,211 @@ port.api=5000
         assert!(!is_env_var_name("post-start"));
         assert!(!is_env_var_name("2FOO"));
         assert!(!is_env_var_name("env.FOO"));
+    }
+
+    // ========================================================================
+    // Roles and roles_order
+    // ========================================================================
+
+    #[test]
+    fn parse_service_role() {
+        let eph = parse("roles_order=dep\n\n[postgres]\nimage=postgres:16\nrole=dep\n").unwrap();
+        assert_eq!(eph.services["postgres"].role.as_deref(), Some("dep"));
+    }
+
+    #[test]
+    fn no_roles_is_legacy_mode() {
+        // A file with no role= and no roles_order stays in legacy mode: no graph,
+        // and start order is declaration order with run= services last.
+        let eph = parse("[postgres]\nimage=postgres:16\n\n[web]\nrun=serve\n").unwrap();
+        assert!(eph.roles_order.is_none());
+        assert!(eph.services["postgres"].role.is_none());
+        let order: Vec<&str> = eph.start_order().iter().map(|s| s.as_str()).collect();
+        assert_eq!(order, ["postgres", "web"]);
+    }
+
+    #[test]
+    fn linear_roles_order_desugars_to_a_chain() {
+        let eph = parse(
+            "roles_order=dep,app\n\n[db]\nimage=postgres:16\nrole=dep\n\n[web]\nrun=serve\nrole=app\n",
+        )
+        .unwrap();
+        let order = eph.roles_order.as_ref().unwrap();
+        assert_eq!(order.deps["dep"], Vec::<String>::new());
+        assert_eq!(order.deps["app"], vec!["dep".to_string()]);
+        assert_eq!(order.topo_roles().unwrap(), vec!["dep", "app"]);
+    }
+
+    #[test]
+    fn dag_roles_order_section_parses_edges() {
+        // worker depends on dep but NOT app, so it can come up without app.
+        let eph = parse(
+            "[db]\nimage=postgres:16\nrole=dep\n\
+             [web]\nrun=serve\nrole=app\n\
+             [jobs]\nrun=worker\nrole=worker\n\
+             [roles_order]\ndep=\napp=dep\nworker=dep\n",
+        )
+        .unwrap();
+        let order = eph.roles_order.as_ref().unwrap();
+        assert_eq!(order.deps["dep"], Vec::<String>::new());
+        assert_eq!(order.deps["app"], vec!["dep".to_string()]);
+        assert_eq!(order.deps["worker"], vec!["dep".to_string()]);
+        // dep sorts first; app and worker both follow it, breaking the tie by
+        // declaration order in the section (app before worker).
+        assert_eq!(order.topo_roles().unwrap(), vec!["dep", "app", "worker"]);
+    }
+
+    #[test]
+    fn start_order_groups_by_role_in_topological_order() {
+        // Services are declared out of role order; start_order regroups them by
+        // the role graph, keeping declaration order within a role.
+        let eph = parse(
+            "roles_order=dep,app\n\
+             [web]\nrun=serve\nrole=app\n\
+             [db]\nimage=postgres:16\nrole=dep\n\
+             [cache]\nimage=redis:7\nrole=dep\n",
+        )
+        .unwrap();
+        let order: Vec<&str> = eph.start_order().iter().map(|s| s.as_str()).collect();
+        // Both dep services (in declaration order db, cache) before the app.
+        assert_eq!(order, ["db", "cache", "web"]);
+    }
+
+    #[test]
+    fn forward_closure_pulls_in_dependencies_only() {
+        let eph = parse(
+            "[db]\nimage=postgres:16\nrole=dep\n\
+             [web]\nrun=serve\nrole=app\n\
+             [jobs]\nrun=worker\nrole=worker\n\
+             [roles_order]\ndep=\napp=dep\nworker=dep\n",
+        )
+        .unwrap();
+        // --role=worker brings up worker + dep, but NOT app.
+        assert_eq!(
+            eph.services_for_roles_up(&["worker".to_string()]).unwrap(),
+            vec!["db".to_string(), "jobs".to_string()]
+        );
+        // --role=app brings up app + dep, but NOT worker.
+        assert_eq!(
+            eph.services_for_roles_up(&["app".to_string()]).unwrap(),
+            vec!["db".to_string(), "web".to_string()]
+        );
+    }
+
+    #[test]
+    fn reverse_closure_pulls_in_dependents() {
+        let eph = parse(
+            "[db]\nimage=postgres:16\nrole=dep\n\
+             [web]\nrun=serve\nrole=app\n\
+             [jobs]\nrun=worker\nrole=worker\n\
+             [roles_order]\ndep=\napp=dep\nworker=dep\n",
+        )
+        .unwrap();
+        // Tearing down dep must also take everything that depends on it, returned
+        // in bring-up order (the caller stops in reverse).
+        assert_eq!(
+            eph.services_for_roles_down(&["dep".to_string()]).unwrap(),
+            vec!["db".to_string(), "web".to_string(), "jobs".to_string()]
+        );
+    }
+
+    #[test]
+    fn role_flag_on_a_file_without_roles_is_an_error() {
+        let eph = parse("[postgres]\nimage=postgres:16\n").unwrap();
+        assert!(eph.services_for_roles_up(&["dep".to_string()]).is_err());
+    }
+
+    #[test]
+    fn unknown_role_in_selection_is_an_error() {
+        let eph = parse("roles_order=dep\n\n[db]\nimage=postgres:16\nrole=dep\n").unwrap();
+        let err = eph
+            .services_for_roles_up(&["nope".to_string()])
+            .expect_err("unknown role must error");
+        assert!(err.to_string().contains("nope"));
+    }
+
+    #[test]
+    fn tagging_a_role_without_roles_order_is_rejected() {
+        let input = "[postgres]\nimage=postgres:16\nrole=dep\n";
+        let err = parse(input).expect_err("role without roles_order must be rejected");
+        assert!(err.to_string().contains("roles_order"));
+    }
+
+    #[test]
+    fn roles_order_with_an_untagged_service_is_rejected() {
+        let input = "roles_order=dep\n\n[db]\nimage=postgres:16\nrole=dep\n\n[web]\nrun=serve\n";
+        let err = parse(input).expect_err("untagged service under roles_order must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("web") && msg.contains("role"));
+    }
+
+    #[test]
+    fn service_role_not_in_roles_order_is_rejected() {
+        let input = "roles_order=dep\n\n[web]\nrun=serve\nrole=app\n";
+        let err = parse(input).expect_err("service role missing from roles_order must be rejected");
+        assert!(err.to_string().contains("app"));
+    }
+
+    #[test]
+    fn roles_order_role_without_a_service_is_rejected() {
+        // `cache` is listed in roles_order but no service declares it.
+        let input = "roles_order=dep,cache\n\n[db]\nimage=postgres:16\nrole=dep\n";
+        let err = parse(input).expect_err("role with no service must be rejected");
+        assert!(err.to_string().contains("cache"));
+    }
+
+    #[test]
+    fn dependency_on_unknown_role_is_rejected() {
+        let input = "[db]\nimage=postgres:16\nrole=dep\n[roles_order]\ndep=ghost\n";
+        let err = parse(input).expect_err("edge to unknown role must be rejected");
+        assert!(err.to_string().contains("ghost"));
+    }
+
+    #[test]
+    fn cyclic_roles_order_is_rejected() {
+        let input = "[a]\nrun=a\nrole=x\n[b]\nrun=b\nrole=y\n[roles_order]\nx=y\ny=x\n";
+        let err = parse(input).expect_err("a role cycle must be rejected");
+        assert!(err.to_string().contains("cycle"));
+    }
+
+    #[test]
+    fn declaring_both_roles_order_forms_is_rejected() {
+        let input = "roles_order=dep\n\n[db]\nimage=postgres:16\nrole=dep\n\n[roles_order]\ndep=\n";
+        let err = parse(input).expect_err("both linear and section forms must be rejected");
+        assert!(err.to_string().contains("both"));
+    }
+
+    #[test]
+    fn duplicate_role_key_in_dag_is_rejected() {
+        let input = "[db]\nimage=postgres:16\nrole=dep\n[roles_order]\ndep=\ndep=\n";
+        let err = parse(input).expect_err("a duplicate role key must be rejected");
+        assert!(err.to_string().contains("duplicate role 'dep'"));
+    }
+
+    #[test]
+    fn duplicate_role_in_linear_form_is_rejected() {
+        let input = "roles_order=dep,dep\n\n[db]\nimage=postgres:16\nrole=dep\n";
+        let err = parse(input).expect_err("a repeated role in the linear form must be rejected");
+        assert!(err.to_string().contains("duplicate role 'dep'"));
+    }
+
+    #[test]
+    fn role_names_are_free_form_including_uppercase() {
+        // Role names are not restricted to any case: an uppercase role works in
+        // both the section and linear forms, and is never mistaken for an env var.
+        let eph = parse("[db]\nimage=postgres:16\nrole=DEP\n\n[roles_order]\nDEP=\n").unwrap();
+        assert_eq!(eph.services["db"].role.as_deref(), Some("DEP"));
+        assert!(eph.roles_order.as_ref().unwrap().deps.contains_key("DEP"));
+    }
+
+    #[test]
+    fn roles_order_section_can_precede_the_services() {
+        // The section may appear anywhere, including before the services it names.
+        let eph = parse(
+            "[roles_order]\ndep=\napp=dep\n\n[db]\nimage=postgres:16\nrole=dep\n\n[web]\nrun=serve\nrole=app\n",
+        )
+        .unwrap();
+        let order: Vec<&str> = eph.start_order().iter().map(|s| s.as_str()).collect();
+        assert_eq!(order, ["db", "web"]);
     }
 }

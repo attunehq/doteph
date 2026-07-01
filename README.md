@@ -64,6 +64,11 @@ eval "$(eph env)"      # load connection strings into your shell
 eph down               # stop when you are done
 ```
 
+Tag services with a `role=` (and a `roles_order`) to split the stack into tiers and
+bring up one at a time: `eph up --role dep` starts just the dependency services (for
+example to prewarm databases in a Claude Code SessionStart hook) without starting
+your app. See [Roles and ordering](docs/user-guide/eph-file.md#roles-and-ordering).
+
 [Getting Started](docs/user-guide/getting-started.md) walks through writing the
 `.eph` file from scratch.
 

@@ -229,6 +229,69 @@ DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/test
 }
 
 // ============================================================================
+// Roles Tests (no Docker: parsing, validation, and selection only)
+// ============================================================================
+
+/// `eph check` reports each service's role and the resulting bring-up order when
+/// the file uses roles, so the dependency-vs-app split is visible without Docker.
+#[tokio::test]
+async fn check_reports_roles_and_bring_up_order() {
+    let ws = TestWorkspace::new(
+        r#"
+roles_order=dep,app
+
+[web]
+run=serve
+role=app
+
+[postgres]
+image=postgres:16
+role=dep
+"#,
+    );
+
+    let out = ws.eph_ok(&["check"]).await;
+    assert!(out.contains("postgres [dep]"), "roles not shown:\n{out}");
+    assert!(out.contains("web [app]"), "roles not shown:\n{out}");
+    // dep comes up before app regardless of declaration order.
+    assert!(
+        out.contains("Bring-up order: postgres, web"),
+        "bring-up order missing or wrong:\n{out}"
+    );
+}
+
+/// `--role` on a file that does not define roles is a clear error, and it fails
+/// during selection (before touching Docker), so it is safe to assert here.
+#[tokio::test]
+async fn up_role_without_roles_order_errors() {
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+    let out = ws.eph(&["up", "--role", "dep"]).await;
+    assert!(!out.status.success(), "up --role should fail without roles");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not define roles"),
+        "expected a no-roles error, got: {stderr}"
+    );
+}
+
+/// A file that tags a role but omits `roles_order` is rejected by `eph check`,
+/// enforcing the mutual-completeness invariant with a message naming roles_order.
+#[tokio::test]
+async fn check_rejects_role_without_roles_order() {
+    let ws = TestWorkspace::new("[postgres]\nimage=postgres:16\nrole=dep\n");
+    let out = ws.eph(&["check"]).await;
+    assert!(
+        !out.status.success(),
+        "check should reject a role without roles_order"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("roles_order"),
+        "expected roles_order in the error, got: {stderr}"
+    );
+}
+
+// ============================================================================
 // Service Lifecycle Tests
 // ============================================================================
 
