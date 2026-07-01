@@ -1527,16 +1527,22 @@ impl ServiceManager {
     /// `eph dev` calls this once the backing services and the foreground app are
     /// all up, preserving the `eph up` guarantee that a hook may reference any
     /// service's assigned port (a seed whose `DATABASE_URL` interpolates
-    /// `${postgres.port}`, say). Hooks run in declaration order against a single
-    /// resolved snapshot of the running services.
+    /// `${postgres.port}`, say). Hooks run in start order (topological in roles
+    /// mode, matching `eph up`) against a single resolved snapshot of the running
+    /// services.
     ///
     /// # Errors
     ///
     /// Returns an error if any `post-start` hook fails.
     pub async fn run_all_post_start(&self, eph: &EphFile) -> Result<()> {
         let running = self.status().await?;
-        for service in eph.services.values() {
-            self.run_service_post_start(eph, &running, service).await?;
+        // Run in start order (topological in roles mode), matching `eph up`, so a
+        // dependency role's post-start hook runs before a dependent's even when
+        // the services are declared out of role order. `run_all_pre_start` already
+        // does this; keep the two consistent.
+        for name in start_order(eph) {
+            self.run_service_post_start(eph, &running, &eph.services[name])
+                .await?;
         }
         Ok(())
     }

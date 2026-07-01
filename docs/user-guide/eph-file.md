@@ -381,7 +381,9 @@ Here both `app` and `worker` depend on `dep`, but not on each other, so a `worke
 that needs the database but not the app can start without it. Use the DAG form when
 a role needs some but not all of the others; use the linear form for a straight
 chain. The section may appear anywhere in the file, including before the services it
-names.
+names. Every line inside it is a role edge (role names are free-form, so nothing is
+reinterpreted as an env var), so keep top-level environment variables outside the
+section: before the first section, or after the services.
 
 ### Ordering in roles mode
 

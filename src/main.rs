@@ -466,21 +466,31 @@ async fn cmd_dev(service: Option<String>, clean: bool, watch: Vec<String>) -> Re
 
     let mut manager = ServiceManager::new(workspace).await?;
 
-    // Services already running before `eph dev` starts (typically dependency
-    // services a SessionStart hook prewarmed with `eph up --role=<dep>`) are
-    // adopted, not owned: eph dev reuses them and must leave them running when it
-    // tears down. Everything else it brings up itself and is responsible for
-    // stopping. Snapshotting here, before the first bring-up, is the whole
-    // ownership model: no persisted refcount required. `--clean` overrides this
-    // and bulldozes everything, since it is an explicit full-reset request.
-    let brought_up: Vec<String> = {
-        let already_running = manager.status().await?;
-        eph.services
-            .keys()
-            .filter(|name| !already_running.contains_key(*name))
-            .cloned()
-            .collect()
-    };
+    let already_running = manager.status().await?;
+    // `eph dev` spawns and attaches to the foreground app itself (see
+    // `start_foreground`, which never adopts an existing process). It therefore
+    // cannot foreground one that is already running: doing so would spawn a second
+    // copy and overwrite the original's state entry, orphaning it beyond eph's
+    // reach. Fail fast with a clear message instead. A prewarmed dependency tier
+    // is fine; only the app being foregrounded is the conflict.
+    if already_running.contains_key(foreground.as_str()) {
+        anyhow::bail!(
+            "the foreground service '{foreground}' is already running; stop it first \
+             with `eph down {foreground}` (eph dev starts and attaches to it itself)"
+        );
+    }
+    // Services already running now (a SessionStart hook's prewarmed dependency
+    // tier, typically) are adopted and left running on teardown. Everything else,
+    // including the foreground just guaranteed not to be running, eph dev brings up
+    // and is responsible for tearing back down. Snapshotting here, before the first
+    // bring-up, is the whole ownership model: no persisted refcount required.
+    // `--clean` overrides this and bulldozes everything, as an explicit full reset.
+    let brought_up: Vec<String> = eph
+        .services
+        .keys()
+        .filter(|name| !already_running.contains_key(name.as_str()))
+        .cloned()
+        .collect();
 
     // A preview server (Claude Desktop) assigns a host port, passes it as $PORT,
     // then polls it and reveals the app the instant it accepts a connection. We

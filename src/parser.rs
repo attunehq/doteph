@@ -536,14 +536,23 @@ pub fn parse(input: &str) -> Result<EphFile> {
         // Remove optional quotes from value
         let value = strip_quotes(value);
 
-        // Inside `[roles_order]`, each line is a `role=dep1,dep2` edge. An empty
-        // value declares a root role that depends on nothing.
+        // Inside `[roles_order]`, every line is a `role=dep1,dep2` edge (an empty
+        // value declares a root that depends on nothing). Role names are
+        // free-form, so a key here is never reinterpreted as an env var the way a
+        // service-section key can be: declare top-level env vars outside the
+        // section (before the first section, or after the services).
         if in_roles_order {
-            let deps = split_roles(value);
-            roles_order_dag
+            let dag = roles_order_dag
                 .as_mut()
-                .expect("dag is initialized on entering [roles_order]")
-                .insert(key.to_string(), deps);
+                .expect("dag is initialized on entering [roles_order]");
+            if dag.contains_key(key) {
+                bail!(
+                    "line {}: duplicate role '{}' in [roles_order]",
+                    line_num,
+                    key
+                );
+            }
+            dag.insert(key.to_string(), split_roles(value));
             continue;
         }
 
@@ -560,7 +569,7 @@ pub fn parse(input: &str) -> Result<EphFile> {
             if roles_order_linear.is_some() {
                 bail!("line {}: duplicate top-level `roles_order=`", line_num);
             }
-            roles_order_linear = Some(split_roles(value));
+            roles_order_linear = Some(split_roles_checked(value, line_num)?);
             continue;
         }
 
@@ -643,6 +652,24 @@ fn split_roles(value: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// Like [`split_roles`], but rejects a repeated role. Used for the linear
+/// `roles_order=a,b,c` form, where a duplicate is a mistake: it would desugar to
+/// a role depending on itself (a cycle) and, more usefully, almost always means a
+/// typo. The list is short, so the quadratic scan is fine.
+fn split_roles_checked(value: &str, line_num: usize) -> Result<Vec<String>> {
+    let roles = split_roles(value);
+    for (i, role) in roles.iter().enumerate() {
+        if roles[..i].contains(role) {
+            bail!(
+                "line {}: duplicate role '{}' in roles_order",
+                line_num,
+                role
+            );
+        }
+    }
+    Ok(roles)
 }
 
 /// Desugar the linear `roles_order=a,b,c` form into an adjacency list: `a` is a
@@ -1429,6 +1456,29 @@ port.api=5000
         let input = "roles_order=dep\n\n[db]\nimage=postgres:16\nrole=dep\n\n[roles_order]\ndep=\n";
         let err = parse(input).expect_err("both linear and section forms must be rejected");
         assert!(err.to_string().contains("both"));
+    }
+
+    #[test]
+    fn duplicate_role_key_in_dag_is_rejected() {
+        let input = "[db]\nimage=postgres:16\nrole=dep\n[roles_order]\ndep=\ndep=\n";
+        let err = parse(input).expect_err("a duplicate role key must be rejected");
+        assert!(err.to_string().contains("duplicate role 'dep'"));
+    }
+
+    #[test]
+    fn duplicate_role_in_linear_form_is_rejected() {
+        let input = "roles_order=dep,dep\n\n[db]\nimage=postgres:16\nrole=dep\n";
+        let err = parse(input).expect_err("a repeated role in the linear form must be rejected");
+        assert!(err.to_string().contains("duplicate role 'dep'"));
+    }
+
+    #[test]
+    fn role_names_are_free_form_including_uppercase() {
+        // Role names are not restricted to any case: an uppercase role works in
+        // both the section and linear forms, and is never mistaken for an env var.
+        let eph = parse("[db]\nimage=postgres:16\nrole=DEP\n\n[roles_order]\nDEP=\n").unwrap();
+        assert_eq!(eph.services["db"].role.as_deref(), Some("DEP"));
+        assert!(eph.roles_order.as_ref().unwrap().deps.contains_key("DEP"));
     }
 
     #[test]
