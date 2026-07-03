@@ -468,6 +468,15 @@ Run `eph update` to install it.
 - `EPH_REPO` and `EPH_BASE_URL` override the GitHub repository and download base
   URL, matching the environment variables the install script honors (useful for a
   mirror or an internal fork).
+- **Passive out-of-date nag.** Every other command checks, at startup, whether a
+  newer release exists and prints a one-line reminder on stderr when one does. The
+  check is disconnected from the command you ran: it reads a cached
+  latest-release lookup (so it never blocks) and refreshes that cache once a day
+  in a detached background process (so there is no network timeout to wait on and
+  a failed lookup never affects the command). It stays silent for source builds,
+  when stderr is not a terminal (scripts, pipes, CI), and when
+  `EPH_NO_UPDATE_CHECK` is set, so it never disturbs `eval "$(eph env)"` or
+  machine-readable output. Set `EPH_NO_UPDATE_CHECK=1` to turn it off entirely.
 
 ## Commands that do not exist (by design)
 

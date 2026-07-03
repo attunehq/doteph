@@ -14,14 +14,22 @@
 //! move-aside dance on Windows where a running `.exe` cannot be overwritten). The
 //! GitHub resolution, asset naming, and checksum verification live here so the
 //! integrity guarantee the install scripts provide is preserved.
+//!
+//! This module also drives the passive out-of-date nag ([`warn_if_outdated`])
+//! that every other command runs at startup: it reads a cached latest-release
+//! lookup to decide whether to warn, and refreshes that cache in a detached
+//! background process ([`run_check_worker`]), so the check never blocks or fails
+//! the command the user actually ran.
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
-use std::time::Duration;
+use std::io::{self, IsTerminal, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use semver::Version;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// The GitHub `owner/repo` releases are pulled from. `EPH_REPO` overrides it,
@@ -338,6 +346,182 @@ fn env_nonempty(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// How long a cached latest-release lookup stays fresh before the startup check
+/// refreshes it in the background. A day keeps the nag current without checking
+/// on every invocation.
+const CHECK_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// The latest release the last background refresh observed, cached so the startup
+/// check can decide whether to nag without touching the network on the hot path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedCheck {
+    /// The latest release tag seen by the most recent successful refresh.
+    latest: String,
+    /// Unix seconds when that refresh ran, for TTL-based staleness.
+    checked_at: u64,
+}
+
+/// Warn on stderr when a newer release is available, and refresh the cached
+/// latest version in a detached background process for next time.
+///
+/// This is the passive counterpart to `eph update`: every other command calls it
+/// at startup so a user on an old build is nudged to upgrade. It is deliberately
+/// cheap and non-blocking: the decision to warn reads only a small on-disk cache,
+/// and the network refresh runs in a spawned-and-forgotten process (see
+/// [`spawn_background_refresh`]), so it never adds latency or a failure mode to
+/// the command the user actually ran.
+///
+/// It stays silent unless all of these hold, so it never interferes with scripts,
+/// pipes, CI, or `eval "$(eph env)"`: the running binary is a tagged release (a
+/// `git describe` dev build has no release to compare against), stderr is a
+/// terminal, and `EPH_NO_UPDATE_CHECK` is unset.
+pub fn warn_if_outdated(current: &str) {
+    // A source build has no clean release to compare against, so skip the check
+    // and its background refresh entirely: developers building from a checkout
+    // should never be nagged or have a worker spawned on their behalf.
+    if parse_release(current).is_none() {
+        return;
+    }
+    if env_nonempty("EPH_NO_UPDATE_CHECK").is_some() {
+        return;
+    }
+    // The nag is for interactive use. Staying silent when stderr is redirected
+    // keeps automation output clean and, just as importantly, avoids spawning a
+    // background worker on every scripted invocation.
+    if !io::stderr().is_terminal() {
+        return;
+    }
+
+    let cache = read_cache();
+
+    // Warn from the last known latest release, before kicking off the refresh
+    // that updates it for next time.
+    if let Some(cache) = &cache
+        && let Some(message) = outdated_warning(current, &cache.latest)
+    {
+        eprintln!("{message}");
+    }
+
+    // Refresh when the cache is missing or past its TTL. Record the attempt first
+    // (a reserve write) so a burst of commands, or a run of offline invocations
+    // whose worker never succeeds, backs off for a full TTL instead of respawning
+    // a worker every time.
+    let now = now_unix();
+    let stale = cache.as_ref().is_none_or(|c| is_stale(c.checked_at, now));
+    if stale {
+        let latest = cache.map_or_else(|| current.to_string(), |c| c.latest);
+        let _ = write_cache(&CachedCheck {
+            latest,
+            checked_at: now,
+        });
+        spawn_background_refresh();
+    }
+}
+
+/// The nag to print when `current` is a released build behind `latest`, or `None`
+/// when it is up to date, ahead, or not a comparable release.
+fn outdated_warning(current: &str, latest: &str) -> Option<String> {
+    match status(current, latest) {
+        Status::UpdateAvailable => Some(format!(
+            "A new eph release is available: {latest} (you have {current}).\n\
+             Run `eph update` to upgrade, or set EPH_NO_UPDATE_CHECK=1 to silence this."
+        )),
+        Status::UpToDate | Status::Development => None,
+    }
+}
+
+/// The refresh body run by the detached `eph __update-check` worker: resolve the
+/// latest release and rewrite the cache. Silent and best-effort, so a failure
+/// (offline, rate-limited) just leaves the previous cache to be retried after the
+/// TTL.
+pub fn run_check_worker() {
+    let Ok(latest) = Updater::new().latest_tag() else {
+        return;
+    };
+    let _ = write_cache(&CachedCheck {
+        latest,
+        checked_at: now_unix(),
+    });
+}
+
+/// Spawn a detached `eph __update-check` process that refreshes the cache and
+/// exits.
+///
+/// Detaching (rather than a background thread) is what lets the refresh finish
+/// even when the current command exits immediately: a fast command like `eph env`
+/// would otherwise tear the thread down mid-request and never update the cache.
+/// The worker reports back only by writing the cache the next run reads, so its
+/// stdio is discarded and its handle dropped without waiting.
+fn spawn_background_refresh() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = Command::new(exe);
+    command
+        .arg("__update-check")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS drops the worker's tie to this command's console (so it
+        // outlives it), and CREATE_NO_WINDOW keeps it from flashing a window.
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
+    // Best effort: never wait on it (fully detached), and ignore a spawn failure.
+    let _ = command.spawn();
+}
+
+/// The path of the cross-workspace update-check cache, under the user's cache
+/// directory. `None` when no cache directory can be resolved (a headless or
+/// misconfigured environment), which simply disables the passive check.
+fn cache_path() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join("eph").join("update-check.json"))
+}
+
+/// Read the cached latest-release lookup, or `None` when it is absent or
+/// unreadable (a corrupt or older-format cache is treated as missing and
+/// refreshed).
+fn read_cache() -> Option<CachedCheck> {
+    let bytes = std::fs::read(cache_path()?).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Write the cache atomically (temp file then rename) so a concurrent reader
+/// never sees a half-written file. A missing cache directory or write error is
+/// returned for the caller to ignore: the passive check is best-effort.
+fn write_cache(cache: &CachedCheck) -> io::Result<()> {
+    let Some(path) = cache_path() else {
+        return Ok(());
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let bytes = serde_json::to_vec(cache).map_err(io::Error::other)?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// Whether a cache entry stamped at `checked_at` is older than the refresh TTL as
+/// of `now` (both Unix seconds). Saturating so a clock that moved backward reads
+/// as fresh rather than panicking.
+fn is_stale(checked_at: u64, now: u64) -> bool {
+    now.saturating_sub(checked_at) >= CHECK_TTL_SECS
+}
+
+/// The current time in Unix seconds, or 0 if the clock is before the epoch (which
+/// only makes a cache entry read as stale, the safe direction).
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +564,36 @@ mod tests {
     fn status_treats_a_bare_hash_as_development() {
         // `git describe --always` with no tags yields a bare commit hash.
         assert_eq!(status("abc1234", "v0.2.0"), Status::Development);
+    }
+
+    #[test]
+    fn outdated_warning_fires_only_for_a_release_behind_the_latest() {
+        assert!(outdated_warning("v0.4.0", "v0.5.0").is_some());
+        assert!(outdated_warning("v0.5.0", "v0.5.0").is_none());
+        assert!(outdated_warning("v0.6.0", "v0.5.0").is_none());
+        // A development build is never nagged: it has no clean release to compare.
+        assert!(outdated_warning("v0.4.0-3-gabc1234", "v0.5.0").is_none());
+    }
+
+    #[test]
+    fn is_stale_respects_the_ttl() {
+        assert!(!is_stale(1000, 1000));
+        assert!(!is_stale(1000, 1000 + CHECK_TTL_SECS - 1));
+        assert!(is_stale(1000, 1000 + CHECK_TTL_SECS));
+        // A backward clock jump reads as fresh, not a panic.
+        assert!(!is_stale(1000, 500));
+    }
+
+    #[test]
+    fn cached_check_round_trips_through_json() {
+        let cache = CachedCheck {
+            latest: "v1.2.3".to_string(),
+            checked_at: 42,
+        };
+        let bytes = serde_json::to_vec(&cache).unwrap();
+        let back: CachedCheck = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.latest, "v1.2.3");
+        assert_eq!(back.checked_at, 42);
     }
 
     #[test]

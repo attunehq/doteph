@@ -209,6 +209,13 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Internal: refresh the cached latest-release lookup, then exit.
+    ///
+    /// Spawned detached by the startup update check (see `eph::update`); not part
+    /// of the user-facing command set, so it is hidden from help.
+    #[command(name = "__update-check", hide = true)]
+    UpdateCheck,
 }
 
 /// Skills subcommands. They install the skills bundled into this binary into a
@@ -256,6 +263,12 @@ async fn main() -> Result<ExitCode> {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
+
+    // Passively nudge a user on an old release to upgrade, before running the
+    // command they asked for. This reads a small on-disk cache and refreshes it
+    // in a detached background process, so it never blocks or fails the command
+    // itself. Skipped for the updater and the internal refresh worker.
+    maybe_nag_about_update(&cli.command);
 
     match cli.command {
         Commands::Up {
@@ -311,6 +324,7 @@ async fn main() -> Result<ExitCode> {
         Commands::Update { check, force } => {
             cmd_update(check, force).await.map(|()| ExitCode::SUCCESS)
         }
+        Commands::UpdateCheck => cmd_update_check_worker().await.map(|()| ExitCode::SUCCESS),
     }
 }
 
@@ -1324,6 +1338,28 @@ fn relative_to(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// Emit the startup out-of-date nag for a normal command.
+///
+/// Skips the updater itself (it reports status directly) and the internal refresh
+/// worker (which must not recurse into another check). Everything else defers to
+/// [`eph::update::warn_if_outdated`], which applies the remaining gates (release
+/// build, interactive stderr, opt-out env) and spawns the background refresh.
+fn maybe_nag_about_update(command: &Commands) {
+    if matches!(command, Commands::Update { .. } | Commands::UpdateCheck) {
+        return;
+    }
+    eph::update::warn_if_outdated(env!("EPH_VERSION"));
+}
+
+/// The detached background worker (`eph __update-check`) spawned by the startup
+/// check: refresh the cached latest release, silently, then exit. Any error is
+/// swallowed so a failed refresh never surfaces; the cache is retried later.
+async fn cmd_update_check_worker() -> Result<()> {
+    tokio::task::spawn_blocking(eph::update::run_check_worker)
+        .await
+        .context("the update-check worker panicked")
 }
 
 /// `eph update`: resolve the latest release and swap the running binary for it.
