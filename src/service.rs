@@ -489,14 +489,72 @@ fn parse_command_override(
         .transpose()
 }
 
+/// The byte length of a leading Windows drive prefix in `spec`, or `None` when
+/// there is none.
+///
+/// Recognizes the plain `C:` form and the verbatim `\\?\C:` form. The colon in a
+/// drive prefix is part of the source path, not the source/destination separator
+/// that a volume spec uses, so callers skip past this prefix before scanning for
+/// the real separator. Docker's own Windows client special-cases a single leading
+/// drive letter the same way; matching it means a one-character named volume like
+/// `x:/data` is read as drive `x:`, which is the accepted trade for drive-letter
+/// support.
+fn windows_drive_prefix_len(spec: &str) -> Option<usize> {
+    let bytes = spec.as_bytes();
+    // Plain drive: `C:`.
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return Some(2);
+    }
+    // Verbatim drive: `\\?\C:`.
+    if bytes.len() >= 6
+        && bytes.starts_with(br"\\?\")
+        && bytes[4].is_ascii_alphabetic()
+        && bytes[5] == b':'
+    {
+        return Some(6);
+    }
+    None
+}
+
+/// Split a volume spec into its source and the remainder (`destination[:mode]`).
+///
+/// The separator is the first `:` that is not a Windows drive colon, so
+/// `C:\path:/data` splits before `/data` rather than on the drive colon. Returns
+/// `None` when the spec has no such separator (a source-only spec, passed through
+/// unchanged so Docker reports the malformed mount itself).
+fn split_volume_source(spec: &str) -> Option<(&str, &str)> {
+    let skip = windows_drive_prefix_len(spec).unwrap_or(0);
+    let sep = spec[skip..].find(':')? + skip;
+    Some((&spec[..sep], &spec[sep + 1..]))
+}
+
+/// Whether a volume-spec source denotes a host path (a bind mount) rather than a
+/// named volume.
+///
+/// Host paths are Unix absolute (`/`), workspace-relative (`.`), any
+/// backslash-prefixed Windows path (UNC `\\server\share` or verbatim `\\?\`), or
+/// a Windows drive-letter path (`C:\` or `C:/`). Everything else is a named
+/// volume namespaced to the workspace.
+fn is_host_path_source(source: &str) -> bool {
+    source.starts_with('/')
+        || source.starts_with('.')
+        || source.starts_with('\\')
+        || windows_drive_prefix_len(source).is_some()
+}
+
 /// Resolve one `volumes` entry into a Docker `-v` bind spec.
 ///
-/// A spec starting with `/` or `.` is a host-path bind mount: a leading `.` is
-/// resolved relative to the workspace root, while an absolute path is used as
-/// is. Anything else is a named volume, namespaced to this workspace and
-/// service (via [`Workspace::volume_name`]) so two workspaces, or two services,
-/// never collide on a shared volume. A spec without a `:<container_path>` half
-/// is passed through unchanged, so Docker reports the malformed mount itself.
+/// A host-path source (see [`is_host_path_source`]) is a bind mount: a leading
+/// `.` is resolved relative to the workspace root, while an absolute path
+/// (including a Windows drive-letter path like `C:\data`) is used as is. Anything
+/// else is a named volume, namespaced to this workspace and service (via
+/// [`Workspace::volume_name`]) so two workspaces, or two services, never collide
+/// on a shared volume. A spec without a `:<container_path>` half is passed
+/// through unchanged, so Docker reports the malformed mount itself.
+///
+/// The source/destination split is Windows-aware: a leading drive colon
+/// (`C:\...` or `\\?\C:\...`) is part of the source, not the field separator, so
+/// the drive colon is never mistaken for it (see [`split_volume_source`]).
 ///
 /// # Errors
 ///
@@ -505,37 +563,36 @@ fn parse_command_override(
 /// [`reject_verbatim_bind_source`]), or if a relative source resolves to a path
 /// that is not valid UTF-8.
 fn resolve_volume_spec(spec: &str, workspace: &Workspace, service_name: &str) -> Result<String> {
-    if spec.starts_with('/') || spec.starts_with('.') {
+    // Source-only or empty-source specs are passed through: Docker reports the
+    // malformed mount itself rather than eph fabricating a bogus named volume.
+    let Some((source, rest)) = split_volume_source(spec) else {
+        return Ok(spec.to_string());
+    };
+    if source.is_empty() {
+        return Ok(spec.to_string());
+    }
+
+    if is_host_path_source(source) {
         // Host-path bind mount.
-        let parts: Vec<&str> = spec.splitn(2, ':').collect();
-        if parts.len() == 2 {
-            let host_path = if parts[0].starts_with('.') {
-                let joined = workspace.path.join(parts[0]);
-                // to_str, not to_string_lossy: a lossy replacement in a bind
-                // source would silently mount the wrong host path.
-                joined
-                    .to_str()
-                    .with_context(|| {
-                        format!("bind mount source {} is not valid UTF-8", joined.display())
-                    })?
-                    .to_string()
-            } else {
-                parts[0].to_string()
-            };
-            reject_verbatim_bind_source(&host_path)?;
-            Ok(format!("{}:{}", host_path, parts[1]))
+        let host_path = if source.starts_with('.') {
+            let joined = workspace.path.join(source);
+            // to_str, not to_string_lossy: a lossy replacement in a bind source
+            // would silently mount the wrong host path.
+            joined
+                .to_str()
+                .with_context(|| {
+                    format!("bind mount source {} is not valid UTF-8", joined.display())
+                })?
+                .to_string()
         } else {
-            Ok(spec.to_string())
-        }
+            source.to_string()
+        };
+        reject_verbatim_bind_source(&host_path)?;
+        Ok(format!("{host_path}:{rest}"))
     } else {
         // Named volume, namespaced to the workspace + service.
-        let parts: Vec<&str> = spec.splitn(2, ':').collect();
-        if parts.len() == 2 {
-            let volume_name = workspace.volume_name(service_name, parts[0]);
-            Ok(format!("{}:{}", volume_name, parts[1]))
-        } else {
-            Ok(spec.to_string())
-        }
+        let volume_name = workspace.volume_name(service_name, source);
+        Ok(format!("{volume_name}:{rest}"))
     }
 }
 
@@ -2434,12 +2491,16 @@ impl ServiceManager {
             summary.services_removed += 1;
 
             // Remove per-workspace named volumes. A volume entry is a named
-            // volume (not a bind mount) when its host part does not begin with
-            // "." or "/". The real Docker volume name is derived via
-            // Workspace::volume_name(service, base).
+            // volume (not a bind mount) when its source is not a host path (see
+            // is_host_path_source, which also recognizes Windows drive-letter and
+            // UNC sources). The source split is Windows-aware so a drive colon is
+            // never mistaken for the source/destination separator. The real
+            // Docker volume name is derived via Workspace::volume_name(service, base).
             for volume in &service.volumes {
-                let base = volume.split_once(':').map(|(b, _)| b).unwrap_or(volume);
-                if base.starts_with('.') || base.starts_with('/') {
+                let base = split_volume_source(volume)
+                    .map(|(source, _)| source)
+                    .unwrap_or(volume);
+                if is_host_path_source(base) {
                     continue; // bind mount, not a managed named volume
                 }
                 let volume_name = self.workspace.volume_name(name, base);
@@ -3261,6 +3322,132 @@ mod tests {
             msg.contains("extended-length"),
             "error should explain the extended-length path: {msg}"
         );
+    }
+
+    #[test]
+    fn resolve_volume_spec_passes_windows_drive_absolute_bind_through() {
+        // Regression for #52: an absolute Windows source starts with a drive
+        // letter, not `/` or `.`, and the drive colon must not be mistaken for
+        // the source/destination separator. Both `\` and `/` path separators are
+        // valid after the drive colon on Windows.
+        let ws = test_workspace(r"C:\ws");
+        assert_eq!(
+            resolve_volume_spec(r"C:\Users\me\data:/data", &ws, "db").unwrap(),
+            r"C:\Users\me\data:/data"
+        );
+        assert_eq!(
+            resolve_volume_spec("C:/Users/me/data:/data", &ws, "db").unwrap(),
+            "C:/Users/me/data:/data"
+        );
+        // Any drive letter, not just `C:`, and case-insensitive.
+        assert_eq!(
+            resolve_volume_spec(r"X:\Data\seed:/data", &ws, "db").unwrap(),
+            r"X:\Data\seed:/data"
+        );
+        assert_eq!(
+            resolve_volume_spec(r"d:\data:/data", &ws, "db").unwrap(),
+            r"d:\data:/data"
+        );
+    }
+
+    #[test]
+    fn resolve_volume_spec_preserves_mode_field() {
+        // A trailing `:ro`/`:rw`/`:z` mode is part of the destination remainder
+        // and must survive on every branch: relative, drive-letter, and named.
+        let ws = test_workspace(r"C:\ws");
+        assert_eq!(
+            resolve_volume_spec(r"C:\data:/data:ro", &ws, "db").unwrap(),
+            r"C:\data:/data:ro"
+        );
+        assert_eq!(
+            resolve_volume_spec("/host/path:/data:rw", &ws, "db").unwrap(),
+            "/host/path:/data:rw"
+        );
+        assert_eq!(
+            resolve_volume_spec("data:/data:ro", &ws, "db").unwrap(),
+            "eph-abcd1234-db-data:/data:ro"
+        );
+    }
+
+    #[test]
+    fn resolve_volume_spec_passes_unc_bind_through() {
+        // A UNC source (`\\server\share\...`) is a host bind: it starts with a
+        // backslash but is not the rejected verbatim `\\?\` form.
+        let ws = test_workspace(r"C:\ws");
+        assert_eq!(
+            resolve_volume_spec(r"\\server\share\data:/data", &ws, "db").unwrap(),
+            r"\\server\share\data:/data"
+        );
+    }
+
+    #[test]
+    fn resolve_volume_spec_rejects_verbatim_drive_bind() {
+        // A verbatim `\\?\C:\...` absolute source is classified as a host bind
+        // (the drive colon is skipped), then rejected with the extended-length
+        // error rather than misparsed into a named volume named `\\?\C`.
+        let ws = test_workspace(r"C:\ws");
+        let err = resolve_volume_spec(r"\\?\C:\data:/data", &ws, "db")
+            .expect_err("a verbatim drive source must be rejected");
+        assert!(
+            err.to_string().contains("extended-length"),
+            "error should explain the extended-length path: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_volume_spec_passes_windows_drive_source_only_through() {
+        // A drive source with no container path (`C:\data`, no `:/dest`) has no
+        // real separator once the drive colon is skipped, so it passes through
+        // unchanged rather than becoming a named volume named `C`.
+        let ws = test_workspace(r"C:\ws");
+        assert_eq!(
+            resolve_volume_spec(r"C:\data", &ws, "db").unwrap(),
+            r"C:\data"
+        );
+        assert_eq!(resolve_volume_spec("C:", &ws, "db").unwrap(), "C:");
+    }
+
+    #[test]
+    fn resolve_volume_spec_passes_empty_source_through() {
+        // A leading-colon spec (`:/data`) has an empty source: pass it through so
+        // Docker reports it, rather than namespacing an empty volume name.
+        let ws = test_workspace("/ws");
+        assert_eq!(resolve_volume_spec(":/data", &ws, "db").unwrap(), ":/data");
+    }
+
+    #[test]
+    fn is_host_path_source_classifies_every_source_shape() {
+        // Host binds: Unix absolute, relative, drive-letter (both slash styles),
+        // UNC, and verbatim drive.
+        assert!(is_host_path_source("/host/path"));
+        assert!(is_host_path_source("./rel"));
+        assert!(is_host_path_source(r"C:\data"));
+        assert!(is_host_path_source("C:/data"));
+        assert!(is_host_path_source(r"\\server\share"));
+        assert!(is_host_path_source(r"\\?\C:\data"));
+        // Named volumes: bare names, including a non-drive `name:` shape.
+        assert!(!is_host_path_source("data"));
+        assert!(!is_host_path_source("pgdata"));
+    }
+
+    #[test]
+    fn split_volume_source_skips_drive_colon() {
+        // The drive colon is never the separator; the first non-drive colon is.
+        assert_eq!(
+            split_volume_source(r"C:\data:/dest"),
+            Some((r"C:\data", "/dest"))
+        );
+        assert_eq!(
+            split_volume_source(r"\\?\C:\data:/dest"),
+            Some((r"\\?\C:\data", "/dest"))
+        );
+        assert_eq!(
+            split_volume_source("data:/dest:ro"),
+            Some(("data", "/dest:ro"))
+        );
+        // No non-drive separator: source-only, no split.
+        assert_eq!(split_volume_source(r"C:\data"), None);
+        assert_eq!(split_volume_source("justaname"), None);
     }
 
     #[test]
