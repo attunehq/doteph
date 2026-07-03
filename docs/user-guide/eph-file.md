@@ -172,23 +172,25 @@ there are several ports.
 
 ## Volumes
 
-`volume=` accepts two forms, distinguished by the first character of the host
-part:
+`volume=` accepts two forms, distinguished by the shape of the host part:
 
-- **Named volume** - does not start with `.` or `/`. Docker manages it, and
-  `eph` prefixes it per workspace (`eph-<short_id>-<service>-<name>`). Survives
-  `down` and `down --rm`; removed by `clean`.
+- **Named volume** - a bare name (does not look like a path). Docker manages it,
+  and `eph` prefixes it per workspace (`eph-<short_id>-<service>-<name>`).
+  Survives `down` and `down --rm`; removed by `clean`.
 
   ```ini
   volume=pgdata:/var/lib/postgresql/data
   ```
 
-- **Bind mount** - starts with `.` or `/`. A path on your machine. Relative
-  paths resolve from the workspace root. Never removed by `eph`.
+- **Bind mount** - a host path. A path on your machine. Relative paths (starting
+  with `.`) resolve from the workspace root. Never removed by `eph`. A host part
+  is a path when it starts with `.` or `/`, or, on Windows, when it is a
+  drive-letter path (`C:\...` or `C:/...`) or a UNC path (`\\server\share\...`).
 
   ```ini
   volume=./seed:/docker-entrypoint-initdb.d
   volume=/absolute/host/path:/data
+  volume=C:\Users\me\data:/data
   ```
 
 ## Health checks and timeouts

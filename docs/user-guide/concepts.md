@@ -169,8 +169,9 @@ after (cleanup eph cannot do itself). A failing `pre-stop` leaves the service
 running so you can retry; a failing `post-stop` aborts the rest of the teardown
 but the service is already stopped. Both are skippable with `--skip-hooks`.
 
-> Bind mounts (host paths starting with `.` or `/`) are never deleted by
-> `eph clean` - only Docker named volumes are.
+> Bind mounts (host paths: `.`, `/`, a Windows drive like `C:\...`, or a UNC
+> `\\server\share\...`) are never deleted by `eph clean` - only Docker named
+> volumes are.
 
 > The table describes `image`/`dockerfile` services. **`compose` services are an
 > exception**: both `eph down` and `eph down --rm` run `docker compose down`,
