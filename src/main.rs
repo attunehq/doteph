@@ -192,6 +192,30 @@ enum Commands {
         #[command(subcommand)]
         command: SkillsCommand,
     },
+
+    /// Update eph to the latest GitHub release, replacing the running binary.
+    ///
+    /// Resolves the latest published release, downloads the archive built for
+    /// this platform, verifies it against the release SHA-256 checksums, and
+    /// swaps it over the running binary in place (no shell or curl). It installs
+    /// the same bits as `scripts/install.sh`, so a self-update and a fresh
+    /// install converge.
+    Update {
+        /// Report whether an update is available without installing it.
+        #[arg(long)]
+        check: bool,
+
+        /// Reinstall the latest release even when already up to date.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Internal: refresh the cached latest-release lookup, then exit.
+    ///
+    /// Spawned detached by the startup update check (see `eph::update`); not part
+    /// of the user-facing command set, so it is hidden from help.
+    #[command(name = "__update-check", hide = true)]
+    UpdateCheck,
 }
 
 /// Skills subcommands. They install the skills bundled into this binary into a
@@ -239,6 +263,12 @@ async fn main() -> Result<ExitCode> {
         .with_target(false)
         .with_writer(std::io::stderr)
         .init();
+
+    // Passively nudge a user on an old release to upgrade, before running the
+    // command they asked for. This reads a small on-disk cache and refreshes it
+    // in a detached background process, so it never blocks or fails the command
+    // itself. Skipped for the updater and the internal refresh worker.
+    maybe_nag_about_update(&cli.command);
 
     match cli.command {
         Commands::Up {
@@ -291,6 +321,10 @@ async fn main() -> Result<ExitCode> {
             }),
             SkillsCommand::List => cmd_skills_list().map(|()| ExitCode::SUCCESS),
         },
+        Commands::Update { check, force } => {
+            cmd_update(check, force).await.map(|()| ExitCode::SUCCESS)
+        }
+        Commands::UpdateCheck => cmd_update_check_worker().await.map(|()| ExitCode::SUCCESS),
     }
 }
 
@@ -1304,6 +1338,103 @@ fn relative_to(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// Emit the startup out-of-date nag for a normal command.
+///
+/// Skips the updater itself (it reports status directly) and the internal refresh
+/// worker (which must not recurse into another check). Everything else defers to
+/// [`eph::update::warn_if_outdated`], which applies the remaining gates (release
+/// build, interactive stderr, opt-out env) and spawns the background refresh.
+fn maybe_nag_about_update(command: &Commands) {
+    if matches!(command, Commands::Update { .. } | Commands::UpdateCheck) {
+        return;
+    }
+    eph::update::warn_if_outdated(env!("EPH_VERSION"));
+}
+
+/// The detached background worker (`eph __update-check`) spawned by the startup
+/// check: refresh the cached latest release, silently, then exit. Any error is
+/// swallowed so a failed refresh never surfaces; the cache is retried later.
+async fn cmd_update_check_worker() -> Result<()> {
+    tokio::task::spawn_blocking(eph::update::run_check_worker)
+        .await
+        .context("the update-check worker panicked")
+}
+
+/// `eph update`: resolve the latest release and swap the running binary for it.
+///
+/// The network and filesystem work (HTTPS download, archive extraction, the
+/// in-place binary swap) is synchronous and blocking, so it runs on a blocking
+/// thread rather than stalling the async runtime the rest of eph shares.
+async fn cmd_update(check: bool, force: bool) -> Result<()> {
+    tokio::task::spawn_blocking(move || run_update(check, force))
+        .await
+        .context("the update task panicked")?
+}
+
+/// The blocking body of [`cmd_update`], factored out so it runs on a blocking
+/// thread. Resolves the latest release, then either reports status (`--check`) or
+/// downloads, verifies, and installs it.
+fn run_update(check: bool, force: bool) -> Result<()> {
+    use eph::update::{self, Status};
+
+    let current = env!("EPH_VERSION");
+    let updater = update::Updater::new();
+    let latest = updater
+        .latest_tag()
+        .context("resolve the latest eph release")?;
+    let status = update::status(current, &latest);
+
+    if check {
+        print_update_status(current, &latest, status);
+        return Ok(());
+    }
+    if status == Status::UpToDate && !force {
+        println!("eph {current} is already the latest release.");
+        return Ok(());
+    }
+
+    match status {
+        // A development build has no meaningful ordering against the release, so
+        // be explicit that this installs the latest published release over it.
+        Status::Development => println!(
+            "Installing the latest release {latest} (replacing development build {current})."
+        ),
+        _ => println!("Updating eph from {current} to {latest}."),
+    }
+
+    // Stage the download in a temp file, then let self-replace swap it over the
+    // running binary. The staged file is copied into place inside `fetch` +
+    // `replace_running_exe`; dropping it afterward removes the leftover.
+    let staged = tempfile::Builder::new()
+        .prefix("eph-update-")
+        .tempfile()
+        .context("create a staging file for the update")?;
+    updater.fetch(&latest, staged.path())?;
+    update::replace_running_exe(staged.path())?;
+    drop(staged);
+
+    println!("eph updated to {latest}.");
+    Ok(())
+}
+
+/// Print the result of `eph update --check`.
+fn print_update_status(current: &str, latest: &str, status: eph::update::Status) {
+    use eph::update::Status;
+    match status {
+        Status::Development => {
+            println!("eph is a development build ({current}); the latest release is {latest}.");
+            println!("Run `eph update` to install it.");
+        }
+        Status::UpToDate => {
+            println!("eph {current} is up to date (latest release {latest}).");
+        }
+        Status::UpdateAvailable => {
+            println!("update available: {latest} (current {current}).");
+            println!("Run `eph update` to install it.");
+        }
+    }
 }
 
 fn load_eph_file(workspace: &Workspace) -> Result<EphFile> {

@@ -416,6 +416,68 @@ List the skills bundled into this `eph` binary, with the version they ship in.
 eph skills list
 ```
 
+## `eph update [--check] [--force]`
+
+Update `eph` to the latest GitHub release, replacing the running binary in place.
+It is a native updater with no dependency on `curl` or a shell: it resolves the
+latest published release, downloads the archive built for this platform, verifies
+it against the release SHA-256 `checksums.txt`, and swaps it over the running
+executable. It installs the same bits as
+[`scripts/install.sh`](../../scripts/install.sh), so a self-update and a fresh
+install converge.
+
+| Flag | Description |
+|------|-------------|
+| `--check` | Report whether an update is available without installing anything. |
+| `--force` | Reinstall the latest release even when already up to date. |
+
+```sh
+eph update
+```
+
+```
+Updating eph from v0.3.0 to v0.4.1.
+eph updated to v0.4.1.
+```
+
+Check without installing:
+
+```sh
+eph update --check
+```
+
+```
+update available: v0.4.1 (current v0.3.0).
+Run `eph update` to install it.
+```
+
+- The version baked into a **release** binary is a clean `vX.Y.Z` tag, so `eph
+  update` compares it against the latest release and reports up to date, an
+  available update, or (with `--force`) a reinstall. A **development** build
+  (installed with `cargo install --path .` or `make install`, so its version
+  carries a `git describe` suffix) has no clean release to compare against and is
+  always offered the latest published release.
+- The download is checksum-verified against the release `checksums.txt` before a
+  single byte is extracted, so a corrupted or tampered archive never reaches your
+  binary. This is the same SHA-256 guarantee the install script provides.
+- The binary is swapped in place: on Unix an atomic rename replaces it while the
+  running process keeps its open image; on Windows, where a running `.exe` cannot
+  be overwritten, the old image is moved aside and cleaned up after the process
+  exits. Either way, restart any long-running `eph dev` or watch session to pick
+  up the new version.
+- `EPH_REPO` and `EPH_BASE_URL` override the GitHub repository and download base
+  URL, matching the environment variables the install script honors (useful for a
+  mirror or an internal fork).
+- **Passive out-of-date nag.** Every other command checks, at startup, whether a
+  newer release exists and prints a one-line reminder on stderr when one does. The
+  check is disconnected from the command you ran: it reads a cached
+  latest-release lookup (so it never blocks) and refreshes that cache once a day
+  in a detached background process (so there is no network timeout to wait on and
+  a failed lookup never affects the command). It stays silent for source builds,
+  when stderr is not a terminal (scripts, pipes, CI), and when
+  `EPH_NO_UPDATE_CHECK` is set, so it never disturbs `eval "$(eph env)"` or
+  machine-readable output. Set `EPH_NO_UPDATE_CHECK=1` to turn it off entirely.
+
 ## Commands that do not exist (by design)
 
 The list above is the complete command set. One thing people look for is
