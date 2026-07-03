@@ -44,6 +44,15 @@ fn main() {
         .unwrap_or_else(fallback_version);
 
     println!("cargo:rustc-env=EPH_VERSION={version}");
+
+    // Bake the compile target triple (e.g. x86_64-unknown-linux-musl) so `eph
+    // update` can name the exact release asset this binary was built from. TARGET
+    // is always set in a build script's environment. Using the build-time triple
+    // rather than runtime OS/arch detection is what lets the updater tell the
+    // musl and gnu Linux builds apart: they share an OS and arch and differ only
+    // in target_env, which a running binary cannot otherwise observe.
+    let target = std::env::var("TARGET").unwrap_or_default();
+    println!("cargo:rustc-env=EPH_TARGET={target}");
 }
 
 /// Use `EPH_VERSION` verbatim when CI (or a developer) sets it to a non-empty

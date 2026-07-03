@@ -12,8 +12,9 @@ fit together. For where each decision lives in the code, see
   dispatches each subcommand to a small `cmd_*` glue function. Nothing here is
   public API.
 - `src/lib.rs` - the library crate (`eph`) that holds all reusable logic, split
-  into modules: `parser`, `workspace`, `service`, `env`, `skills`, and the
-  crate-internal `proc` (the cross-platform shell + PID-control layer).
+  into modules: `parser`, `workspace`, `service`, `env`, `skills`, `update` (the
+  `eph update` self-updater that pulls, verifies, and swaps in a GitHub release),
+  and the crate-internal `proc` (the cross-platform shell + PID-control layer).
 - `src/skills.rs` / `skills/` - the agent skills bundled into the binary. Each
   `skills/<slug>/SKILL.md` is embedded with `include_str!`; `eph skills install`
   writes it into a consuming repo's `.claude/skills/` and `.agents/skills/`, `eph
@@ -31,7 +32,10 @@ External dependencies of note: `clap` (CLI), `bollard` (async Docker API),
 (workspace IDs), `dirs` (platform data directory), `shell-words` (command
 parsing), `sysinfo` (process-table liveness and the Windows descendant-tree
 teardown walk), `libc` (Unix-only: signaling a `run=` shell's process group via
-`killpg`), and `tracing` (logging to stderr).
+`killpg`), and `tracing` (logging to stderr). `eph update` adds `ureq` (rustls
+HTTPS, no system TLS), `flate2`/`tar` (pure-Rust archive extraction),
+`self-replace` (the platform-correct in-place binary swap), and `semver` (version
+comparison).
 
 ## Core concepts
 
@@ -236,6 +240,7 @@ eph run <cmd>...                # run a command with the resolved environment
 eph check                       # validate the .eph file
 eph info                        # workspace metadata
 eph skills <install|check|list> # manage the bundled agent skills
+eph update [--check] [--force]  # replace the running binary with the latest release
 ```
 
 `eph env` writes shell-ready output to stdout while all logs go to stderr, so it

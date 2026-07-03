@@ -26,6 +26,10 @@ dirs = "6"
 # plain `C:\...` path whenever one exists (the common case), keeping the verbatim
 # prefix only for paths that genuinely require it. On Unix it is std::fs::canonicalize.
 dunce = "1"
+# `eph update` unpacks the release `.tar.gz`. flate2's default `miniz_oxide`
+# backend is pure Rust (no zlib/C), so the updater adds no system dependency and
+# keeps every cross target building as cleanly as the rest of eph does.
+flate2 = "1"
 futures-util = "0.3"
 # `eph dev --watch` compiles the user's globs into a matcher and watches the
 # workspace tree for changes: globset for gitignore-style glob matching, notify
@@ -34,6 +38,16 @@ globset = "0.4"
 hex = "0.4"
 indexmap = { version = "2", features = ["serde"] }
 notify = "8"
+# `eph update` swaps the running binary for a freshly downloaded release. A live
+# executable cannot simply be overwritten on Windows; self-replace encapsulates
+# the platform split (an atomic rename on Unix, the move-aside-and-clean-up dance
+# on Windows) so the updater does not hand-roll it.
+self-replace = "1"
+# Compare the running version against the latest release tag in `eph update`.
+# eph tags are `vX.Y.Z`; dev builds carry a `git describe` suffix that is not a
+# clean release, so the updater parses with semver and treats anything else as a
+# development build to reinstall.
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
@@ -48,9 +62,22 @@ socket2 = "0.6"
 # `kill` (Windows has none). Only the process-inspection surface is needed, so
 # the default features (disks, network, components, users) are turned off.
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+# `eph update` stages the downloaded binary in a temp file before self-replace
+# swaps it over the running executable, and unit tests build throwaway archives.
+tempfile = "3"
+# `eph update` unpacks the `eph` binary out of the release tarball's
+# `eph-<target>/` directory. Pure Rust, so it adds no system dependency.
+tar = "0.4"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# HTTPS client for `eph update`: fetch the GitHub release metadata, archive, and
+# checksums. Its defaults (rustls + ring + webpki/Mozilla roots) are all
+# statically linked and vendor their own trust store, so the updater needs no
+# system OpenSSL and no system certificate store: every cross target keeps
+# building with no system dependencies, and a musl/scratch binary can still
+# verify GitHub's certificate.
+ureq = "3"
 
 # Unix-only: tearing down a `run=` service signals the shell's whole process
 # group (`killpg`), which sysinfo cannot express. libc is already in the tree
@@ -61,7 +88,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
 
 [dev-dependencies]
-tempfile = "3"
 # Heavyweight stress tests (tests/stress.rs) open a real SQL connection to the
 # postgres they start, over its mapped host port. redis (RESP) and minio (HTTP)
 # are spoken over raw sockets and need no client crate; postgres's wire protocol

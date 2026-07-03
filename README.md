@@ -37,6 +37,14 @@ download a `tar.gz` directly from the
 are published for macOS (x86_64, arm64), Linux glibc and musl (x86_64, arm64),
 and Windows (x86_64).
 
+Once installed, keep it current with the built-in updater, which downloads the
+latest release, verifies its SHA-256 checksum, and swaps the binary in place:
+
+```sh
+eph update           # install the latest release
+eph update --check   # just report whether one is available
+```
+
 Or build from a source checkout:
 
 ```sh
