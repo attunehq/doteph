@@ -1,5 +1,13 @@
-# Normalize line endings: store LF in the repo, regardless of contributor OS.
+# Store and check out every text file with LF on all platforms, so a checkout is
+# byte-for-byte identical no matter the contributor's OS. `text=auto` still lets
+# git detect binary files and leave them untouched. Uniform line endings are what
+# let content-exact checks pass everywhere: `eph skills check` compares the tracked
+# skill copies under .claude/ and .agents/ against the LF source embedded in the
+# binary, and cargo fmt expects LF.
 * text=auto eol=lf
 
-# Binary / generated files git should not touch.
-Cargo.lock text eol=lf
+# LF pins for files where CRLF is not cosmetic but a bug: POSIX shell scripts and
+# the git pre-commit hook fail to run on Unix with CRLF line endings. Keep them LF
+# even if the blanket rule above is ever relaxed to native checkout.
+*.sh        text eol=lf
+.githooks/* text eol=lf

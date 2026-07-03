@@ -268,6 +268,26 @@ app with eph's own stdin, stdout, and stderr wired through to it, runs
 default, or `eph clean` with `--clean` (each running `pre-stop` then
 `post-stop`).
 
+**Running `eph dev` yourself? Launch it in the background.** `eph dev` foregrounds
+the app and does not return until the app exits, so running it as an ordinary
+(blocking) command hangs you until the tool call times out. When you invoke it
+directly (not through the preview server, which already backgrounds it), start it
+detached, then poll for readiness and keep working in the same shell:
+
+```sh
+# Claude Code: set run_in_background: true on the Bash call that starts it.
+# Any shell: background it yourself and capture its output to a log.
+eph dev > eph-dev.log 2>&1 &
+until eph status | grep -q running; do sleep 1; done   # or curl the app's port
+# ... now run tests / curl the app against the live stack ...
+```
+
+Stop it by ending that background process: a normal stop signal lets `eph dev`
+tear the stack down, while a hard kill leaves the services up (recover them with
+`eph down`). The same rule applies to any eph command that stays in the
+foreground, most notably `eph logs -f`. Commands that return on their own
+(`eph up`, `eph env`, `eph check`, `eph status`) never need backgrounding.
+
 ```jsonc
 // .claude/launch.json -- point the preview server at eph dev
 {
@@ -316,9 +336,17 @@ and interleaved (compose-style), each line prefixed by a color-coded `[name]`
 tag; a single `eph logs <service>` is untagged and pipe-friendly. Logs show even
 for a stopped service, so a `run=` service that died on startup still leaves a
 trace -- check `eph logs <service>` when a service is missing from `eph status`.
+The `-f` (follow) forms block until interrupted, so an agent must run them in the
+background (Claude Code: `run_in_background: true`); the non-follow forms print and
+return, so they run as normal commands.
 
 ## Behaviors that matter
 
+- **Foreground commands must be backgrounded by an agent.** `eph dev` (and
+  `eph logs -f`) stay in the foreground and never return on their own, so launch
+  them detached (Claude Code: `run_in_background: true`; any shell: append `&`) or
+  they hang your tool call until it times out. `eph up`, `eph env`, `eph check`,
+  and `eph status` return on their own, so they run as normal blocking commands.
 - **Ports are random and change per create.** Never hardcode a host port; always
   go through `eph env`.
 - **Idempotent up.** A running service is reused and a stopped one restarted, but
