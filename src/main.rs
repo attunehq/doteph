@@ -236,9 +236,9 @@ enum SystemCommand {
         #[arg(long)]
         dry_run: bool,
 
-        /// Also prune state directories written before eph recorded workspace paths.
+        /// Also prune state directories written by eph v0.4.2 and earlier.
         #[arg(long)]
-        include_legacy: bool,
+        compatibility_v042: bool,
     },
 }
 
@@ -314,8 +314,8 @@ async fn main() -> Result<ExitCode> {
         Commands::System { command } => match command {
             SystemCommand::Prune {
                 dry_run,
-                include_legacy,
-            } => cmd_system_prune(dry_run, include_legacy)
+                compatibility_v042,
+            } => cmd_system_prune(dry_run, compatibility_v042)
                 .await
                 .map(|()| ExitCode::SUCCESS),
         },
@@ -490,10 +490,10 @@ async fn cmd_clean(skip_hooks: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_system_prune(dry_run: bool, include_legacy: bool) -> Result<()> {
+async fn cmd_system_prune(dry_run: bool, compatibility_v042: bool) -> Result<()> {
     let report = eph::prune(PruneOptions {
         dry_run,
-        include_legacy,
+        compatibility_v042,
     })
     .await?;
     print_prune_report(&report);
@@ -516,7 +516,7 @@ fn print_prune_report(report: &PruneReport) {
                 .workspace_path
                 .as_ref()
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<legacy metadata unavailable>".to_string());
+                .unwrap_or_else(|| "<workspace metadata unavailable>".to_string());
             println!("  {} ({}) - {}", workspace.short_id, workspace.reason, path);
             println!(
                 "    containers: {}, volumes: {}, networks: {}, images: {}, run processes: {}, state dirs: {}",

@@ -107,7 +107,7 @@ unresolved reference stays visible rather than silently becoming empty. So run
 When `eph` starts services, it records what it started - container IDs, the
 assigned ports, and any process PIDs - in a small `state.json` file. It also
 writes `workspace.json` beside it, with the canonical workspace path and short
-ID used by [`eph system prune`](command-reference.md#eph-system-prune---dry-run---include-legacy).
+ID used by [`eph system prune`](command-reference.md#eph-system-prune---dry-run---compatibility-v042).
 
 | Platform | Location |
 |----------|----------|

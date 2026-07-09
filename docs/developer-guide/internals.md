@@ -184,8 +184,9 @@ a separate `processes` map.
 `src/prune.rs` scans `<dirs::data_local_dir()>/eph/*` rather than resolving the
 current workspace. Metadata-backed state is pruned only when the recorded
 workspace path is missing, is empty, or is no longer a directory. Legacy state
-has no path to check, so it is skipped unless the CLI passes `--include-legacy`.
-Even then, the state directory name must look like an 8-hex workspace short ID.
+has no path to check, so it is skipped unless the CLI passes
+`--compatibility-v042`. Even then, the state directory name must look like an
+8-hex workspace short ID.
 
 System prune removes Docker resources by namespace prefix (`eph-<short_id>-`) so
 it does not need the original `.eph` file or compose file. It removes containers

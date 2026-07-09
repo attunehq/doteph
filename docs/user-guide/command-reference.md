@@ -131,7 +131,7 @@ Workspace cleaned:
 > broken `pre-stop` or `post-stop` hook is wedging `clean`, pass `--skip-hooks`
 > to reset anyway.
 
-## `eph system prune [--dry-run] [--include-legacy]`
+## `eph system prune [--dry-run] [--compatibility-v042]`
 
 Cross-workspace prune for state left behind after worktrees are deleted. It
 scans the eph state root, reads each workspace's recorded path, and removes
@@ -140,12 +140,12 @@ resources for workspaces whose path is gone or now an empty directory.
 | Flag | Description |
 |------|-------------|
 | `--dry-run` | Print what would be removed without deleting Docker resources, processes, or state. |
-| `--include-legacy` | Also prune state directories written by older eph versions that did not record the workspace path. |
+| `--compatibility-v042` | Also prune state directories written by eph v0.4.2 and earlier, before workspace paths were recorded. |
 
 ```sh
 eph system prune
 eph system prune --dry-run
-eph system prune --include-legacy
+eph system prune --compatibility-v042
 ```
 
 ```text
@@ -174,10 +174,11 @@ skips it and prints a warning. If a `run=` command deliberately detaches
 grandchild processes outside the shell tree eph launched, system prune cannot
 find those after the recorded shell tree is gone.
 
-By default, legacy state directories are skipped because older state does not
-record the workspace path. `--include-legacy` prunes them by `short_id` namespace
-only; directories whose names are not 8 hex digits are still skipped. Use
-`--dry-run --include-legacy` first if you have old state on disk.
+By default, v0.4.2-and-earlier state directories are skipped because older state
+does not record the workspace path. `--compatibility-v042` prunes them by
+`short_id` namespace only; directories whose names are not 8 hex digits are still
+skipped. Use `--dry-run --compatibility-v042` first if you have old state on
+disk.
 
 ## `eph dev [SERVICE] [--clean] [--watch GLOB]...`
 

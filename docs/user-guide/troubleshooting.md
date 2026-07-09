@@ -143,7 +143,7 @@ If the workspace itself was deleted, run `eph system prune` from anywhere. It
 scans all eph state directories and removes resources for recorded workspace
 paths that are missing or now empty folders. Use `eph system prune --dry-run`
 first to see the plan. Older state without workspace metadata is skipped unless
-you pass `--include-legacy`.
+you pass `--compatibility-v042`.
 
 For `run=` services, system prune stops only a recorded PID whose live process
 still matches the identity eph captured when it launched the service. If the

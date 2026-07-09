@@ -24,8 +24,8 @@ use tokio::time::sleep;
 pub struct PruneOptions {
     /// Print what would be removed without deleting Docker resources or state.
     pub dry_run: bool,
-    /// Prune state directories that predate workspace metadata.
-    pub include_legacy: bool,
+    /// Prune state directories written by eph v0.4.2 and earlier.
+    pub compatibility_v042: bool,
 }
 
 /// The reason a metadata-backed workspace is considered stale.
@@ -37,8 +37,8 @@ pub enum StaleReason {
     EmptyDirectory,
     /// The recorded workspace path exists but is no longer a directory.
     NotDirectory,
-    /// The state directory has no workspace metadata.
-    LegacyState,
+    /// The state directory was written before eph recorded workspace metadata.
+    CompatibilityV042State,
 }
 
 impl StaleReason {
@@ -47,7 +47,9 @@ impl StaleReason {
             StaleReason::Missing => "missing workspace",
             StaleReason::EmptyDirectory => "empty workspace directory",
             StaleReason::NotDirectory => "workspace path is not a directory",
-            StaleReason::LegacyState => "legacy state without workspace metadata",
+            StaleReason::CompatibilityV042State => {
+                "v0.4.2-and-earlier state without workspace metadata"
+            }
         }
     }
 }
@@ -188,13 +190,13 @@ async fn inspect_state_dir(
     let metadata_path = state_dir.join(WORKSPACE_METADATA_FILE);
 
     if !metadata_path.exists() {
-        if options.include_legacy {
+        if options.compatibility_v042 {
             let pruned = prune_workspace(
                 docker,
                 state_dir,
                 short_id,
                 None,
-                StaleReason::LegacyState,
+                StaleReason::CompatibilityV042State,
                 options.dry_run,
                 report,
             )
@@ -205,8 +207,9 @@ async fn inspect_state_dir(
             report.skipped.push(SkippedWorkspace {
                 short_id,
                 workspace_path: None,
-                reason: "legacy state has no workspace metadata; pass --include-legacy to prune it"
-                    .to_string(),
+                reason:
+                    "v0.4.2-and-earlier state has no workspace metadata; pass --compatibility-v042 to prune it"
+                        .to_string(),
             });
         }
         return Ok(());
