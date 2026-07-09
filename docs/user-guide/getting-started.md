@@ -1,21 +1,41 @@
+---
+title: "Getting Started"
+summary: "Install eph, write your first .eph file, and run the core loop in five minutes."
+order: 1
+---
+
 # Getting Started
 
-This page takes you from nothing to a running Postgres in about five minutes.
+This page takes you from nothing to a running, health-checked Postgres with its
+connection string loaded in your shell. Budget about five minutes.
 
 ## Prerequisites
 
 - **Docker**, installed and running. `eph` talks to your local Docker daemon to
-  start containers. Check it with `docker ps`.
-- **A shell** for the non-container features (`run=` services, the
-  `pre-start`/`post-start`/`pre-stop`/`post-stop` hooks, and shell health checks). eph uses `sh -c` on
-  Linux and macOS and `cmd /C` on Windows, so these run natively everywhere; no
-  external `kill` is needed. A command string written for `sh` may need a
-  `cmd`-compatible form on Windows (or run eph inside **WSL** to keep using
-  POSIX commands). See [Troubleshooting](troubleshooting.md#windows).
+  start containers. Confirm with `docker ps`.
+- **A shell.** The non-container features (`run=` services, lifecycle hooks,
+  and shell health checks) run through the platform shell: `sh -c` on Linux and
+  macOS, `cmd /C` on Windows. Everything works natively on all three platforms;
+  the one catch is that a command string written for `sh` (pipes, `$VAR`,
+  POSIX tools) may need a `cmd`-compatible form on Windows, or you can run
+  `eph` inside WSL. See [Troubleshooting](troubleshooting.md#windows).
 
 ## Install
 
-From a checkout of the source:
+Install the latest release binary. The script verifies a SHA-256 checksum
+before installing:
+
+```sh
+# Linux / macOS
+curl -sSfL https://raw.githubusercontent.com/attunehq/doteph/main/scripts/install.sh | bash
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/attunehq/doteph/main/scripts/install.ps1 | iex
+```
+
+Or build from a source checkout:
 
 ```sh
 cargo install --path .
@@ -23,11 +43,16 @@ cargo install --path .
 make install
 ```
 
-This puts an `eph` binary on your `PATH`. Confirm it:
+Confirm the binary is on your `PATH`:
 
 ```sh
 eph --version
 ```
+
+Keep it current later with the built-in updater: `eph update` installs the
+latest release (checksum-verified, swapped in place), and `eph update --check`
+just reports whether one exists. Details in the
+[Command Reference](command-reference.md#eph-update---check---force).
 
 ## Write your first `.eph` file
 
@@ -45,16 +70,16 @@ healthcheck=pg_isready -U dev
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 ```
 
-What each part does:
+Reading it line by line:
 
 - `[postgres]` declares a service named `postgres`.
-- `image=` says to run the official `postgres:16-alpine` Docker image.
-- `port=5432` exposes the container's port 5432. `eph` maps it to a **random
-  free port on your machine** so it never collides with anything else.
-- `env.POSTGRES_*` are environment variables passed **into the container** (here
-  they configure the Postgres superuser and database).
-- `healthcheck=` is a command `eph` runs until it succeeds, so `eph up` only
-  returns once Postgres is actually ready to accept connections.
+- `image=` runs the official `postgres:16-alpine` Docker image.
+- `port=5432` publishes the container's port 5432 on a **random free port on
+  your machine**, so it never collides with anything else.
+- `env.POSTGRES_*` are environment variables passed **into the container**;
+  here they configure the Postgres superuser and database.
+- `healthcheck=` is a command `eph` runs repeatedly until it succeeds, so
+  `eph up` only returns once Postgres actually accepts connections.
 - `DATABASE_URL=...` is a top-level environment variable for **your shell**.
   `${postgres.port}` is replaced with the real assigned host port when you run
   `eph env`.
@@ -64,14 +89,14 @@ What each part does:
 
 ## Validate it
 
-Before starting anything, check the file parses:
+Before starting anything, check that the file parses:
 
 ```sh
 eph check
 ```
 
 This reports the environment variables and services it found, or a parse error
-with a line number.
+with a line number. It never touches Docker, so it is always safe to run.
 
 ## Start your services
 
@@ -105,11 +130,12 @@ Running services:
 
 ## Load the connection details into your shell
 
-`eph env` prints shell-ready variable assignments with the real ports filled in:
+`eph env` prints shell-ready variable assignments with the real ports filled
+in:
 
 ```sh
-eph env
-# export DATABASE_URL="postgres://dev:dev@localhost:54321/myapp"
+$ eph env
+export DATABASE_URL="postgres://dev:dev@localhost:54321/myapp"
 ```
 
 Load them into your current shell:
@@ -119,7 +145,8 @@ eval "$(eph env)"              # bash / zsh / sh
 ```
 
 Now `$DATABASE_URL` points at your running Postgres, and your app can connect.
-(fish and JSON formats are covered in [Shell Integration](shell-integration.md).)
+fish and JSON formats are covered in
+[Shell Integration](shell-integration.md).
 
 ## Stop your services
 
@@ -127,15 +154,15 @@ Now `$DATABASE_URL` points at your running Postgres, and your app can connect.
 eph down
 ```
 
-This stops the containers but **keeps them and their data**, so the next `eph
-up` is fast. To also remove the containers:
+This stops the container but **keeps it and its data**, so the next `eph up`
+is fast. To also remove the container:
 
 ```sh
 eph down --rm
 ```
 
-To wipe everything for this workspace - containers, named volumes (their data),
-and saved state:
+To wipe everything for this workspace (containers, named volumes and their
+data, and saved state):
 
 ```sh
 eph clean
@@ -155,5 +182,5 @@ eph down               # stop when you are done
 ## Next
 
 You have the mechanics. Now read [Core Concepts](concepts.md) to understand
-*why* it works the way it does - workspaces, isolation, ports, and the
-lifecycle - which makes everything else fall into place.
+*why* it works this way (workspaces, isolation, ports, and the lifecycle),
+which makes everything else in the guide fall into place.
