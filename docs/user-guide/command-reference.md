@@ -1,7 +1,8 @@
 # Command Reference
 
-Every `eph` command, its flags, and what it prints. All commands operate on the
+Every `eph` command, its flags, and what it prints. Most commands operate on the
 workspace found by searching up from the current directory for a `.eph` file.
+`eph system prune` is global: it scans eph's state root for deleted workspaces.
 
 ```
 eph [--verbose] <command> [args]
@@ -129,6 +130,54 @@ Workspace cleaned:
 > it and `post-stop` hooks after, and a failing hook aborts the reset. If a
 > broken `pre-stop` or `post-stop` hook is wedging `clean`, pass `--skip-hooks`
 > to reset anyway.
+
+## `eph system prune [--dry-run] [--include-legacy]`
+
+Cross-workspace prune for state left behind after worktrees are deleted. It
+scans the eph state root, reads each workspace's recorded path, and removes
+resources for workspaces whose path is gone or now an empty directory.
+
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Print what would be removed without deleting Docker resources, processes, or state. |
+| `--include-legacy` | Also prune state directories written by older eph versions that did not record the workspace path. |
+
+```sh
+eph system prune
+eph system prune --dry-run
+eph system prune --include-legacy
+```
+
+```text
+System prune complete:
+  a1b2c3d4 (missing workspace) - C:\Users\me\.codex\worktrees\1234\app
+    containers: 2, volumes: 1, networks: 1, images: 1, run processes: 0, state dirs: 1
+
+Totals:
+  Containers: 2
+  Volumes: 1
+  Networks: 1
+  Images: 1
+  Verified run= processes: 0
+  State directories: 1
+```
+
+System prune removes Docker resources by eph's workspace namespace
+(`eph-<short_id>-...`), so it can remove direct containers, built images, named
+volumes, Compose containers, and Compose networks even when the original `.eph`
+or compose file is gone. It deletes the workspace state directory last.
+
+For `run=` services, system prune kills only PIDs whose current process identity
+matches the identity eph recorded when it launched the service. Legacy `run=`
+state has no identity, and a mismatched PID may be a reused PID, so system prune
+skips it and prints a warning. If a `run=` command deliberately detaches
+grandchild processes outside the shell tree eph launched, system prune cannot
+find those after the recorded shell tree is gone.
+
+By default, legacy state directories are skipped because older state does not
+record the workspace path. `--include-legacy` prunes them by `short_id` namespace
+only; directories whose names are not 8 hex digits are still skipped. Use
+`--dry-run --include-legacy` first if you have old state on disk.
 
 ## `eph dev [SERVICE] [--clean] [--watch GLOB]...`
 

@@ -195,10 +195,15 @@ pub struct CleanSummary {
 pub(crate) enum Backend {
     /// A Docker container (`image=` / `dockerfile=`), by container id.
     Container { id: String },
-    /// A `run=` shell command, by process id. Non-zero because a real PID never
-    /// is, and PID 0 is special on Unix (signaling it targets the caller's own
-    /// process group), so the type forbids it outright.
-    Process { pid: NonZeroU32 },
+    /// A `run=` shell command, by process id and, for new state, process
+    /// identity. Non-zero because a real PID never is, and PID 0 is special on
+    /// Unix (signaling it targets the caller's own process group), so the type
+    /// forbids it outright.
+    Process {
+        pid: NonZeroU32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        identity: Option<proc::ProcessIdentity>,
+    },
     /// A docker-compose project (`compose=`), by project name.
     Compose { project: String },
 }
@@ -220,7 +225,10 @@ impl Backend {
             let pid: NonZeroU32 = pid
                 .parse()
                 .with_context(|| format!("invalid legacy process id in state: {id:?}"))?;
-            Ok(Backend::Process { pid })
+            Ok(Backend::Process {
+                pid,
+                identity: None,
+            })
         } else {
             Ok(Backend::Container { id: id.to_string() })
         }
@@ -466,6 +474,17 @@ fn allocate_ports(
 /// service is a managed app whose process eph may re-launch on a fresh port.
 fn has_auto_port(declared: &[PortMapping]) -> bool {
     declared.iter().any(|p| p.auto)
+}
+
+fn process_backend(name: &str, pid: NonZeroU32) -> Backend {
+    let identity = proc::identity(pid);
+    if identity.is_none() {
+        warn!(
+            "could not record process identity for run= service {}; `eph system prune` will skip PID {}",
+            name, pid
+        );
+    }
+    Backend::Process { pid, identity }
 }
 
 /// Split a `command=` override into an argv vector, or `None` when the service
@@ -1407,6 +1426,7 @@ impl ServiceManager {
     /// persisted state file exists but cannot be read or parsed.
     pub async fn new(workspace: Workspace) -> Result<Self> {
         let docker = DockerClient::connect().await?;
+        workspace.save_metadata().await?;
         let state = ServiceState::load(&workspace).await?;
         Ok(ServiceManager {
             workspace,
@@ -1680,7 +1700,7 @@ impl ServiceManager {
         // Probe the tracked PID the same way status() does.
         if matches!(service.source, ServiceSource::Command(_))
             && let Some(entry) = self.state.services.get(name)
-            && let Backend::Process { pid } = &entry.backend
+            && let Backend::Process { pid, .. } = &entry.backend
             && proc::is_alive(*pid)
         {
             info!("Service {} already running (PID {})", name, pid);
@@ -1912,6 +1932,7 @@ impl ServiceManager {
                 .map(|hc| resolve_against(hc, &running));
 
             let (mut child, pid) = self.spawn_command(name, cmd, &env, false)?;
+            let backend = process_backend(name, pid);
             info!(
                 "Started {} with PID {} (attempt {}/{})",
                 name, pid, attempt, max_attempts
@@ -1922,7 +1943,7 @@ impl ServiceManager {
             self.state.services.insert(
                 name.to_string(),
                 ServiceStateEntry {
-                    backend: Backend::Process { pid },
+                    backend: backend.clone(),
                     ports: ports.clone(),
                 },
             );
@@ -1951,7 +1972,7 @@ impl ServiceManager {
                             name: name.to_string(),
                             ports,
                         },
-                        Backend::Process { pid },
+                        backend,
                     ));
                 }
                 ReadyOutcome::PortConflict if attempt < max_attempts => {
@@ -2387,7 +2408,7 @@ impl ServiceManager {
             ServiceSource::Command(_) => {
                 // Kill the process, reading its PID from the recorded backend.
                 if let Some(ServiceStateEntry {
-                    backend: Backend::Process { pid },
+                    backend: Backend::Process { pid, .. },
                     ..
                 }) = self.state.services.get(name)
                 {
@@ -2595,6 +2616,7 @@ impl ServiceManager {
             .map(|hc| resolve_against(hc, &running));
 
         let (mut child, pid) = self.spawn_command(name, cmd, &env, true)?;
+        let backend = process_backend(name, pid);
         info!("Started {} (foreground) with PID {}", name, pid);
 
         // Record before waiting so `eph status` and any teardown see the process
@@ -2602,7 +2624,7 @@ impl ServiceManager {
         self.state.services.insert(
             name.to_string(),
             ServiceStateEntry {
-                backend: Backend::Process { pid },
+                backend,
                 ports: ports.clone(),
             },
         );
@@ -2667,7 +2689,7 @@ impl ServiceManager {
                 }
                 // run= services are tracked by PID; probe it the same way
                 // `eph up`'s dedup check does.
-                Backend::Process { pid } => proc::is_alive(*pid),
+                Backend::Process { pid, .. } => proc::is_alive(*pid),
                 Backend::Container { .. } => {
                     let container_name = self.workspace.container_name(name);
                     self.docker
@@ -3619,7 +3641,10 @@ mod tests {
                 r#"{"container":{"id":"abc123"}}"#,
             ),
             (
-                Backend::Process { pid: pid(4321) },
+                Backend::Process {
+                    pid: pid(4321),
+                    identity: None,
+                },
                 r#"{"process":{"pid":4321}}"#,
             ),
             (
@@ -3650,7 +3675,10 @@ mod tests {
     #[test]
     fn state_entry_round_trips() {
         let entry = ServiceStateEntry {
-            backend: Backend::Process { pid: pid(1234) },
+            backend: Backend::Process {
+                pid: pid(1234),
+                identity: None,
+            },
             ports: HashMap::from([("default".to_string(), 5173)]),
         };
         let json = serde_json::to_string(&entry).unwrap();
@@ -3686,7 +3714,10 @@ mod tests {
         );
         assert_eq!(
             state.services["web"].backend,
-            Backend::Process { pid: pid(4321) }
+            Backend::Process {
+                pid: pid(4321),
+                identity: None
+            }
         );
         assert_eq!(
             state.services["stack"].backend,
