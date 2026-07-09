@@ -68,7 +68,9 @@ port, so `eph` reports the declared port as-is rather than remapping it.
 
 Running-service information (container IDs, assigned ports, process PIDs) is
 persisted to the platform local-data directory under
-`eph/<short_id>/state.json`:
+`eph/<short_id>/state.json`. Workspace metadata lives beside it in
+`eph/<short_id>/workspace.json`; system prune uses that file to decide whether the
+recorded workspace path still exists.
 
 - Linux: `~/.local/share/eph/<short_id>/state.json`
 - macOS: `~/Library/Application Support/eph/<short_id>/state.json`
@@ -76,7 +78,12 @@ persisted to the platform local-data directory under
 
 State lets `eph status` and `eph env` work without re-deriving everything, lets
 assigned ports survive terminal restarts, and records which resources belong to a
-workspace. `eph clean` deletes this directory.
+workspace. `eph clean` deletes this directory for the current workspace. `eph
+system prune` scans every state directory and removes Docker resources by the
+`eph-<short_id>-` namespace when the recorded workspace path is missing or empty.
+For `run=` services it signals only PIDs whose current process identity matches
+the identity saved at launch; legacy process entries are warned about and left
+alone.
 
 ## File format
 
@@ -234,6 +241,7 @@ Commands follow a simple, predictable shape:
 eph up [services...]            # start
 eph down [--rm] [services...]   # stop (optionally remove containers)
 eph clean                       # full reset
+eph system prune                # remove resources for deleted/empty workspaces
 eph status                      # show state
 eph env [-f format]             # export resolved environment
 eph run <cmd>...                # run a command with the resolved environment

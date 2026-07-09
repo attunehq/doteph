@@ -15,7 +15,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eph::parser::{self, EphFile, ServiceSource};
-use eph::{LogOptions, RunningService, ServiceManager, Workspace, skills};
+use eph::{
+    LogOptions, PruneOptions, PruneReport, RunningService, ServiceManager, Workspace, skills,
+};
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -83,6 +85,13 @@ enum Commands {
         /// Tear everything down without running pre-stop hooks
         #[arg(long = "skip-hooks")]
         skip_hooks: bool,
+    },
+
+    /// Manage eph's global state and resources.
+    System {
+        /// The system subcommand to run.
+        #[command(subcommand)]
+        command: SystemCommand,
     },
 
     /// Run the dev stack in the foreground for a Claude Desktop preview server.
@@ -218,6 +227,21 @@ enum Commands {
     UpdateCheck,
 }
 
+/// System subcommands that operate outside the current workspace.
+#[derive(Subcommand)]
+enum SystemCommand {
+    /// Remove resources for deleted or empty workspaces.
+    Prune {
+        /// Print what would be removed without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Also prune state directories written by eph v0.4.2 and earlier.
+        #[arg(long)]
+        compatibility_v042: bool,
+    },
+}
+
 /// Skills subcommands. They install the skills bundled into this binary into a
 /// repository (so its agents discover how to drive `eph up` / `eph env`) and
 /// check that the checked-in copies are still current.
@@ -287,6 +311,14 @@ async fn main() -> Result<ExitCode> {
             .await
             .map(|()| ExitCode::SUCCESS),
         Commands::Clean { skip_hooks } => cmd_clean(skip_hooks).await.map(|()| ExitCode::SUCCESS),
+        Commands::System { command } => match command {
+            SystemCommand::Prune {
+                dry_run,
+                compatibility_v042,
+            } => cmd_system_prune(dry_run, compatibility_v042)
+                .await
+                .map(|()| ExitCode::SUCCESS),
+        },
         Commands::Dev {
             service,
             clean,
@@ -456,6 +488,77 @@ async fn cmd_clean(skip_hooks: bool) -> Result<()> {
     );
 
     Ok(())
+}
+
+async fn cmd_system_prune(dry_run: bool, compatibility_v042: bool) -> Result<()> {
+    let report = eph::prune(PruneOptions {
+        dry_run,
+        compatibility_v042,
+    })
+    .await?;
+    print_prune_report(&report);
+    Ok(())
+}
+
+fn print_prune_report(report: &PruneReport) {
+    let title = if report.dry_run {
+        "System prune dry run:"
+    } else {
+        "System prune complete:"
+    };
+    println!("{title}");
+
+    if report.pruned.is_empty() {
+        println!("  No stale workspaces found");
+    } else {
+        for workspace in &report.pruned {
+            let path = workspace
+                .workspace_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<workspace metadata unavailable>".to_string());
+            println!("  {} ({}) - {}", workspace.short_id, workspace.reason, path);
+            println!(
+                "    containers: {}, volumes: {}, networks: {}, images: {}, run processes: {}, state dirs: {}",
+                workspace.counts.containers,
+                workspace.counts.volumes,
+                workspace.counts.networks,
+                workspace.counts.images,
+                workspace.counts.processes,
+                workspace.counts.state_dirs
+            );
+        }
+    }
+
+    println!();
+    println!("Totals:");
+    println!("  Containers: {}", report.totals.containers);
+    println!("  Volumes: {}", report.totals.volumes);
+    println!("  Networks: {}", report.totals.networks);
+    println!("  Images: {}", report.totals.images);
+    println!("  Verified run= processes: {}", report.totals.processes);
+    println!("  State directories: {}", report.totals.state_dirs);
+
+    if !report.skipped.is_empty() {
+        println!();
+        println!("Skipped:");
+        for skipped in &report.skipped {
+            let path = skipped
+                .workspace_path
+                .as_ref()
+                .map(|p| format!(" ({})", p.display()))
+                .unwrap_or_default();
+            println!("  {}{} - {}", skipped.short_id, path, skipped.reason);
+        }
+    }
+
+    if !report.warnings.is_empty() {
+        println!();
+        println!("Warnings:");
+        for warning in &report.warnings {
+            println!("  {warning}");
+        }
+    }
 }
 
 /// Why [`cmd_dev`] stopped blocking in the foreground.

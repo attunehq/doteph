@@ -5,8 +5,47 @@
 //! don't conflict with each other.
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(crate) const WORKSPACE_METADATA_FILE: &str = "workspace.json";
+const WORKSPACE_METADATA_SCHEMA: u32 = 1;
+
+/// Cross-workspace state that lets `eph system prune` decide whether a state
+/// directory still points at a real workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct WorkspaceMetadata {
+    pub(crate) schema: u32,
+    pub(crate) workspace_id: String,
+    pub(crate) short_id: String,
+    pub(crate) workspace_path: PathBuf,
+    pub(crate) container_prefix: String,
+    pub(crate) last_seen_unix_secs: u64,
+}
+
+impl WorkspaceMetadata {
+    pub(crate) fn for_workspace(workspace: &Workspace) -> Self {
+        WorkspaceMetadata {
+            schema: WORKSPACE_METADATA_SCHEMA,
+            workspace_id: workspace.id.clone(),
+            short_id: workspace.short_id.clone(),
+            workspace_path: workspace.path.clone(),
+            container_prefix: workspace.container_prefix(),
+            last_seen_unix_secs: current_unix_secs(),
+        }
+    }
+
+    pub(crate) async fn load_from_state_dir(state_dir: &Path) -> Result<Self> {
+        let path = state_dir.join(WORKSPACE_METADATA_FILE);
+        let contents = tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("failed to read workspace metadata: {}", path.display()))?;
+        serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse workspace metadata: {}", path.display()))
+    }
+}
 
 /// A workspace: a directory containing a `.eph` file.
 ///
@@ -159,11 +198,22 @@ impl Workspace {
     /// Returns an error if the platform's local data directory cannot be
     /// determined.
     pub fn state_dir(&self) -> Result<PathBuf> {
-        let state_dir = dirs::data_local_dir()
-            .context("failed to determine local data directory")?
-            .join("eph")
-            .join(&self.short_id);
-        Ok(state_dir)
+        Ok(state_root()?.join(&self.short_id))
+    }
+
+    pub(crate) async fn save_metadata(&self) -> Result<()> {
+        let state_dir = self.state_dir()?;
+        tokio::fs::create_dir_all(&state_dir)
+            .await
+            .with_context(|| {
+                format!("failed to create state directory: {}", state_dir.display())
+            })?;
+        let path = state_dir.join(WORKSPACE_METADATA_FILE);
+        let contents = serde_json::to_string_pretty(&WorkspaceMetadata::for_workspace(self))
+            .context("failed to serialize workspace metadata")?;
+        tokio::fs::write(&path, contents)
+            .await
+            .with_context(|| format!("failed to write workspace metadata: {}", path.display()))
     }
 
     /// Get the directory holding captured `run=` service logs.
@@ -203,6 +253,18 @@ fn compute_workspace_id(path: &Path) -> String {
     hex::encode(hasher.finalize())
 }
 
+pub(crate) fn state_root() -> Result<PathBuf> {
+    Ok(dirs::data_local_dir()
+        .context("failed to determine local data directory")?
+        .join("eph"))
+}
+
+fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +282,22 @@ mod tests {
         let id1 = compute_workspace_id(Path::new("/home/user/projects/app1"));
         let id2 = compute_workspace_id(Path::new("/home/user/projects/app2"));
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn workspace_metadata_records_prune_lookup_fields() {
+        let workspace = Workspace {
+            path: PathBuf::from("/home/user/projects/app"),
+            id: "abcdef0123456789".to_string(),
+            short_id: "abcdef01".to_string(),
+        };
+
+        let metadata = WorkspaceMetadata::for_workspace(&workspace);
+
+        assert_eq!(metadata.schema, WORKSPACE_METADATA_SCHEMA);
+        assert_eq!(metadata.workspace_id, workspace.id);
+        assert_eq!(metadata.short_id, workspace.short_id);
+        assert_eq!(metadata.workspace_path, workspace.path);
+        assert_eq!(metadata.container_prefix, "eph-abcdef01");
     }
 }

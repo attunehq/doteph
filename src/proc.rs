@@ -41,8 +41,49 @@
 //! no group).
 
 use std::num::NonZeroU32;
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
 use tokio::process::Command as TokioCommand;
+
+/// Stable process facts recorded when eph starts a `run=` service.
+///
+/// A PID alone can be reused after the original process exits. Prune uses this
+/// snapshot to prove the current process table entry is still the shell eph
+/// launched before sending it a signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProcessIdentity {
+    pub(crate) start_time: u64,
+    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) exe: Option<PathBuf>,
+    pub(crate) cmd: Vec<String>,
+}
+
+impl ProcessIdentity {
+    fn from_process(process: &Process) -> Option<Self> {
+        let identity = ProcessIdentity {
+            start_time: process.start_time(),
+            cwd: process.cwd().map(PathBuf::from),
+            exe: process.exe().map(PathBuf::from),
+            cmd: process
+                .cmd()
+                .iter()
+                .map(|part| part.to_string_lossy().into_owned())
+                .collect(),
+        };
+
+        if identity.has_distinguishing_fields() {
+            Some(identity)
+        } else {
+            None
+        }
+    }
+
+    fn has_distinguishing_fields(&self) -> bool {
+        self.cwd.is_some() || self.exe.is_some() || !self.cmd.is_empty()
+    }
+}
 
 /// Build a [`TokioCommand`] that runs `cmd` through the platform shell.
 ///
@@ -100,6 +141,24 @@ fn snapshot(pid: NonZeroU32) -> (System, Pid) {
         ProcessRefreshKind::nothing(),
     );
     (system, pid)
+}
+
+/// Return the current identity for `pid`, when the platform exposes enough
+/// process metadata to distinguish the entry from a later PID reuse.
+pub(crate) fn identity(pid: NonZeroU32) -> Option<ProcessIdentity> {
+    let pid = Pid::from_u32(pid.get());
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::everything(),
+    );
+    system.process(pid).and_then(ProcessIdentity::from_process)
+}
+
+/// Whether `pid` still names the process represented by `expected`.
+pub(crate) fn identity_matches(pid: NonZeroU32, expected: &ProcessIdentity) -> bool {
+    identity(pid).as_ref() == Some(expected)
 }
 
 /// Whether a process with `pid` is present in the OS process table (a native
@@ -325,6 +384,18 @@ mod tests {
     #[tokio::test]
     async fn terminate_ends_the_process() {
         assert_kill_ends(spawn_sleeper(), terminate).await;
+    }
+
+    #[tokio::test]
+    async fn identity_matches_the_spawned_process() {
+        let mut child = spawn_sleeper();
+        let pid = NonZeroU32::new(child.id().expect("freshly spawned child has a PID")).unwrap();
+
+        let recorded = identity(pid).expect("test process should expose identity");
+        assert!(identity_matches(pid, &recorded));
+
+        force_kill(pid);
+        let _ = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
     }
 
     /// Poll the descendants of `root` until at least one appears, returning them

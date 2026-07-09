@@ -139,6 +139,19 @@ ever looks wrong, `eph clean` resets the workspace completely (removing
 containers, named volumes, and the state file), after which `eph up` rebuilds
 from scratch.
 
+If the workspace itself was deleted, run `eph system prune` from anywhere. It
+scans all eph state directories and removes resources for recorded workspace
+paths that are missing or now empty folders. Use `eph system prune --dry-run`
+first to see the plan. Older state without workspace metadata is skipped unless
+you pass `--compatibility-v042`.
+
+For `run=` services, system prune stops only a recorded PID whose live process
+still matches the identity eph captured when it launched the service. If the
+state is legacy, or if the PID now belongs to another process, system prune
+warns and leaves it alone. A command that detached grandchildren outside eph's
+shell tree can still leave processes behind after that tree exits; stop those
+manually.
+
 ## Windows
 
 `eph` runs natively on Linux, macOS, and Windows. The Docker-backed services

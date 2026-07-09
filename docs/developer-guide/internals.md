@@ -11,6 +11,7 @@ src/
   lib.rs         Library crate root; re-exports the public API.
   parser.rs      .eph -> AST, plus interpolation.
   workspace.rs   Workspace resolution, IDs, naming, paths.
+  prune.rs       Cross-workspace stale-state discovery and resource removal.
   service.rs     Docker client wrapper + ServiceManager + persisted state.
   env.rs         Rendering resolved env vars for shell eval.
 tests/
@@ -87,6 +88,8 @@ data-dir lookup.
 - Naming helpers: `container_prefix()` (`eph-<short_id>`), `container_name(svc)`,
   `volume_name(svc, vol)`, `eph_file_path()`.
 - `state_dir()` returns `<dirs::data_local_dir()>/eph/<short_id>`.
+- `save_metadata()` writes `<state_dir>/workspace.json`, which records the
+  canonical workspace path for cross-workspace pruning.
 
 ## service
 
@@ -170,10 +173,27 @@ engine.
 ServiceStateEntry>, auto_ports: ... }`, serialized as pretty JSON to
 `<state_dir>/state.json`. `ServiceStateEntry { backend, ports }`, where `backend`
 is a typed `Backend` enum: `Container { id }` for `image=` / `dockerfile=`,
-`Process { pid }` for `run=`, or `Compose { project }` for compose. It is the
-single source of truth for a `run=` service's PID. `load` migrates a legacy file
-that used a stringly-typed `container_id` (a bare id, `pid:<n>`, or
-`compose:<project>`) plus a separate `processes` map.
+`Process { pid, identity }` for `run=`, or `Compose { project }` for compose. The
+PID is the addressable handle for teardown; `identity` is used by `eph system prune`
+to avoid signaling a reused PID. `load` migrates a legacy file that used a
+stringly-typed `container_id` (a bare id, `pid:<n>`, or `compose:<project>`) plus
+a separate `processes` map.
+
+## prune
+
+`src/prune.rs` scans `<dirs::data_local_dir()>/eph/*` rather than resolving the
+current workspace. Metadata-backed state is pruned only when the recorded
+workspace path is missing, is empty, or is no longer a directory. Legacy state
+has no path to check, so it is skipped unless the CLI passes
+`--compatibility-v042`. Even then, the state directory name must look like an
+8-hex workspace short ID.
+
+System prune removes Docker resources by namespace prefix (`eph-<short_id>-`) so
+it does not need the original `.eph` file or compose file. It removes containers
+first, then volumes, networks, images, and the state directory. For `run=`
+services it reads `state.json` and terminates only a PID whose current
+`ProcessIdentity` exactly matches the saved identity; old entries without
+identity and mismatches become warnings.
 
 **`RunningService`** is the runtime handle returned to callers: `host()` (always
 `localhost`), `port()` (the `default` port, else any), `named_port(name)`. It is

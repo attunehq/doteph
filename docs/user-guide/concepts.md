@@ -105,7 +105,9 @@ unresolved reference stays visible rather than silently becoming empty. So run
 ## Persisted state
 
 When `eph` starts services, it records what it started - container IDs, the
-assigned ports, and any process PIDs - in a small `state.json` file:
+assigned ports, and any process PIDs - in a small `state.json` file. It also
+writes `workspace.json` beside it, with the canonical workspace path and short
+ID used by [`eph system prune`](command-reference.md#eph-system-prune---dry-run---compatibility-v042).
 
 | Platform | Location |
 |----------|----------|
@@ -116,7 +118,15 @@ assigned ports, and any process PIDs - in a small `state.json` file:
 State is why `eph status` and `eph env` work instantly without re-inspecting
 everything, why the assigned ports survive a terminal restart, and why `eph`
 knows which containers and volumes belong to this workspace. `eph clean` deletes
-this directory.
+this directory for the current workspace. `eph system prune` scans all state
+directories and removes resources for workspaces whose recorded path is missing
+or empty.
+
+For `run=` services, new state also stores process identity. System prune uses
+that identity before signaling a recorded PID, because PIDs can be reused.
+Legacy `run=` entries and identity mismatches are skipped with a warning. If the
+command detached grandchildren outside the shell tree eph launched, system prune
+cannot discover those later.
 
 ## The service lifecycle
 
