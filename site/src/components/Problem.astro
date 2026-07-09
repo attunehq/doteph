@@ -1,0 +1,96 @@
+---
+import SectionHeading from "./SectionHeading.astro";
+
+const points = [
+  {
+    title: "Ports collide across checkouts",
+    body: "Two clones of the same project both want Postgres on 5432. Whichever one grabbed the port first wins; the other fails to bind, or worse, talks to the wrong database.",
+  },
+  {
+    title: "Data bleeds between environments",
+    body: "One shared Postgres container means one shared database. A migration you're testing in one checkout, or a seed script gone wrong, shows up in every other checkout using the same container.",
+  },
+  {
+    title: "Containers run all the time",
+    body: "Services started by hand tend to stay started, whether or not you're using them: consuming memory and CPU, drifting from what a fresh checkout would actually need.",
+  },
+];
+---
+
+<section class="section problem">
+  <div class="container">
+    <SectionHeading title="Local services get messy fast.">
+      Working on multiple projects, or multiple checkouts of the same project,
+      surfaces the same three problems every time.
+    </SectionHeading>
+
+    <div class="problem-grid">
+      {
+        points.map((p, i) => (
+          <article class="problem-card" data-reveal style={`--reveal-delay:${i * 70}ms`}>
+            <span class="problem-num">{String(i + 1).padStart(2, "0")}</span>
+            <h3>{p.title}</h3>
+            <p>{p.body}</p>
+          </article>
+        ))
+      }
+    </div>
+
+    <p class="problem-foot" data-reveal>
+      <span class="mono">eph</span> gives every workspace its own isolated
+      services, started on demand, with host ports assigned automatically. No
+      port to agree on and no container to share; nothing runs when you
+      aren't working.
+    </p>
+  </div>
+</section>
+
+<style>
+  .problem-grid {
+    margin-top: clamp(2rem, 1rem + 3vw, 3.25rem);
+    display: grid;
+    gap: 1.25rem;
+  }
+  @media (min-width: 760px) {
+    .problem-grid {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+
+  .problem-card {
+    background: var(--paper-raised);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-3);
+    padding: clamp(1.1rem, 0.8rem + 1vw, 1.5rem);
+    box-shadow: var(--shadow-1);
+  }
+  .problem-num {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--ink-3);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-1);
+    padding: 0.15em 0.5em;
+    margin-bottom: 0.9rem;
+  }
+  .problem-card h3 {
+    font-size: var(--text-md);
+    margin-bottom: 0.6rem;
+  }
+  .problem-card p {
+    font-size: var(--text-sm);
+    color: var(--ink-2);
+  }
+
+  .problem-foot {
+    margin-top: clamp(1.75rem, 1rem + 2vw, 2.5rem);
+    padding: clamp(1.1rem, 0.8rem + 1vw, 1.5rem);
+    max-width: var(--measure);
+    border: 1px solid var(--teal-line);
+    border-radius: var(--radius-3);
+    background: linear-gradient(to bottom right, var(--teal-bg), var(--paper-raised) 55%);
+    font-size: var(--text-base);
+    color: var(--ink-2);
+  }
+</style>

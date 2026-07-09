@@ -1,0 +1,131 @@
+---
+import SectionHeading from "./SectionHeading.astro";
+import Artifact from "./Artifact.astro";
+
+// Trimmed from the repo's example.eph: enough to show a Docker-backed
+// service, a run= process service with an auto-assigned port, and
+// interpolation into a top-level environment variable.
+const ephHtml = [
+  '<span class="t-punct">[</span><span class="t-key">postgres</span><span class="t-punct">]</span>',
+  '<span class="t-key">image</span><span class="t-punct">=</span><span class="t-str">postgres:16-alpine</span>',
+  '<span class="t-key">port</span><span class="t-punct">=</span><span class="t-num">5432</span>',
+  '<span class="t-key">env.POSTGRES_USER</span><span class="t-punct">=</span><span class="t-str">dev</span>',
+  '<span class="t-key">env.POSTGRES_PASSWORD</span><span class="t-punct">=</span><span class="t-str">dev</span>',
+  '<span class="t-key">healthcheck</span><span class="t-punct">=</span><span class="t-str">pg_isready -U dev</span>',
+  "",
+  '<span class="t-punct">[</span><span class="t-key">web</span><span class="t-punct">]</span>',
+  '<span class="t-key">run</span><span class="t-punct">=</span><span class="t-str">npm run dev</span>',
+  '<span class="t-key">port</span><span class="t-punct">=</span><span class="t-str">auto</span>',
+  '<span class="t-key">env.PORT</span><span class="t-punct">=</span><span class="t-str">${web.port}</span>',
+  "",
+  '<span class="t-key">DATABASE_URL</span><span class="t-punct">=</span><span class="t-str">postgres://dev:dev@localhost:${postgres.port}/myapp</span>',
+].join("\n");
+
+const steps = [
+  {
+    cmd: "eph up",
+    body: "Starts every service (as a container, a Compose project, or a plain process) and waits until each health check passes.",
+  },
+  {
+    cmd: 'eval "$(eph env)"',
+    body: "Loads the resolved connection strings, with the real assigned ports filled in, into your shell.",
+  },
+  {
+    cmd: "eph down",
+    body: "Stops the containers. Data stays put for a fast restart; eph clean wipes it when you want a fresh start.",
+  },
+];
+---
+
+<section class="section how" id="how-it-works">
+  <div class="container">
+    <SectionHeading title="One file, three commands.">
+      Every service your project needs lives in a single <span class="mono"
+        >.eph</span
+      > file at the workspace root. The loop is the same for every project.
+    </SectionHeading>
+
+    <div class="how-body">
+      <Artifact filename=".eph" lang="ini" class="how-artifact">
+        <Fragment set:html={ephHtml} />
+      </Artifact>
+
+      <ol class="how-loop" data-reveal>
+        {
+          steps.map((s, i) => (
+            <li class="how-step">
+              <span class="how-step-num">{i + 1}</span>
+              <code class="how-step-cmd">{s.cmd}</code>
+              <p class="how-step-body">{s.body}</p>
+            </li>
+          ))
+        }
+      </ol>
+    </div>
+  </div>
+</section>
+
+<style>
+  .how-body {
+    margin-top: clamp(2rem, 1rem + 3vw, 3.25rem);
+    display: grid;
+    gap: clamp(1.5rem, 1rem + 2vw, 2.5rem);
+  }
+  @media (min-width: 900px) {
+    .how-body {
+      grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+      align-items: start;
+    }
+  }
+
+  .how-artifact :global(.artifact-body code) {
+    font-size: 0.82rem;
+    line-height: 1.75;
+  }
+
+  .how-loop {
+    list-style: none;
+    display: grid;
+    gap: 0;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-3);
+    background: var(--paper-raised);
+    box-shadow: var(--shadow-1);
+    overflow: hidden;
+  }
+  .how-step {
+    position: relative;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.25rem 0.9rem;
+    padding: 1rem 1.15rem;
+  }
+  .how-step + .how-step {
+    border-top: 1px dashed var(--line);
+  }
+  .how-step-num {
+    grid-row: 1 / 3;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.6rem;
+    height: 1.6rem;
+    border-radius: 999px;
+    border: 1px solid var(--teal-line);
+    background: var(--teal-bg);
+    color: var(--teal-ink);
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+  .how-step-cmd {
+    font-family: var(--font-mono);
+    font-size: 0.86rem;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  .how-step-body {
+    font-size: var(--text-sm);
+    color: var(--ink-2);
+  }
+</style>

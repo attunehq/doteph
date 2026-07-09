@@ -1,0 +1,319 @@
+---
+import Artifact from "./Artifact.astro";
+import { withBase } from "../lib/base";
+
+const repo = "https://github.com/attunehq/doteph";
+const unix =
+  "curl -sSfL https://raw.githubusercontent.com/attunehq/doteph/main/scripts/install.sh | bash";
+const win =
+  "irm https://raw.githubusercontent.com/attunehq/doteph/main/scripts/install.ps1 | iex";
+
+// Built as HTML strings so indentation inside the <pre> is exact.
+const mapHtml = [
+  '<span class="t-punct">~/projects/</span><span class="t-key">app</span>',
+  '  <span class="t-punct">-&gt;</span>  <span class="t-str">eph-a1b2c3d4-postgres</span>  <span class="t-num">localhost:54321</span>',
+  "",
+  '<span class="t-punct">~/projects/</span><span class="t-key">app-v2</span>',
+  '  <span class="t-punct">-&gt;</span>  <span class="t-str">eph-e5f6g7h8-postgres</span>  <span class="t-num">localhost:54322</span>',
+].join("\n");
+---
+
+<section class="hero" id="top">
+  <div class="container hero-inner">
+    <div class="hero-copy">
+      <p class="hero-kicker" data-reveal>
+        <span class="hero-kicker-mark" aria-hidden="true"></span>
+        <span class="hero-kicker-text">A small Rust CLI</span>
+      </p>
+
+      <h1 class="hero-title" data-reveal style="--reveal-delay:60ms">
+        Ephemeral services per workspace.
+      </h1>
+
+      <p class="hero-sub" data-reveal style="--reveal-delay:100ms">
+        Like <span class="mono">.env</span> files, but for services.
+      </p>
+
+      <p class="hero-lede prose" data-reveal style="--reveal-delay:140ms">
+        Describe the Postgres, Redis, or MinIO your project needs in a single
+        <span class="mono">.eph</span> file. <span class="mono">eph up</span> starts
+        them isolated per workspace, with host ports assigned automatically, so
+        two checkouts of the same project <strong
+          >run on different ports, keep separate data, and don't stay running
+          once you're done with them</strong
+        >.
+      </p>
+
+      <div class="hero-cta" data-reveal style="--reveal-delay:180ms">
+        <a href={withBase("/guide")} class="btn btn--primary">Read the guide</a>
+        <a href={repo} class="btn btn--ghost" rel="noopener">View on GitHub</a>
+      </div>
+
+      <div class="hero-install" data-reveal style="--reveal-delay:220ms">
+        <div class="hero-install-row">
+          <span class="hero-install-os">macOS &middot; Linux</span>
+          <div class="hero-install-cmd-row">
+            <code class="hero-install-cmd" id="install-unix">{unix}</code>
+            <button
+              class="copy-btn"
+              type="button"
+              data-copy="install-unix"
+              aria-label="Copy the macOS and Linux install command"
+            >
+              <svg class="copy-ic copy-ic--clip" viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
+                <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.4"></rect>
+                <path d="M3.5 10.5H3a1.5 1.5 0 0 1-1.5-1.5V3A1.5 1.5 0 0 1 3 1.5h6A1.5 1.5 0 0 1 10.5 3v.5" stroke="currentColor" stroke-width="1.4"></path>
+              </svg>
+              <svg class="copy-ic copy-ic--check" viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
+                <path d="M3 8.4l3.2 3.2L13 4.2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"></path>
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div class="hero-install-row">
+          <span class="hero-install-os">Windows</span>
+          <div class="hero-install-cmd-row">
+            <code class="hero-install-cmd" id="install-win">{win}</code>
+            <button
+              class="copy-btn"
+              type="button"
+              data-copy="install-win"
+              aria-label="Copy the Windows PowerShell install command"
+            >
+              <svg class="copy-ic copy-ic--clip" viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
+                <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.4"></rect>
+                <path d="M3.5 10.5H3a1.5 1.5 0 0 1-1.5-1.5V3A1.5 1.5 0 0 1 3 1.5h6A1.5 1.5 0 0 1 10.5 3v.5" stroke="currentColor" stroke-width="1.4"></path>
+              </svg>
+              <svg class="copy-ic copy-ic--check" viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
+                <path d="M3 8.4l3.2 3.2L13 4.2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"></path>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="hero-art" data-reveal style="--reveal-delay:160ms">
+      <Artifact filename="two checkouts, two workspaces" class="hero-map">
+        <Fragment set:html={mapHtml} />
+      </Artifact>
+
+      <div class="hero-run" aria-label="eph up output">
+        <div class="hero-run-head">
+          <code>$ eph up</code>
+        </div>
+        <pre class="hero-run-body"><code><span class="t-str">Services started:</span>
+  <span class="t-key">postgres</span> <span class="t-punct">-&gt;</span> <span class="t-num">localhost:54321</span>
+
+Run <span class="t-str">`eval "$(eph env)"`</span> to set environment variables</code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  .hero {
+    position: relative;
+    padding-block: clamp(2.5rem, 1rem + 7vw, 6rem)
+      clamp(3rem, 1rem + 6vw, 5.5rem);
+  }
+  .hero-inner {
+    display: grid;
+    gap: clamp(2.5rem, 1rem + 5vw, 4.5rem);
+    align-items: start;
+    /* minmax(0, ...) keeps the track from being stretched to a child's
+       max-width and overflowing the viewport */
+    grid-template-columns: minmax(0, 1fr);
+  }
+  @media (min-width: 960px) {
+    .hero-inner {
+      grid-template-columns: minmax(0, 0.98fr) minmax(0, 1.02fr);
+    }
+  }
+
+  .hero-kicker {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    max-width: 100%;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--ink-3);
+    letter-spacing: 0.01em;
+  }
+  .hero-kicker-mark {
+    width: 0.55rem;
+    height: 0.55rem;
+    margin-top: 0.4em;
+    border-radius: 999px;
+    background: var(--teal);
+    box-shadow: 0 0 0 3px var(--teal-bg);
+    flex: none;
+  }
+  .hero-kicker-text {
+    min-width: 0;
+  }
+
+  .hero-title {
+    margin-top: 1.1rem;
+    font-size: clamp(2.5rem, 1.4rem + 3vw, 3.7rem);
+    letter-spacing: -0.03em;
+    line-height: 1.05;
+  }
+
+  .hero-sub {
+    margin-top: 0.9rem;
+    font-size: var(--text-lg);
+    font-weight: 540;
+    color: var(--ink);
+  }
+
+  .hero-lede {
+    margin-top: 1rem;
+    font-size: var(--text-md);
+    color: var(--ink-2);
+  }
+
+  .hero-cta {
+    margin-top: 1.75rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+
+  /* ---- inline install block ---- */
+  .hero-install {
+    margin-top: 1.75rem;
+    display: grid;
+    gap: 0.6rem;
+    max-width: 34rem;
+  }
+  .hero-install-row {
+    display: grid;
+    gap: 0.35rem;
+  }
+  .hero-install-os {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--ink-3);
+  }
+  .hero-install-cmd-row {
+    display: flex;
+    align-items: stretch;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-2);
+    overflow: hidden;
+    background: var(--paper-raised);
+  }
+  .hero-install-cmd {
+    flex: 1;
+    min-width: 0;
+    padding: 0.65rem 0.8rem;
+    font-size: 0.76rem;
+    line-height: 1.5;
+    color: var(--ink);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .copy-btn {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    border-left: 1px solid var(--line);
+    background: var(--paper-2);
+    color: var(--ink-2);
+    padding-inline: 0.8rem;
+    cursor: pointer;
+    transition: background-color var(--dur-1) var(--ease-out),
+      color var(--dur-1) var(--ease-out);
+  }
+  .copy-btn:hover {
+    background: var(--teal-bg);
+    color: var(--teal-deep);
+  }
+  .copy-btn[data-copied] {
+    background: var(--teal-bg);
+    color: var(--teal-ink);
+  }
+  .copy-ic--check {
+    display: none;
+  }
+  .copy-btn[data-copied] .copy-ic--clip {
+    display: none;
+  }
+  .copy-btn[data-copied] .copy-ic--check {
+    display: block;
+  }
+
+  /* ---- artifact stack ---- */
+  .hero-art {
+    position: relative;
+    display: grid;
+    justify-items: stretch;
+  }
+  .hero-map {
+    position: relative;
+    z-index: var(--z-base);
+  }
+  .hero-map :global(.artifact-body code) {
+    font-size: 0.78rem;
+    line-height: 1.9;
+  }
+  .hero-run {
+    position: relative;
+    z-index: var(--z-raised);
+    width: min(100%, 24rem);
+    margin-top: -1.4rem;
+    margin-left: auto;
+    margin-right: clamp(-1.5rem, -2vw, 0rem);
+    background: var(--paper-raised);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-3);
+    box-shadow: var(--shadow-lift);
+    overflow: hidden;
+  }
+  @media (max-width: 520px) {
+    .hero-run {
+      /* Full width on mobile: the desktop overlap (negative margin-top,
+         right offset) would collapse into the cards butting together with
+         no breathing room, so stack them with a real gap instead. */
+      margin-top: 1rem;
+      margin-right: 0;
+      margin-left: 0;
+      width: 100%;
+    }
+  }
+  .hero-run-head {
+    padding: 0.6rem 0.85rem;
+    background: var(--ink);
+    color: var(--ink-inverse);
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+  }
+  .hero-run-head code {
+    color: var(--ink-inverse);
+  }
+  .hero-run-body {
+    padding: 0.85rem;
+    font-size: 0.78rem;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+  }
+  .hero-run-body .t-str {
+    color: var(--tok-str);
+  }
+  .hero-run-body .t-key {
+    color: var(--tok-key);
+    font-weight: 560;
+  }
+  .hero-run-body .t-num {
+    color: var(--teal-ink);
+    font-weight: 560;
+  }
+  .hero-run-body .t-punct {
+    color: var(--tok-punct);
+  }
+</style>
