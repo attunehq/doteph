@@ -1,0 +1,27 @@
+---
+import { render } from "astro:content";
+import Docs from "../../layouts/Docs.astro";
+import { loadGuide, isIndex, rawSlugFor } from "../../lib/guide";
+import { withBase } from "../../lib/base";
+
+const entries = await loadGuide();
+const entry = entries.find(isIndex);
+if (!entry) throw new Error("User guide is missing an index entry (order: 0).");
+
+const { Content, headings } = await render(entry);
+const rawPath = withBase(`/guide/${rawSlugFor(entry)}.md`);
+const githubUrl =
+  "https://github.com/attunehq/doteph/blob/main/docs/user-guide/README.md";
+---
+
+<Docs
+  title={entry.data.title}
+  summary={entry.data.summary}
+  currentId={entry.id}
+  headings={headings}
+  rawPath={rawPath}
+  githubUrl={githubUrl}
+  rawMarkdown={entry.body ?? ""}
+>
+  <Content />
+</Docs>

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <rect width="32" height="32" rx="7" fill="#201d18" />
+  <!-- terminal prompt -->
+  <path
+    d="M8 11.2 13 16l-5 4.8"
+    fill="none"
+    stroke="#f5f1e8"
+    stroke-width="2.6"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <!-- a cursor trail dissolving off the edge: ephemeral, not persistent -->
+  <circle cx="18.6" cy="20.8" r="2.1" fill="#2dd4bf" />
+  <circle cx="23.4" cy="20.8" r="1.5" fill="#2dd4bf" opacity="0.55" />
+  <circle cx="26.9" cy="20.8" r="0.9" fill="#2dd4bf" opacity="0.25" />
+</svg>

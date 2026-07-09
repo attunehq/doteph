@@ -1,0 +1,34 @@
+---
+import type { GetStaticPaths } from "astro";
+import { render } from "astro:content";
+import Docs from "../../layouts/Docs.astro";
+import { loadGuide, isIndex, rawSlugFor, type GuideEntry } from "../../lib/guide";
+import { withBase } from "../../lib/base";
+
+export const getStaticPaths = (async () => {
+  const entries = await loadGuide();
+  return entries
+    .filter((e) => !isIndex(e))
+    .map((entry) => ({ params: { slug: entry.id }, props: { entry } }));
+}) satisfies GetStaticPaths;
+
+interface Props {
+  entry: GuideEntry;
+}
+const { entry } = Astro.props as Props;
+const { Content, headings } = await render(entry);
+const rawPath = withBase(`/guide/${rawSlugFor(entry)}.md`);
+const githubUrl = `https://github.com/attunehq/doteph/blob/main/docs/user-guide/${entry.id}.md`;
+---
+
+<Docs
+  title={entry.data.title}
+  summary={entry.data.summary}
+  currentId={entry.id}
+  headings={headings}
+  rawPath={rawPath}
+  githubUrl={githubUrl}
+  rawMarkdown={entry.body ?? ""}
+>
+  <Content />
+</Docs>

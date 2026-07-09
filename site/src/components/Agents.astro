@@ -1,0 +1,118 @@
+---
+import SectionHeading from "./SectionHeading.astro";
+import { withBase } from "../lib/base";
+
+const points = [
+  {
+    title: "Skills, installed",
+    body: "eph skills install drops a using-eph skill into .claude/skills and .agents/skills, so an agent working in the repo discovers eph on its own.",
+  },
+  {
+    title: "Machine-readable docs",
+    body: "This site serves llms.txt and every guide page as raw Markdown at its .md URL, for an agent to fetch directly instead of scraping HTML.",
+  },
+];
+---
+
+<section class="section agents" id="agents">
+  <div class="container">
+    <SectionHeading title="Built for agents.">
+      Coding agents work in the same workspaces you do. eph is written to be
+      driven by one directly.
+    </SectionHeading>
+
+    <div class="agents-body">
+      <div class="agents-grid" data-reveal>
+        {
+          points.map((p) => (
+            <article class="agents-card">
+              <h3>{p.title}</h3>
+              <p>{p.body}</p>
+            </article>
+          ))
+        }
+      </div>
+
+      <pre class="agents-term" data-reveal style="--reveal-delay:100ms"><code><span class="ag-com"># SessionStart hook: prewarm deps, inject their env.</span>
+<span class="ag-prompt">$</span> <span class="ag-cmd">eph up --role dep</span>
+<span class="ag-out">postgres -&gt; localhost:54321</span>
+<span class="ag-prompt">$</span> <span class="ag-cmd">eph env &gt;&gt; "$CLAUDE_ENV_FILE"</span>
+
+<span class="ag-com"># SessionEnd hook (optional): stop the tier on session end.</span>
+<span class="ag-prompt">$</span> <span class="ag-cmd">eph down --role dep</span></code></pre>
+    </div>
+
+    <p class="agents-foot" data-reveal>
+      Full reference for agents and automation is in <a
+        href={withBase("/guide/for-agents")}>For Agents and Scripts</a
+      >, and at <a href={withBase("/llms.txt")} class="mono">/llms.txt</a>.
+    </p>
+  </div>
+</section>
+
+<style>
+  .agents-body {
+    margin-top: clamp(2rem, 1rem + 3vw, 3.25rem);
+    display: grid;
+    gap: 1.25rem;
+  }
+  @media (min-width: 900px) {
+    .agents-body {
+      grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+      align-items: start;
+    }
+  }
+
+  .agents-grid {
+    display: grid;
+    gap: 1rem;
+  }
+  .agents-card {
+    padding: clamp(1rem, 0.8rem + 0.6vw, 1.3rem);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-3);
+    background: var(--paper-raised);
+  }
+  .agents-card h3 {
+    font-size: var(--text-md);
+    margin-bottom: 0.5rem;
+  }
+  .agents-card p {
+    font-size: var(--text-sm);
+    color: var(--ink-2);
+  }
+
+  .agents-term {
+    background: var(--ink);
+    border-radius: var(--radius-3);
+    padding: 1rem 1.1rem;
+    overflow-x: auto;
+    font-size: 0.78rem;
+    line-height: 1.8;
+    align-self: stretch;
+    height: fit-content;
+  }
+  .agents-term code {
+    color: var(--ink-inverse);
+  }
+  .ag-com {
+    color: oklch(0.62 0.02 60);
+    font-style: italic;
+  }
+  .ag-prompt {
+    color: var(--teal);
+    user-select: none;
+  }
+  .ag-cmd {
+    color: oklch(0.9 0.01 60);
+  }
+  .ag-out {
+    color: oklch(0.74 0.012 60);
+  }
+
+  .agents-foot {
+    margin-top: clamp(1.5rem, 1rem + 1.5vw, 2rem);
+    font-size: var(--text-sm);
+    color: var(--ink-2);
+  }
+</style>

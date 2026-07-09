@@ -1,43 +1,48 @@
+---
+title: "Core Concepts"
+summary: "Workspaces, isolation, automatic ports, persisted state, and the service lifecycle."
+order: 2
+---
+
 # Core Concepts
 
-This page explains the model behind `eph`. Once these ideas click (workspaces,
-isolation, automatic ports, persisted state, the lifecycle, and the split between
-dependency services and the app), the commands and the file format are obvious.
+This page explains the model behind `eph`: workspaces, isolation, automatic
+ports, persisted state, the service lifecycle, and the split between dependency
+services and the app you are building. Once these six ideas click, the commands
+and the file format are obvious.
 
 ## Workspaces
 
 A **workspace** is any directory that contains a `.eph` file.
 
 When you run an `eph` command, it searches the current directory and then walks
-**up** through parent directories until it finds a `.eph` file. The directory
-that holds it is the workspace, and every command operates on that workspace. So
-you can run `eph status` from a deep subdirectory of your project and it still
-finds the right services.
+**up** through parent directories until it finds a `.eph` file, the same way
+git finds a repository. The directory that holds the file is the workspace, and
+every command operates on that workspace, so `eph status` works from any
+subdirectory of your project.
 
 If no `.eph` file is found in the current directory or any parent, the command
 fails with `no .eph file found`.
 
 All relative paths and shell commands in your `.eph` file (volumes,
-`dockerfile=`, `compose=`, `run=`, health checks, `post-start`/`pre-stop` hooks)
-are resolved and executed **from the workspace root**, not from your current
-directory.
+`dockerfile=`, `compose=`, `run=`, health checks, and lifecycle hooks) resolve
+and execute **from the workspace root**, not from wherever you happen to run
+the command.
 
 ## Isolation
 
-Each workspace is isolated from every other workspace, even two checkouts of the
-same repository. This is what lets you run the same project in several
-directories at once without conflicts.
+Each workspace is isolated from every other workspace, including two checkouts
+of the same repository. That is the point of the tool: run the same project in
+several directories at once, with no shared ports and no shared data.
 
 Isolation is keyed on a **workspace ID**: the SHA-256 hash of the workspace's
-absolute (canonicalized) path. The first 8 hex characters - the **short ID** -
-are used for naming:
+absolute (canonicalized) path. The first 8 hex characters (the **short ID**)
+namespace everything `eph` creates:
 
 ```
 ~/projects/app/      ->  short ID a1b2c3d4  ->  eph-a1b2c3d4-postgres
 ~/projects/app-v2/   ->  short ID e5f6g7h8  ->  eph-e5f6g7h8-postgres
 ```
-
-Everything `eph` creates is namespaced by the short ID:
 
 | Resource | Name |
 |----------|------|
@@ -56,21 +61,21 @@ current workspace.
 ## Automatic ports
 
 You never pick host ports. For each `port=` you declare, `eph` asks Docker to
-publish the container port on a **random free host port**, bound to `127.0.0.1`.
+publish the container port on a **random free host port**, bound to
+`127.0.0.1`. This means:
 
-This means:
+- **No port conflicts, ever.** Not between workspaces, and not with other
+  software on your machine.
+- **Nothing is exposed to your local network.** Services are bound to loopback
+  only.
+- **The real port changes between container creations**, so never hardcode it.
+  Reference it symbolically instead (next section) and let `eph env` fill in
+  the current value.
 
-- **No port conflicts**, ever - not between workspaces, not with other software.
-- Services are reachable from your machine but **not exposed to the local
-  network** (they are bound to loopback only).
-- The real port changes between runs, so you should never hardcode it. Reference
-  it through interpolation instead (see below), and let `eph env` fill in the
-  current value.
-
-There is one exception: `run=` (non-container) services bind whatever port their
-process binds. `eph` does not remap those - the declared `port=` is reported
-as-is. See
-[Defining Services](services.md#run---shell-command-non-docker-services).
+One exception: `run=` (non-container) services bind whatever port their process
+binds. With a numeric `port=`, `eph` reports the declared value as-is; with
+`port=auto`, `eph` allocates a free port and injects it into the process. See
+[Running Your App](run-your-app.md#portauto).
 
 ## Interpolation: connecting your app to the ports
 
@@ -82,8 +87,8 @@ DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 REDIS_URL=redis://localhost:${redis.port}
 ```
 
-When you run `eph env`, each `${...}` is replaced using the **currently running**
-services:
+When you run `eph env`, each `${...}` is replaced using the **currently
+running** services:
 
 | Reference | Resolves to |
 |-----------|-------------|
@@ -91,23 +96,20 @@ services:
 | `${service.port.name}` | A named port (multi-port services) |
 | `${service.host}` | Always `localhost` |
 
-If a service is not running, its placeholders are left **untouched** so the
-unresolved reference stays visible rather than silently becoming empty. So run
-`eph up` before `eph env`. Full details in
-[Shell Integration](shell-integration.md).
+If a service is not running, its placeholders are left **untouched**, so the
+unresolved reference stays visible instead of silently becoming empty. Run
+`eph up` before `eph env`.
 
-> All four service types are tracked once running, so their ports resolve: `eph`
-> finds `image`/`dockerfile` services by container name, `run` services by their
-> process ID, and `compose` services by the Compose project's
-> `com.docker.compose.project` label. For a compose service, the ports you
-> declared with `expose.<name>=` resolve as `${service.port.<name>}`.
+All four service types resolve once running: `eph` finds `image` and
+`dockerfile` services by container name, `run` services by their tracked
+process, and `compose` services by their Compose project label. Details in
+[Shell Integration](shell-integration.md).
 
 ## Persisted state
 
-When `eph` starts services, it records what it started - container IDs, the
-assigned ports, and any process PIDs - in a small `state.json` file. It also
-writes `workspace.json` beside it, with the canonical workspace path and short
-ID used by [`eph system prune`](command-reference.md#eph-system-prune---dry-run---compatibility-v042).
+When `eph` starts services, it records what it started (container IDs, assigned
+ports, and process PIDs) in a small `state.json` file, with workspace metadata
+beside it:
 
 | Platform | Location |
 |----------|----------|
@@ -115,117 +117,101 @@ ID used by [`eph system prune`](command-reference.md#eph-system-prune---dry-run-
 | macOS | `~/Library/Application Support/eph/<short_id>/state.json` |
 | Windows | `%LOCALAPPDATA%\eph\<short_id>\state.json` |
 
-State is why `eph status` and `eph env` work instantly without re-inspecting
-everything, why the assigned ports survive a terminal restart, and why `eph`
-knows which containers and volumes belong to this workspace. `eph clean` deletes
-this directory for the current workspace. `eph system prune` scans all state
-directories and removes resources for workspaces whose recorded path is missing
-or empty.
+State is why `eph status` and `eph env` answer instantly, why assigned ports
+survive a terminal restart, and why `eph` knows which containers and volumes
+belong to this workspace.
 
-For `run=` services, new state also stores process identity. System prune uses
-that identity before signaling a recorded PID, because PIDs can be reused.
-Legacy `run=` entries and identity mismatches are skipped with a warning. If the
-command detached grandchildren outside the shell tree eph launched, system prune
-cannot discover those later.
+Two commands manage it: `eph clean` deletes the state directory for the current
+workspace along with its services and data, and
+[`eph system prune`](command-reference.md#eph-system-prune---dry-run---compatibility-v042)
+scans **all** state directories and removes leftovers for workspaces whose
+directory has since been deleted (a worktree you removed, for example).
 
 ## The service lifecycle
 
-Bringing a service up to a healthy state is **idempotent** and has three paths:
+Bringing a service up is **idempotent**. `eph up` takes whichever of three
+paths applies:
 
-1. **Already running** -> `eph up` detects it and reuses it. Nothing restarts.
-2. **Stopped but still present** (after `eph down`) -> the existing container is
-   restarted. This is fast, and it reuses the existing data.
-3. **Not present** -> a fresh container is created and the image pulled or built
+1. **Already running**: the service is reused. Nothing restarts.
+2. **Stopped but still present** (after `eph down`): the existing container is
+   restarted. Fast, and the data is still there.
+3. **Not present**: a fresh container is created, pulling or building the image
    if needed.
 
-This lifecycle applies to `image` and `dockerfile` services. **`run`** services
-are tracked by process ID: an alive process is reused, otherwise it is
-respawned. **`compose`** services delegate to `docker compose up -d` on every
-`eph up` (which is itself idempotent).
+That is the container story (`image` and `dockerfile`). The other two sources
+have their own idempotency: a `run` service is reused if its tracked process is
+alive and respawned otherwise, and a `compose` service delegates to
+`docker compose up -d`, which is itself idempotent.
 
-Each service runs its `pre-start` hooks just before it is created, so prep the
-service depends on (codegen a Go server needs to compile, a generated config a
-container mounts) finishes first. Then, once **every** service in the same
-`eph up` is healthy, eph runs `post-start` hooks in a second phase, regardless of
-which start path each service took. Deferring `post-start` this way means such a
-hook can reference any other service's assigned port (for example a migration
-whose `DATABASE_URL` interpolates `${postgres.port}`); every hook runs with eph's
-resolved environment injected (see
-[The `.eph` file](eph-file.md#hook-environment)).
+### Hooks bracket the lifecycle
 
-> **`pre-start` and `post-start` run on every `eph up`**, not only on fresh
-> creation. Write hooks to be idempotent -- a migration that no-ops when already
-> applied, an `INSERT ... ON CONFLICT` seed. A failing `pre-start` aborts the
-> `up` before its service starts; a failing `post-start` aborts the `up`. For
-> one-off or non-idempotent work, run it explicitly with
-> [`eph run`](command-reference.md#eph-run-cmd) instead of wiring it into a hook.
+Each service can declare four hooks: `pre-start`, `post-start`, `pre-stop`, and
+`post-stop`. During `eph up`, each service's `pre-start` hooks run just before
+it is created (codegen, generated config), and once **every** service in the
+`up` is healthy, all `post-start` hooks run in a second phase (migrations,
+seeds). Deferring `post-start` this way means a hook can reference any other
+service's assigned port. Teardown mirrors it: `pre-stop` before a service stops
+(backup, drain), `post-stop` after.
 
-The three levels of teardown:
+Two things to internalize now; the full rules live in
+[The `.eph` File](eph-file.md#lifecycle-hooks):
+
+- **`pre-start` and `post-start` run on every `eph up`**, not only on fresh
+  creation. Write them to be idempotent: a migration that no-ops when applied,
+  an `INSERT ... ON CONFLICT` seed. For one-off work, use
+  [`eph run`](command-reference.md#eph-run-cmd) instead.
+- **A failing hook aborts the command** rather than being skipped silently.
+  `--skip-hooks` is the escape hatch on `up`, `down`, and `clean`.
+
+### Three levels of teardown
 
 | Command | Stops | Removes container | Removes named volumes (data) | Removes state |
 |---------|:-----:|:-----------------:|:----------------------------:|:-------------:|
 | `eph down` | yes | no | no | clears entries |
 | `eph down --rm` | yes | yes | no | clears entries |
-| `eph clean` | yes | yes | **yes** | deletes file |
+| `eph clean` | yes | yes | **yes** | deletes directory |
 
-`eph down` keeps containers and data for a fast restart. `eph down --rm` removes
-containers but keeps named-volume data (and forces a fresh create next time).
-`eph clean` is the full reset and **deletes the data in named volumes** - use it
-when you want to start completely fresh.
+`eph down` keeps containers and data for a fast restart. `eph down --rm`
+removes containers but keeps named-volume data, forcing a fresh create next
+time. `eph clean` is the full reset: it **deletes the data in named volumes**,
+so use it when you want to start over completely.
 
-Teardown is bracketed by hooks the same way startup is: each service runs its
-`pre-stop` hooks before it stops (a backup or drain) and its `post-stop` hooks
-after (cleanup eph cannot do itself). A failing `pre-stop` leaves the service
-running so you can retry; a failing `post-stop` aborts the rest of the teardown
-but the service is already stopped. Both are skippable with `--skip-hooks`.
+Two footnotes to the table:
 
-> Bind mounts (host paths: `.`, `/`, a Windows drive like `C:\...`, or a UNC
-> `\\server\share\...`) are never deleted by `eph clean` - only Docker named
-> volumes are.
-
-> The table describes `image`/`dockerfile` services. **`compose` services are an
-> exception**: both `eph down` and `eph down --rm` run `docker compose down`,
-> which removes the compose containers either way. `eph clean` removes only the
-> named volumes declared with `volume=` in your `.eph` file; volumes declared
-> inside a Compose file are left to `docker compose`.
+- Bind mounts (host paths like `./seed` or `C:\data`) are never deleted by
+  `eph clean`. Only Docker named volumes are.
+- `compose` services are torn down with `docker compose down` in every case, so
+  `--rm` makes no difference for them, and `eph clean` removes only the named
+  volumes declared in your `.eph` file, not volumes internal to the Compose
+  file. See [Defining Services](services.md#how-compose-services-differ).
 
 ## Dependency services vs the app
 
-Most stacks split in two: **dependency services** (databases, caches, queues, mail
-catchers) that your app talks to, and the **first-party app** you are building.
-The dependency tier is stable and can run ahead of time; the app is what you
-restart constantly and want to control precisely.
+Most stacks split in two. **Dependency services** (databases, caches, queues,
+mail catchers) are stable, slow to warm up, and fine to leave running. The
+**first-party app** is what you restart constantly and want to control
+precisely.
 
-`role=` names that split, and `roles_order` orders it. Tag the backing services
-`role=dep` and the app `role=app`, then declare `roles_order=dep,app` ("app depends
-on dep"). Now the two tiers are addressable:
+`eph` lets you name that split. Tag each service with a `role=` (say, `dep`
+and `app`) and declare the order with `roles_order=dep,app`, which reads "app
+depends on dep". You get two things:
 
-- **Start order follows the graph.** `eph up` brings the `dep` tier up first and
-  waits for it healthy, then the app, so the app's `DATABASE_URL` resolves the
-  moment it starts. Teardown reverses that. This replaces the legacy "start `run=`
-  services last" rule with an explicit ordering you control.
-- **You can bring up one tier.** `eph up --role dep` starts the dependency services
-  and everything they depend on, without touching the app. `eph up --role app`
-  starts the app and pulls its dependencies in with it (see
-  [Command Reference](command-reference.md#eph-up-service)).
+- **Start order follows the dependency graph.** `eph up` brings the `dep` tier
+  up and healthy first, then the app, so the app's `DATABASE_URL` resolves the
+  moment it starts. Teardown runs in reverse.
+- **Tiers are addressable.** `eph up --role dep` starts just the dependency
+  services, for example to prewarm databases from a coding agent's
+  session-start hook without launching the app. `eph up --role app` starts the
+  app and pulls its dependencies up with it.
 
-The motivating case is prewarming. A dependency tier is known-good and slow to
-build (image pulls, migrations, seeds), so warming it once and reusing it beats
-starting it per task. A Claude Code SessionStart hook can run `eph up --role dep`
-and inject the resolved connection env before an agent's first command, leaving the
-app for later. Because `eph up` is idempotent, a later `eph up` or `eph dev` reuses
-the already-running dependency services rather than restarting them, and `eph dev`
-on exit leaves the tier it adopted running. See
-[For Agents](for-agents.md#prewarm-dependency-services-on-session-start) for the
-recipe.
-
-A file that uses no `role=` and no `roles_order` stays in **legacy mode** and
-behaves exactly as before: declaration order, `run=` services last. Roles are
-opt-in. Full rules are in
-[The `.eph` File](eph-file.md#roles-and-ordering).
+Roles are opt-in. A file with no `role=` and no `roles_order` behaves as it
+always has: services start in declaration order with `run=` services last.
+The full rules are in [The `.eph` File](eph-file.md#roles-and-ordering), and
+the prewarming workflow is in
+[Recipes](recipes.md#prewarm-dependency-services-on-claude-code-session-start).
 
 ## Next
 
-Now that you have the model, see [The `.eph` File](eph-file.md) for the complete
-format, or jump to [Defining Services](services.md) for ready-to-use service
-definitions.
+You have the model. [The `.eph` File](eph-file.md) gives you the complete
+format, or jump ahead to [Defining Services](services.md) for ready-to-use
+service definitions.
