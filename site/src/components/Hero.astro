@@ -21,12 +21,7 @@ const mapHtml = [
 <section class="hero" id="top">
   <div class="container hero-inner">
     <div class="hero-copy">
-      <p class="hero-kicker" data-reveal>
-        <span class="hero-kicker-mark" aria-hidden="true"></span>
-        <span class="hero-kicker-text">A small Rust CLI</span>
-      </p>
-
-      <h1 class="hero-title" data-reveal style="--reveal-delay:60ms">
+      <h1 class="hero-title" data-reveal>
         Ephemeral services per workspace.
       </h1>
 
@@ -48,8 +43,27 @@ const mapHtml = [
         <a href={withBase("/guide")} class="btn btn--primary">Read the guide</a>
         <a href={repo} class="btn btn--ghost" rel="noopener">View on GitHub</a>
       </div>
+    </div>
 
-      <div class="hero-install" data-reveal style="--reveal-delay:220ms">
+    <div class="hero-art" data-reveal style="--reveal-delay:160ms">
+      <Artifact filename="two checkouts, two workspaces" class="hero-map">
+        <Fragment set:html={mapHtml} />
+      </Artifact>
+
+      <div class="hero-run" aria-label="eph up output">
+        <div class="hero-run-head">
+          <code>$ eph up</code>
+        </div>
+        <pre class="hero-run-body"><code><span class="t-str">Services started:</span>
+  <span class="t-key">postgres</span> <span class="t-punct">-&gt;</span> <span class="t-num">localhost:54321</span>
+
+Run <span class="t-str">`eval "$(eph env)"`</span> to set environment variables</code></pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="container">
+    <div class="hero-install" data-reveal style="--reveal-delay:220ms">
         <div class="hero-install-row">
           <span class="hero-install-os">macOS &middot; Linux</span>
           <div class="hero-install-cmd-row">
@@ -92,23 +106,6 @@ const mapHtml = [
         </div>
       </div>
     </div>
-
-    <div class="hero-art" data-reveal style="--reveal-delay:160ms">
-      <Artifact filename="two checkouts, two workspaces" class="hero-map">
-        <Fragment set:html={mapHtml} />
-      </Artifact>
-
-      <div class="hero-run" aria-label="eph up output">
-        <div class="hero-run-head">
-          <code>$ eph up</code>
-        </div>
-        <pre class="hero-run-body"><code><span class="t-str">Services started:</span>
-  <span class="t-key">postgres</span> <span class="t-punct">-&gt;</span> <span class="t-num">localhost:54321</span>
-
-Run <span class="t-str">`eval "$(eph env)"`</span> to set environment variables</code></pre>
-      </div>
-    </div>
-  </div>
 </section>
 
 <style>
@@ -131,31 +128,7 @@ Run <span class="t-str">`eval "$(eph env)"`</span> to set environment variables<
     }
   }
 
-  .hero-kicker {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.6rem;
-    max-width: 100%;
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    color: var(--ink-3);
-    letter-spacing: 0.01em;
-  }
-  .hero-kicker-mark {
-    width: 0.55rem;
-    height: 0.55rem;
-    margin-top: 0.4em;
-    border-radius: 999px;
-    background: var(--teal);
-    box-shadow: 0 0 0 3px var(--teal-bg);
-    flex: none;
-  }
-  .hero-kicker-text {
-    min-width: 0;
-  }
-
   .hero-title {
-    margin-top: 1.1rem;
     font-size: clamp(2.5rem, 1.4rem + 3vw, 3.7rem);
     letter-spacing: -0.03em;
     line-height: 1.05;
@@ -181,12 +154,11 @@ Run <span class="t-str">`eval "$(eph env)"`</span> to set environment variables<
     gap: 0.75rem;
   }
 
-  /* ---- inline install block ---- */
+  /* ---- install block: its own full-content-width row below the hero grid ---- */
   .hero-install {
-    margin-top: 1.75rem;
+    margin-top: clamp(2rem, 1rem + 2.5vw, 3rem);
     display: grid;
     gap: 0.6rem;
-    max-width: 34rem;
   }
   .hero-install-row {
     display: grid;
@@ -212,8 +184,10 @@ Run <span class="t-str">`eval "$(eph env)"`</span> to set environment variables<
     font-size: 0.76rem;
     line-height: 1.5;
     color: var(--ink);
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
+    /* Full content width means the command fits on one line; on narrow
+       viewports it scrolls rather than wrapping. */
+    white-space: pre;
+    overflow-x: auto;
   }
   .copy-btn {
     flex: none;

@@ -40,7 +40,10 @@ const points = [
       <pre class="agents-term" data-reveal style="--reveal-delay:100ms"><code><span class="ag-com"># SessionStart hook: prewarm deps, inject their env.</span>
 <span class="ag-prompt">$</span> <span class="ag-cmd">eph up --role dep</span>
 <span class="ag-out">postgres -&gt; localhost:54321</span>
-<span class="ag-prompt">$</span> <span class="ag-cmd">eph env &gt;&gt; "$CLAUDE_ENV_FILE"</span></code></pre>
+<span class="ag-prompt">$</span> <span class="ag-cmd">eph env &gt;&gt; "$CLAUDE_ENV_FILE"</span>
+
+<span class="ag-com"># SessionEnd hook (optional): stop the tier on session end.</span>
+<span class="ag-prompt">$</span> <span class="ag-cmd">eph down --role dep</span></code></pre>
     </div>
 
     <p class="agents-foot" data-reveal>
