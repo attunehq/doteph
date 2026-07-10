@@ -152,6 +152,30 @@ fn exit_7_command() -> Vec<&'static str> {
     vec!["run", "cmd", "/C", "exit /B 7"]
 }
 
+/// An `eph run` invocation whose command echoes back every argument it was
+/// given, including several flag-shaped ones (`-v`, `-h`, `-V`, `--weird`).
+/// Used to prove those tokens reached the command untouched rather than being
+/// intercepted by eph's own flag parsing.
+#[cfg(unix)]
+fn echo_flags_command() -> Vec<&'static str> {
+    vec![
+        "run",
+        "sh",
+        "-c",
+        "echo \"$@\"",
+        "_",
+        "-v",
+        "-h",
+        "-V",
+        "--weird",
+    ]
+}
+
+#[cfg(windows)]
+fn echo_flags_command() -> Vec<&'static str> {
+    vec!["run", "cmd", "/C", "echo", "-v", "-h", "-V", "--weird"]
+}
+
 // ============================================================================
 // Check Functions
 // ============================================================================
@@ -2462,4 +2486,236 @@ async fn dev_forwards_stdio_to_the_foreground_app() {
         "a line written to `eph dev` stdin should reach the app and stream back on \
          stdout; got: {out:?}"
     );
+}
+
+// ============================================================================
+// eph env: unresolved references, powershell format, and json ordering
+// ============================================================================
+
+/// `eph env` omits a variable whose value still contains an unresolved
+/// `${service.property}` reference, names it (and the reference) in a warning
+/// on stderr, and still exits zero. This is `eph env`'s own contract: hooks,
+/// `eph run`, and a service's own `env.` all keep the old leave-verbatim
+/// behavior instead. Once the referenced service actually starts, the same
+/// variable resolves and appears in stdout.
+#[tokio::test]
+async fn env_omits_unresolved_reference_and_warns() {
+    let ws = TestWorkspace::new(
+        r#"
+[db]
+image=redis:7-alpine
+port=6379
+
+[env]
+DATABASE_URL=postgres://user:pass@localhost:${db.port}/app
+"#,
+    );
+
+    // `db` is never started, so DATABASE_URL cannot resolve.
+    let out = ws.eph(&["env"]).await;
+    assert!(
+        out.status.success(),
+        "eph env should still exit 0 with an unresolved reference: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("DATABASE_URL"),
+        "unresolved variable should be omitted from stdout, got:\n{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("DATABASE_URL") && stderr.contains("${db.port}"),
+        "stderr should name the omitted variable and its unresolved reference, got:\n{stderr}"
+    );
+
+    // Once `db` is up, the same variable resolves and appears.
+    ws.eph_ok(&["up", "db"]).await;
+    sleep(Duration::from_secs(1)).await;
+    let resolved = ws.eph_ok(&["env"]).await;
+    assert!(
+        resolved.contains("DATABASE_URL") && !resolved.contains("${"),
+        "DATABASE_URL should resolve once db is running, got:\n{resolved}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// `eph env --format powershell` emits `$env:NAME = 'value'` lines, doubling an
+/// embedded single quote per PowerShell's own single-quoted-string rule.
+#[tokio::test]
+async fn env_format_powershell() {
+    let ws = TestWorkspace::new("APP_NAME=test's app\nDEBUG=true\n");
+
+    let output = ws.eph_ok(&["env", "--format", "powershell"]).await;
+    assert!(
+        output.contains("$env:APP_NAME = 'test''s app'"),
+        "got: {output}"
+    );
+    assert!(output.contains("$env:DEBUG = 'true'"), "got: {output}");
+}
+
+/// `eph env --format json` keys appear in the `.eph` file's declaration order,
+/// not an arbitrary hash-map order.
+#[tokio::test]
+async fn env_format_json_preserves_declaration_order() {
+    let ws = TestWorkspace::new("ZEBRA=z\nAPPLE=a\nMANGO=m\n");
+
+    let output = ws.eph_ok(&["env", "--format", "json"]).await;
+    let zebra = output.find("ZEBRA").expect("ZEBRA missing");
+    let apple = output.find("APPLE").expect("APPLE missing");
+    let mango = output.find("MANGO").expect("MANGO missing");
+    assert!(
+        zebra < apple && apple < mango,
+        "json keys should preserve declaration order, got:\n{output}"
+    );
+}
+
+// ============================================================================
+// eph run: flags belong to the command, not to eph
+// ============================================================================
+
+/// Every token after `run` belongs to the command, even one that looks like
+/// one of eph's own flags (`-v`, `-h`, `-V`) or an arbitrary long flag: none of
+/// them are stolen by eph's global flag parsing.
+#[tokio::test]
+async fn run_passes_through_flag_shaped_arguments() {
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+    let out = ws.eph_ok(&echo_flags_command()).await;
+    assert!(
+        out.contains("-v") && out.contains("-h") && out.contains("-V") && out.contains("--weird"),
+        "expected every flag-shaped token to reach the command untouched, got: {out}"
+    );
+}
+
+/// `eph run -h` is not eph's help: there is no program named `-h`, so it fails
+/// with eph's own "failed to run command" message naming it, and eph's usage
+/// text never appears.
+#[tokio::test]
+async fn run_bare_dash_h_is_the_command_not_help() {
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+    let out = ws.eph(&["run", "-h"]).await;
+    assert!(!out.status.success(), "there is no program named -h");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("failed to run command: -h"),
+        "expected eph's own exec-failure message, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Usage:"),
+        "eph's own help text must not appear for `eph run -h`, got: {stderr}"
+    );
+}
+
+/// `eph run -v` is likewise the command, not eph's verbose flag: there is no
+/// program named `-v`, so it fails the same way `-h` does.
+#[tokio::test]
+async fn run_bare_dash_v_is_the_command_not_verbose() {
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+    let out = ws.eph(&["run", "-v"]).await;
+    assert!(!out.status.success(), "there is no program named -v");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("failed to run command: -v"),
+        "expected eph's own exec-failure message, got: {stderr}"
+    );
+}
+
+/// A flag placed *before* `run` is still eph's own global flag: `eph -v run
+/// ...` keeps enabling verbose logging and must not leak `-v` into the
+/// command's own arguments, the opposite of a flag placed after `run`.
+#[cfg(unix)]
+#[tokio::test]
+async fn verbose_before_run_is_ephs_flag_not_the_commands() {
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+    let out = ws
+        .eph(&["-v", "run", "sh", "-c", "echo \"$1\"", "_", "marker"])
+        .await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "marker",
+        "the command's own args should be unaffected by a -v placed before run"
+    );
+}
+
+// ============================================================================
+// eph up: stale-workspace nudge
+// ============================================================================
+
+/// `eph up` nudges toward `eph system prune` when other workspaces' state
+/// points at deleted checkouts. `EPH_STATE_ROOT` points the whole invocation at
+/// a throwaway directory so the test never touches (or is confused by) the
+/// real per-user state directory.
+#[tokio::test]
+async fn up_nudges_about_stale_workspaces() {
+    let state_root = tempfile::tempdir().unwrap();
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+    let root_str = state_root.path().to_string_lossy().into_owned();
+
+    // A fabricated stale workspace: an 8-hex-digit state dir with metadata
+    // (the exact shape `Workspace::save_metadata` writes) pointing at a path
+    // that does not exist.
+    let stale_dir = state_root.path().join("deadbeef");
+    std::fs::create_dir_all(&stale_dir).unwrap();
+    let metadata = serde_json::json!({
+        "schema": 1,
+        "workspace_id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "short_id": "deadbeef",
+        "workspace_path": "/this/path/does/not/exist-eph-integration-test",
+        "container_prefix": "eph-deadbeef",
+        "last_seen_unix_secs": 0
+    });
+    std::fs::write(
+        stale_dir.join("workspace.json"),
+        serde_json::to_string_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+
+    let out = ws
+        .eph_with_envs(&["up"], &[("EPH_STATE_ROOT", &root_str)])
+        .await;
+    assert!(
+        out.status.success(),
+        "up should still succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("1 stale eph workspace") && stderr.contains("eph system prune"),
+        "expected a stale-workspace note, got: {stderr}"
+    );
+
+    ws.eph_with_envs(&["down"], &[("EPH_STATE_ROOT", &root_str)])
+        .await;
+}
+
+/// With no stale workspace state recorded, `eph up` prints no nudge at all.
+#[tokio::test]
+async fn up_prints_no_nudge_when_nothing_is_stale() {
+    let state_root = tempfile::tempdir().unwrap();
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+    let root_str = state_root.path().to_string_lossy().into_owned();
+
+    let out = ws
+        .eph_with_envs(&["up"], &[("EPH_STATE_ROOT", &root_str)])
+        .await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("stale eph workspace"),
+        "should not nudge with no stale workspaces: {stderr}"
+    );
+
+    ws.eph_with_envs(&["down"], &[("EPH_STATE_ROOT", &root_str)])
+        .await;
 }

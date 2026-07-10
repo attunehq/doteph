@@ -1,6 +1,9 @@
 //! Service management - starting, stopping, and managing Docker containers
 
-use crate::parser::{EphFile, PortMapping, Service, ServiceSource, resolve_interpolations};
+use crate::parser::{
+    EphFile, PortMapping, Service, ServiceSource, resolve_interpolations,
+    resolve_interpolations_tracked,
+};
 use crate::proc;
 use crate::workspace::Workspace;
 use anyhow::{Context, Result, anyhow, bail};
@@ -109,14 +112,93 @@ pub fn resolve_env_vars(
 #[must_use]
 pub fn resolve_against(value: &str, running: &HashMap<String, RunningService>) -> String {
     resolve_interpolations(value, |service, property| {
-        let svc = running.get(service)?;
-        match property {
-            "host" => Some(svc.host().to_string()),
-            "port" => svc.port().map(|p| p.to_string()),
-            prop if prop.starts_with("port.") => svc.named_port(&prop[5..]).map(|p| p.to_string()),
-            _ => None,
-        }
+        resolve_property(service, property, running)
     })
+}
+
+/// The single lookup shared by [`resolve_against`] and
+/// [`resolve_against_tracked`]: `${service.host}`, `${service.port}`, and
+/// `${service.port.NAME}` resolve against `running`; anything else (an unknown
+/// service or property) is `None`.
+fn resolve_property(
+    service: &str,
+    property: &str,
+    running: &HashMap<String, RunningService>,
+) -> Option<String> {
+    let svc = running.get(service)?;
+    match property {
+        "host" => Some(svc.host().to_string()),
+        "port" => svc.port().map(|p| p.to_string()),
+        prop if prop.starts_with("port.") => svc.named_port(&prop[5..]).map(|p| p.to_string()),
+        _ => None,
+    }
+}
+
+/// Like [`resolve_against`], but also returns every unresolved
+/// `${service.property}` reference in `value`, for `eph env`'s omit-and-warn
+/// contract (see [`resolve_env_vars_for_eval`]).
+fn resolve_against_tracked(
+    value: &str,
+    running: &HashMap<String, RunningService>,
+) -> (String, Vec<(String, String)>) {
+    resolve_interpolations_tracked(value, |service, property| {
+        resolve_property(service, property, running)
+    })
+}
+
+/// One `eph env` variable omitted from the resolved output because its value
+/// still contained an unresolved `${service.property}` reference (typically:
+/// the referenced service is not running).
+///
+/// Carries enough for a specific stderr warning naming both the omitted
+/// variable and the one reference that failed; see [`resolve_env_vars_for_eval`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OmittedVar {
+    /// The top-level variable name that was omitted.
+    pub name: String,
+    /// The `service` half of the reference that could not be resolved.
+    pub service: String,
+    /// The `property` half of the reference that could not be resolved.
+    pub property: String,
+}
+
+/// Resolve `eph env`'s top-level variables for direct `eval`, omitting any
+/// variable whose value still contains an unresolved `${service.property}`
+/// reference rather than handing the caller's shell a literal placeholder.
+///
+/// This is `eph env`'s own contract, distinct from [`resolve_env_vars`] (used
+/// by lifecycle hooks, `eph run`, and a service's own `env.` entries), which
+/// all still leave an unresolved reference verbatim: a hook may legitimately
+/// run before the service it references starts, and the placeholder is a
+/// recognizable, documented signal there. `eph env`'s output, by contrast, is
+/// meant to be `eval`'d directly, so a variable that cannot be fully resolved
+/// must not leak `${...}` syntax into the caller's shell.
+///
+/// Returns the resolvable pairs, in declaration order, plus one [`OmittedVar`]
+/// per variable left out (one entry per variable even if its value carries
+/// several unresolved references: only the first is reported, which is enough
+/// to point at the fix). The caller is expected to print a warning for each.
+#[must_use]
+pub fn resolve_env_vars_for_eval(
+    eph: &EphFile,
+    running: &HashMap<String, RunningService>,
+) -> (Vec<(String, String)>, Vec<OmittedVar>) {
+    let mut resolved = Vec::with_capacity(eph.env_vars.len());
+    let mut omitted = Vec::new();
+    for var in &eph.env_vars {
+        let (value, mut unresolved) = resolve_against_tracked(&var.value, running);
+        if unresolved.is_empty() {
+            resolved.push((var.name.clone(), value));
+        } else {
+            let (service, property) = unresolved.remove(0);
+            omitted.push(OmittedVar {
+                name: var.name.clone(),
+                service,
+                property,
+            });
+        }
+    }
+    (resolved, omitted)
 }
 
 /// Build the `EPH_*` metadata variables describing the workspace and the
@@ -3580,6 +3662,100 @@ impl ServiceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::EnvVar;
+
+    fn running_with(name: &str, port: u16) -> HashMap<String, RunningService> {
+        HashMap::from([(
+            name.to_string(),
+            RunningService {
+                name: name.to_string(),
+                ports: HashMap::from([("default".to_string(), port)]),
+            },
+        )])
+    }
+
+    fn eph_with_env(pairs: &[(&str, &str)]) -> EphFile {
+        EphFile {
+            env_vars: pairs
+                .iter()
+                .map(|(name, value)| EnvVar {
+                    name: (*name).to_string(),
+                    value: (*value).to_string(),
+                })
+                .collect(),
+            services: Default::default(),
+            roles_order: None,
+        }
+    }
+
+    #[test]
+    fn eval_resolution_omits_a_variable_with_an_unresolved_reference() {
+        let eph = eph_with_env(&[("DATABASE_URL", "postgres://localhost:${db.port}/app")]);
+        let running = HashMap::new(); // db is not running
+
+        let (resolved, omitted) = resolve_env_vars_for_eval(&eph, &running);
+        assert!(resolved.is_empty(), "got: {resolved:?}");
+        assert_eq!(omitted.len(), 1);
+        assert_eq!(omitted[0].name, "DATABASE_URL");
+        assert_eq!(omitted[0].service, "db");
+        assert_eq!(omitted[0].property, "port");
+    }
+
+    #[test]
+    fn eval_resolution_keeps_a_fully_resolvable_variable() {
+        let eph = eph_with_env(&[("DATABASE_URL", "postgres://localhost:${db.port}/app")]);
+        let running = running_with("db", 5432);
+
+        let (resolved, omitted) = resolve_env_vars_for_eval(&eph, &running);
+        assert!(omitted.is_empty(), "got: {omitted:?}");
+        assert_eq!(
+            resolved,
+            vec![(
+                "DATABASE_URL".to_string(),
+                "postgres://localhost:5432/app".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn eval_resolution_treats_the_escaped_form_as_resolved() {
+        // `$${` is a literal `${`, never a reference, so it must not be omitted.
+        let eph = eph_with_env(&[("LITERAL", "cost is $${db.port} dollars")]);
+        let running = HashMap::new();
+
+        let (resolved, omitted) = resolve_env_vars_for_eval(&eph, &running);
+        assert!(omitted.is_empty(), "got: {omitted:?}");
+        assert_eq!(
+            resolved,
+            vec![(
+                "LITERAL".to_string(),
+                "cost is ${db.port} dollars".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn eval_resolution_only_omits_the_variable_that_actually_missed() {
+        let eph = eph_with_env(&[
+            ("OK", "${db.port}"),
+            ("MISSING", "${ghost.port}"),
+            ("ALSO_OK", "static"),
+        ]);
+        let running = running_with("db", 5432);
+
+        let (resolved, omitted) = resolve_env_vars_for_eval(&eph, &running);
+        assert_eq!(
+            resolved,
+            vec![
+                ("OK".to_string(), "5432".to_string()),
+                ("ALSO_OK".to_string(), "static".to_string()),
+            ]
+        );
+        assert_eq!(omitted.len(), 1);
+        assert_eq!(omitted[0].name, "MISSING");
+        assert_eq!(omitted[0].service, "ghost");
+        assert_eq!(omitted[0].property, "port");
+    }
 
     fn port(name: Option<&str>, container_port: u16) -> PortMapping {
         PortMapping {

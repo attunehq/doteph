@@ -27,10 +27,16 @@ tests/
 The public API is whatever `src/lib.rs` re-exports:
 
 ```rust
-pub use env::{escape_bash, escape_fish, render, render_export, render_fish, render_json};
+pub use env::{
+    escape_bash, escape_fish, escape_powershell, render, render_export, render_fish,
+    render_json, render_powershell,
+};
 pub use parser::{EphFile, Service, ServiceSource, parse, resolve_interpolations};
 pub use prune::{ConfirmationOutcome, PruneOptions, PruneReport, confirmation_outcome, prune};
-pub use service::{Hooks, LogOptions, RunningService, ServiceManager, resolve_env_vars};
+pub use service::{
+    Hooks, LogOptions, OmittedVar, RunningService, ServiceManager, resolve_env_vars,
+    resolve_env_vars_for_eval,
+};
 pub use workspace::Workspace;
 ```
 
@@ -129,9 +135,18 @@ treating `$${` as an escaped literal `${`, splits the content on the first
 Anything the resolver declines (`None`), or a placeholder with no `.`, is left
 verbatim; an unterminated `${` is copied through rather than repaired, since
 `parse` already guarantees a parsed file has none. The resolver is supplied by
-the caller (`cmd_env` in `main.rs` and `service::resolve_against`) and reads
-from running
-services.
+the caller (`service::resolve_against`, used for hooks, `eph run`, and every
+service's own `env.<KEY>=`) and reads from running services.
+
+**`resolve_interpolations_tracked(input, resolver) -> (String, Vec<(String,
+String)>)`** wraps `resolve_interpolations` (via a `RefCell`-captured closure,
+since `resolve_interpolations` requires a plain `Fn`) to additionally return
+every reference the resolver declined, as `(service, property)` pairs. This is
+`eph env`'s own hook into resolution (through `service::resolve_against_tracked`
+and `service::resolve_env_vars_for_eval`, called from `cmd_env` in `main.rs`):
+unlike every other consumer, which leaves an unresolved reference verbatim,
+`eph env` needs to know which variables to omit instead, since its output is
+handed straight to a shell's `eval`.
 
 ## workspace
 
@@ -146,7 +161,15 @@ canonicalization and the data-dir lookup.
   every command.
 - Naming helpers: `container_prefix()` (`eph-<short_id>`),
   `container_name(svc)`, `volume_name(svc, vol)`, `eph_file_path()`.
-- `state_dir()` returns `<dirs::data_local_dir()>/eph/<short_id>`.
+- `state_dir()` returns `state_root()?.join(&self.short_id)`.
+- `state_root()` (a public, module-level function, not a `Workspace` method,
+  since `count_stale_workspaces` in `prune.rs` needs it before any particular
+  workspace is resolved) is `<dirs::data_local_dir()>/eph`, or `EPH_STATE_ROOT`
+  when that variable is set to a non-empty (post-trim) value; a whitespace-only
+  override falls back to the default rather than resolving to a bogus path
+  built from blank text. The override is what lets an integration test point a
+  whole `eph` invocation at a throwaway state root instead of the real
+  per-user data directory.
 - `save_metadata()` writes `<state_dir>/workspace.json`, which records the
   canonical workspace path for cross-workspace pruning.
 
@@ -269,11 +292,24 @@ lifecycle engine.
   `orphaned_state_entries` is the plain diff (state keys minus declared
   service names) both `stop_all` and `clean` use to find them.
 - `resolve_env_vars` / `command_env` / `hook_env` build the resolved
-  environment shared by `eph env`, `eph run`, and the lifecycle hooks.
-  `hook_env` resolves the owning service's own `env.X` values'
-  `${service.property}` references before overlaying them, so a hook like
-  `post-start` sees the same resolved values the service itself was created
-  with rather than a raw placeholder.
+  environment shared by `eph run` and the lifecycle hooks (both leave an
+  unresolved reference verbatim). `hook_env` resolves the owning service's own
+  `env.X` values' `${service.property}` references before overlaying them, so
+  a hook like `post-start` sees the same resolved values the service itself
+  was created with rather than a raw placeholder.
+- `resolve_env_vars_for_eval(eph, running) -> (Vec<(String, String)>,
+  Vec<OmittedVar>)` is `eph env`'s own resolver, used by `cmd_env` in
+  `main.rs` instead of `resolve_env_vars`: it calls
+  `resolve_against_tracked` (built on `parser::resolve_interpolations_tracked`)
+  per variable, and any variable with a still-unresolved reference is left out
+  of the returned pairs and reported as an `OmittedVar { name, service,
+  property }` instead (only the first unresolved reference per variable is
+  reported, which is enough to point at the fix). `cmd_env` prints a warning
+  per `OmittedVar` to stderr and exits `0` regardless. `resolve_property` is
+  the single `${service.host}` / `${service.port}` / `${service.port.NAME}`
+  lookup shared by both `resolve_against` (used by `resolve_env_vars` and the
+  Docker-container `env.<KEY>=` path in `DockerClient::run_image`) and
+  `resolve_against_tracked`.
 - `clean` opens the `WorkspaceLock`, reloads state, tears down every declared
   service (`stop_service`) and every `orphaned_state_entries` (`stop_orphan`),
   removes each stopped service's per-workspace named volumes (skipping bind
@@ -393,18 +429,39 @@ proceeding. The CLI (`cmd_system_prune` in `main.rs`) runs `prune` once as a
 dry-run preview to decide and display what would happen, resolves the
 confirmation, then (if confirmed) runs `prune` again for real.
 
+`count_stale_workspaces(root, exclude_short_id) -> usize` is the cheap,
+Docker-free half of the same staleness check, reused for `eph up`'s passive
+nudge (`print_stale_workspace_nudge` in `main.rs`, run after every successful
+`up`): it walks `state_dirs(root)`, and for each directory whose name is a
+workspace short ID (skipping anything else, or a directory whose metadata
+cannot be loaded) checks `classify_workspace_path` on the recorded path,
+excluding `exclude_short_id` (the current workspace) so `up` never nudges
+about itself. It never touches Docker and never errors: an unreadable state
+root reads as zero, since the count must never turn a successful `up` into a
+failure.
+
 ## env
 
 `src/env.rs` is the pure rendering half of `eph env` (the workspace lookup
-and interpolation live in `main.rs`):
+lives in `cmd_env` in `main.rs`; interpolation lives in
+`service::resolve_env_vars_for_eval`, which `cmd_env` calls):
 
 - `render(vars, format)` dispatches to `render_export` / `render_fish` /
-  `render_json` and errors on an unknown format.
+  `render_powershell` / `render_json` and errors on an unknown format, listing
+  the four valid ones in the message.
 - `render_export` emits `export NAME="value"`; `render_fish` emits
-  `set -gx NAME "value"`; `render_json` emits a pretty JSON object.
+  `set -gx NAME "value"`; `render_powershell` emits `$env:NAME = 'value'`;
+  `render_json` emits a pretty JSON object.
 - `escape_bash` escapes `\ " $ `` ` ``; `escape_fish` escapes `\ " $` (fish
-  does not treat backticks specially in double quotes). Newlines are
-  preserved. The unit tests pin these exact strings.
+  does not treat backticks specially in double quotes); `escape_powershell`
+  doubles an embedded `'` (a single-quoted PowerShell string is the literal
+  form: nothing else is interpolated inside it, so nothing else needs
+  escaping). Newlines are preserved. The unit tests pin these exact strings.
+- `render_json` builds a `serde_json::Map` (not a `HashMap`) and inserts in
+  input order, so the emitted keys follow the `.eph` file's declaration order:
+  this crate enables serde_json's `preserve_order` feature specifically so
+  that ordering survives serialization. A `HashMap`-backed implementation
+  would scramble it, which is exactly what the unit tests pin against.
 
 ## skills
 
@@ -412,7 +469,15 @@ and interpolation live in `main.rs`):
 implements `eph skills install` (write into `.claude/skills/` and
 `.agents/skills/` at the git repo root, never clobbering local edits without
 `--force`), `eph skills check` (byte-compare, non-zero exit on drift; CI runs
-this), and `eph skills list`.
+this), and `eph skills list`. `skills_root` (`main.rs`) falls back to the
+current directory when it is not inside a git repo, printing a warning on
+stderr naming that directory so the fallback is never silent. `confine_to_root`
+rejects a `--dir` value that is absolute, contains `..`, or (on Windows) that
+carries a `Component::Prefix` (a drive-relative path like `C:foo`, or a UNC
+path): `C:foo` is not absolute by `Path::is_absolute`'s rules (it needs both a
+prefix *and* a root), yet `root.join("C:foo")` still discards `root` entirely
+because any `Prefix` component makes `join` do that, the same escape an
+absolute path or a `..` gets.
 
 ## update
 
@@ -424,18 +489,55 @@ and a detached `__update-check` invocation (a hidden subcommand) refreshes
 the cache at most once a day. `EPH_REPO` / `EPH_BASE_URL` override the
 source; `EPH_NO_UPDATE_CHECK` silences the nag.
 
+`effective_repo()` (`env_nonempty("EPH_REPO")` or `DEFAULT_REPO`) is the single
+source `Updater::new`, the passive nag, and the background refresh worker all
+read, so the three agree on which repo's releases they mean. `cache_path(repo)`
+namespaces the cache file by that repo: `<dirs::cache_dir()>/eph/update-check-
+<sanitized-repo>.json`, where `sanitize_repo_for_filename` replaces anything
+outside `[A-Za-z0-9._-]` (crucially the `/` between owner and repo) with `-`,
+so `attunehq/doteph` becomes `update-check-attunehq-doteph.json`. Before this,
+`eph update` and the passive nag shared one unnamespaced cache file, so
+pointing `EPH_REPO` at a fork to test a build would poison (or read stale data
+from) the default repo's cached nag; per-repo namespacing keeps that from
+happening. `read_cache(repo)` / `write_cache(repo, cache)` take the repo
+explicitly rather than re-deriving it, so the caller decides which repo's
+cache it means.
+
 ## main
 
-`src/main.rs` defines the `clap` `Cli`/`Commands`, initializes `tracing`
-(debug if `--verbose`, else info) writing to **stderr** so stdout stays clean
-for `eph env`, and dispatches to `cmd_*` functions. Each `cmd_*` resolves the
-workspace, loads and parses `.eph` (`load_eph_file`), and drives the relevant
-`ServiceManager` calls. `cmd_env` and `cmd_run` resolve the environment
-through `service::resolve_env_vars` (and `ServiceManager::command_env` for
-`cmd_run`), the same builder the lifecycle hooks use; `cmd_run` then execs the
-given command with that environment and propagates its exit code. `cmd_up`
-passes `Hooks::from_skip_flag(--skip-hooks)` straight through to
-`start_services`.
+`src/main.rs` defines the `clap` `Cli`/`Commands`, initializes `tracing` via
+`init_tracing` (debug if `--verbose`, else info) writing to **stderr** so
+stdout stays clean for `eph env`, and dispatches to `cmd_*` functions.
+
+`eph run`'s own argv is special-cased before `Cli::parse()` ever runs:
+`split_run_argv(&argv[1..])` splits the raw process argv into
+`(global_args, command_args)` when the invocation is `eph [-v] run <cmd...>`,
+so every token from `run`'s first argument onward (including one shaped like a
+flag: `-v`, `-h`, `--foo`) reaches `cmd_run` untouched instead of being
+recognized by clap's `global = true` verbose flag or its auto
+`-h`/`--help`/`-V`/`--version`, which would otherwise match anywhere on the
+command line. `split_run_argv` returns `None` (falling through to ordinary
+`Cli::parse()`) when `run` is not the subcommand being invoked at all: no
+`run` token, a non-flag token before it, or (crucially) `eph help run`, so
+clap's generated help keeps working; it also falls through when `run`'s own
+command is empty, so clap's "required argument" error still fires. The
+`Commands::Run` variant itself sets `disable_help_flag` / `disable_version_flag`
+so clap does not try to claim `-h`/`-V` when generating that help text.
+
+Each `cmd_*` resolves the workspace, loads and parses `.eph` (`load_eph_file`),
+and drives the relevant `ServiceManager` calls. `cmd_run` resolves the
+environment through `service::resolve_env_vars` (via
+`ServiceManager::command_env`), the same builder the lifecycle hooks use, and
+leaves an unresolved `${service.property}` reference verbatim; it then execs
+the given command with that environment and propagates its exit code. `cmd_env`
+instead calls `service::resolve_env_vars_for_eval`, printing a `warning:
+omitted ...` line to stderr for each returned `OmittedVar` before rendering the
+resolvable pairs, and always exits `0`. `cmd_up` passes
+`Hooks::from_skip_flag(--skip-hooks)` straight through to `start_services`,
+then calls `print_stale_workspace_nudge` (backed by
+`prune::count_stale_workspaces`) to print the stale-workspace note described in
+[prune](#prune) above; that call is swallowed on any error resolving the state
+root, since it must never turn a successful `up` into a failure.
 
 The `eph dev` loop and its `--watch` restarts live here too, driving the
 library through the same `ServiceManager` calls; `src/watch.rs` supplies the

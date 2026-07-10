@@ -28,17 +28,20 @@ Output goes to **stdout** and all logs go to stderr, which keeps the output
 clean for `eval` and piping.
 
 > Run `eph up` before `eph env`. Interpolation only resolves for running
-> services; placeholders for stopped services are left unresolved (literally
-> `${name.port}`) rather than blanked.
+> services; a variable whose value still has an unresolved reference (a
+> stopped service) is **omitted from the output** rather than printed with a
+> raw `${name.port}`, and a warning naming the variable and the reference goes
+> to stderr instead. The command still exits `0`.
 
 ## Formats
 
 Choose with `-f` / `--format`. The default is `export`.
 
 ```sh
-eph env                # export (bash/zsh/sh), the default
-eph env -f fish        # fish
-eph env -f json        # JSON object
+eph env                     # export (bash/zsh/sh), the default
+eph env -f fish             # fish
+eph env -f powershell       # PowerShell
+eph env -f json             # JSON object
 ```
 
 ### bash / zsh / sh
@@ -56,6 +59,17 @@ eph env -f fish | source
 # or, equivalently:
 eval (eph env -f fish | string collect)
 ```
+
+### PowerShell
+
+```powershell
+eph env --format powershell | Out-String | Invoke-Expression
+```
+
+`Out-String` collects the lines into one string before `Invoke-Expression`
+runs it, the PowerShell equivalent of fish's `| source`. Each line is
+`$env:NAME = 'value'`, with an embedded `'` doubled per PowerShell's own
+single-quoted-string escaping rule.
 
 ### JSON
 
@@ -96,11 +110,15 @@ interactive shell or a tool eph does not launch.
 
 ## Escaping
 
-Values are emitted inside double quotes and escaped for the target shell:
+Values are escaped for the target shell:
 
-- **export**: backslash, `"`, `$`, and backtick are escaped.
-- **fish**: backslash, `"`, and `$` are escaped (fish does not treat backticks
-  specially inside double quotes).
+- **export** and **fish** emit the value inside double quotes: export escapes
+  backslash, `"`, `$`, and backtick; fish escapes backslash, `"`, and `$`
+  (fish does not treat backticks specially inside double quotes).
+- **powershell** emits the value inside single quotes (`$env:NAME = 'value'`),
+  PowerShell's literal-string form: nothing is interpolated inside it, so the
+  only character that needs escaping is the single quote itself, doubled
+  (`it's` becomes `it''s`).
 
 Literal newlines inside a value are preserved. You do not need to quote values
 in your `.eph` file for the shell's benefit; `eph` handles escaping.

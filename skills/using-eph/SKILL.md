@@ -54,12 +54,17 @@ the `.eph` file: that is the *container* port, not the published host port.
 ```sh
 eval "$(eph env)"                        # bash / zsh / sh
 eph env -f fish | source                 # fish
+eph env --format powershell | Out-String | Invoke-Expression   # PowerShell
 eph env -f json | jq -r .DATABASE_URL    # machine-readable, best for scripts
 ```
 
 `eph env` prints only the top-level `KEY=VALUE` variables from the `.eph` file,
-with `${service.port}` style interpolations filled in from **running** services.
-A reference to a stopped service is left unresolved, so run `eph up` first.
+with `${service.port}` style interpolations filled in from **running**
+services. A variable whose reference cannot resolve (its service is not
+running) is dropped from the output and named in a warning on stderr instead,
+so `eph env`'s stdout never contains a raw `${...}` placeholder; the command
+still exits `0`. Run `eph up` first so everything resolves. (Hooks and
+`eph run`, by contrast, leave an unresolved reference verbatim; see below.)
 
 ## Tearing down
 
@@ -277,7 +282,12 @@ The command is executed directly, not through a shell, so eph does not expand
 `$VAR` in the arguments; wrap it in `sh -c '...'` when you need shell expansion
 of eph's injected variables, piping, or globbing. `eph run` exits with the
 command's own exit code. Use it for repeatable operations (seeding, resets,
-ad-hoc queries) -- unlike `post-start`, it runs every time you invoke it.
+ad-hoc queries): unlike `post-start`, it runs every time you invoke it.
+
+Every token after `run` belongs to the command, flag-shaped or not: `eph run
+-v ./script.sh`, `eph run -h`, and `eph run --foo` all pass `-v`/`-h`/`--foo`
+straight through as the command's own argument, with no `--` separator needed.
+Only a flag placed *before* `run` (`eph -v run ...`) is still eph's own.
 
 ## Claude Desktop preview servers: `eph dev`
 

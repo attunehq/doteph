@@ -35,6 +35,11 @@ curl -sSfL https://raw.githubusercontent.com/attunehq/doteph/main/scripts/instal
 irm https://raw.githubusercontent.com/attunehq/doteph/main/scripts/install.ps1 | iex
 ```
 
+Both scripts honor `EPH_REPO` (an `owner/repo`, default `attunehq/doteph`) and
+`EPH_BASE_URL` (replaces the GitHub download base entirely, with no release
+tag appended after it) for installing from a fork or a mirror; `eph update`
+honors the same two variables (see below).
+
 Or build from a source checkout:
 
 ```sh
