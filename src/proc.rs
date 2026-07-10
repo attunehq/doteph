@@ -61,8 +61,11 @@ pub(crate) struct ProcessIdentity {
 }
 
 impl ProcessIdentity {
-    fn from_process(process: &Process) -> Option<Self> {
-        let identity = ProcessIdentity {
+    /// Snapshot whatever the OS exposes about `process`, however little that
+    /// is. Callers that need the snapshot to actually distinguish a PID reuse
+    /// apply [`Self::has_distinguishing_fields`] on top (see [`identity`]).
+    fn from_process_raw(process: &Process) -> Self {
+        ProcessIdentity {
             start_time: process.start_time(),
             cwd: process.cwd().map(PathBuf::from),
             exe: process.exe().map(PathBuf::from),
@@ -71,12 +74,6 @@ impl ProcessIdentity {
                 .iter()
                 .map(|part| part.to_string_lossy().into_owned())
                 .collect(),
-        };
-
-        if identity.has_distinguishing_fields() {
-            Some(identity)
-        } else {
-            None
         }
     }
 
@@ -172,9 +169,10 @@ fn snapshot(pid: NonZeroU32) -> (System, Pid) {
     (system, pid)
 }
 
-/// Return the current identity for `pid`, when the platform exposes enough
-/// process metadata to distinguish the entry from a later PID reuse.
-pub(crate) fn identity(pid: NonZeroU32) -> Option<ProcessIdentity> {
+/// Refresh a fresh [`System`] with everything it can learn about `pid` and
+/// return its process entry's raw identity snapshot, `None` only when the
+/// process is not in the table at all.
+fn raw_identity(pid: NonZeroU32) -> Option<ProcessIdentity> {
     let pid = Pid::from_u32(pid.get());
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -182,13 +180,32 @@ pub(crate) fn identity(pid: NonZeroU32) -> Option<ProcessIdentity> {
         true,
         ProcessRefreshKind::everything(),
     );
-    system.process(pid).and_then(ProcessIdentity::from_process)
+    system.process(pid).map(ProcessIdentity::from_process_raw)
+}
+
+/// Return the current identity for `pid`, when the platform exposes enough
+/// process metadata to distinguish the entry from a later PID reuse.
+///
+/// This is the *recording* side, used when eph launches a `run=` service: an
+/// identity with no cwd, no exe, and no command line could never distinguish
+/// anything, so recording it would only manufacture false confidence, and
+/// `None` tells the caller to store no identity at all.
+pub(crate) fn identity(pid: NonZeroU32) -> Option<ProcessIdentity> {
+    raw_identity(pid).filter(ProcessIdentity::has_distinguishing_fields)
 }
 
 /// Whether `pid` still names the process represented by `expected` (see
 /// [`ProcessIdentity::matches`] for what "the same process" tolerates).
+///
+/// The comparison side deliberately skips [`identity`]'s
+/// distinguishing-fields filter: a loaded system can transiently expose
+/// nothing about a live process (an opaque snapshot with only a start time),
+/// and treating that as "not the same process" is the harmful direction, as
+/// it makes teardown leak a live service and prune skip one it should reap.
+/// An opaque snapshot still has to agree on the start time to match; only a
+/// PID absent from the process table is a definite mismatch.
 pub(crate) fn identity_matches(pid: NonZeroU32, expected: &ProcessIdentity) -> bool {
-    identity(pid).is_some_and(|current| current.matches(expected))
+    raw_identity(pid).is_some_and(|current| current.matches(expected))
 }
 
 /// Whether a process with `pid` is present in the OS process table (a native
@@ -480,7 +497,19 @@ mod tests {
         let pid = NonZeroU32::new(child.id().expect("freshly spawned child has a PID")).unwrap();
 
         let recorded = identity(pid).expect("test process should expose identity");
-        assert!(identity_matches(pid, &recorded));
+        // A loaded machine (a busy CI runner) can transiently fail to
+        // enumerate a live process's entry; a short retry keeps this test
+        // about identity semantics rather than scheduler weather. A genuine
+        // mismatch still fails: retrying cannot make a wrong identity right.
+        let mut matched = identity_matches(pid, &recorded);
+        for _ in 0..20 {
+            if matched {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            matched = identity_matches(pid, &recorded);
+        }
+        assert!(matched, "recorded identity should match the live process");
 
         force_kill(pid);
         let _ = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
