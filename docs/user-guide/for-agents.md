@@ -142,6 +142,7 @@ volume=pgdata:/var/lib/postgresql/data
 healthcheck=pg_isready -U dev
 post-start=npm run db:migrate
 
+[env]
 DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 ```
 
@@ -151,30 +152,46 @@ Line by line: `image=` is the source (one of image/dockerfile/compose/run);
 volume; `healthcheck` for an image service runs without a shell
 (whitespace-split, `docker exec`); `post-start` runs on the host via the
 platform shell (`sh -c` on Unix, `cmd /C` on Windows) after every service is
-healthy; the trailing `DATABASE_URL=` is a **shell** env var emitted by
-`eph env`, with `${postgres.port}` filled in at runtime.
+healthy; `[env]` switches back to top-level variables (see below); the
+trailing `DATABASE_URL=` is a **shell** env var emitted by `eph env`, with
+`${postgres.port}` filled in at runtime.
 
-### Service sources (one per section; if several are given, the last wins)
+**Sections do not end at blank lines.** A bare `KEY=VALUE` line directly after
+a service section is a parse error, not a silent trailing variable. Top-level
+variables (what `eph env` prints) only parse in two places: above the first
+section, or inside a reserved `[env]` section (which may repeat). `env.KEY=`
+inside a service section is a different thing entirely: it sets a variable
+**in the container**, not your shell. Writing an UPPERCASE key straight into a
+service section, meaning it for the shell, is the single most common mistake
+when generating a `.eph` file: `eph check` rejects it and names both fixes
+(`env.KEY=` for the container, `[env]` for the shell).
+
+### Service sources (exactly one per section; a second one is a parse error)
 
 | Key | Meaning |
 |-----|---------|
 | `image=` | Run a Docker image. |
 | `dockerfile=` (+ `context=`) | Build a local image (paths from workspace root). |
-| `compose=` (+ `expose.<name>=`) | Delegate to a Compose file. |
+| `compose=` (+ `expose.<name>=`) | Delegate to a Compose file. `port=`/`port.<name>=` are illegal here. |
 | `run=` | Host process via the platform shell. Numeric ports are NOT remapped (declared value reported as-is); `port=auto` makes eph allocate and inject the port. |
 
 ### Properties
 
 | Key | Notes |
 |-----|-------|
-| `port=` / `port.<name>=` | Single / named ports. `auto` is valid for `run=` services only. |
-| `env.<KEY>=` | Container env (not shell env). |
-| `volume=` | `name:/path` = named volume; `./host:/path` or `/abs:/path` = bind mount. |
+| `port=` / `port.<name>=` | Single / named ports. `auto` is valid for `run=` services only. Illegal on `compose=` (use `expose.<name>=`). |
+| `env.<KEY>=` | Container env (not shell env). One value per distinct `KEY`. |
+| `volume=` | `name:/path` = named volume; `./host:/path` or `/abs:/path` = bind mount. Repeatable. |
 | `role=` | Tier name for roles mode; requires a `roles_order` listing every role. |
-| `command=` | Override container CMD (shell-word split, no shell). |
+| `command=` | Override container CMD (shell-word split, no shell). Only legal for `image=`/`dockerfile=`; a parse error on `run=`/`compose=`. |
 | `healthcheck=` | image/dockerfile: no shell. run/compose: platform shell (`sh -c` / `cmd /C`). |
 | `ready-timeout=` | Seconds (default 30; compose 60). |
 | `pre-start=` / `post-start=` / `pre-stop=` / `post-stop=` | Lifecycle hooks. Host platform shell in workspace root; repeatable; run with the resolved env + `EPH_*` metadata + the service's `env.X` injected. `pre-start` runs just before its service is created (no own port yet); `post-start` after all services are healthy. Both run on every `up`; failures abort. `pre-stop` runs before a stop (failure aborts, service left running); `post-stop` after (failure aborts the rest of teardown). |
+
+Every property above except the four marked repeatable is single-valued: a
+second occurrence is a parse error, as is an unknown property (the error
+lists every known one), an invalid or duplicate service/port name, or an
+empty value (everything except `env.<KEY>=`, where empty is legal).
 
 ### Interpolation (resolved against running services)
 

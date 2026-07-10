@@ -24,14 +24,16 @@ image=postgres:16-alpine
 port=5432
 env.POSTGRES_USER=dev
 
-# Top-level variables can reference services
+# A top-level variable after a service section goes in [env]
+[env]
 DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 ```
 
 There are exactly two kinds of content:
 
-- **Top-level environment variables**: `KEY=VALUE` lines outside any section.
-  These are what `eph env` prints for your shell.
+- **Top-level environment variables**: `KEY=VALUE` lines above the first
+  section, or inside an `[env]` section. These are what `eph env` prints for
+  your shell.
 - **Service sections**: a `[name]` header followed by `property=value` lines.
   These define what `eph up` starts.
 
@@ -41,14 +43,20 @@ There are exactly two kinds of content:
 - `key=value` splits on the **first** `=`. Both sides are trimmed of
   surrounding whitespace.
 - A value may be wrapped in one matching pair of `'single'` or `"double"`
-  quotes, which are stripped. Quotes are only needed to preserve leading or
-  trailing spaces; they are otherwise optional.
-- Within a section, property order does not matter, and interpolation refers to
-  services by name, so a service can be referenced from anywhere in the file.
-  Placement of top-level variables does matter, though: a top-level variable
-  written after a `[section]` ends that section (see
-  [the reclassification rule](#where-to-put-top-level-variables)). Blank lines
-  and comments do **not** end a section.
+  quotes, which are stripped. The pair is only stripped when it is
+  unambiguous: the value is at least two characters, starts and ends with the
+  same quote, and that quote does not occur again in between. `"a" and "b"` is
+  left exactly as written rather than mangled to `a" and "b`. Quotes are only
+  needed to preserve leading or trailing spaces; they are otherwise optional.
+- A leading UTF-8 byte-order mark (some Windows editors add one automatically)
+  is ignored.
+- Within a section, property order does not matter, and interpolation refers
+  to services by name, so a service can be referenced from anywhere in the
+  file. **Sections do not end at blank lines or comments**: once a
+  `[section]` opens, every following line belongs to it until the next
+  `[section]`, `[env]`, or `[roles_order]` header. A bare top-level variable
+  therefore cannot follow a service section directly; see
+  [Where to put top-level variables](#where-to-put-top-level-variables).
 
 ### Comments
 
@@ -76,7 +84,8 @@ port=5432
 
 ## Environment variables
 
-Outside a section, every `KEY=VALUE` is a top-level environment variable:
+A top-level environment variable is a bare `KEY=VALUE` line, written either
+above the first section or inside an `[env]` section:
 
 ```ini
 APP_ENV=development
@@ -91,22 +100,71 @@ contain `${service.property}` references (see [Interpolation](#interpolation)).
 > variables go to **your shell**; `env.KEY=` goes **into the container**. They
 > are separate namespaces.
 
+A top-level variable name must be a valid shell identifier:
+`^[A-Za-z_][A-Za-z0-9_]*$` (letters, digits, and underscores, not starting
+with a digit). Anything else would break the `export NAME=...` line `eph env`
+emits. The top-of-file block and every `[env]` section share one namespace, so
+declaring the same name twice anywhere is a duplicate-variable error, even
+across the two forms.
+
 ### Where to put top-level variables
 
-An unknown lowercase key inside a section is a hard parse error (a typo like
-`prot=5432` cannot slip through). An unknown `SCREAMING_SNAKE_CASE` key inside
-a section is treated differently: it is reclassified as a top-level environment
-variable, it **ends the section**, and `eph` prints a warning. That rule is
-what lets you write top-level variables after your services, but it has one
-sharp edge: a miscased property such as `HEALTHCHECK=...` silently becomes a
-global variable instead of a health check. See
-[Troubleshooting](troubleshooting.md#a-property-was-ignored).
+Sections do not end at blank lines, so once you are inside `[postgres]`, a
+bare `KEY=VALUE` line is ambiguous: is it a new service property, or a
+variable meant for your shell? The parser does not guess. A bare top-level
+variable is legal in exactly two places:
 
-Both conventional layouts work: variables first, then sections; or sections
-first, then a trailing block of variables. With the trailing layout, the first
-variable after the last section triggers exactly one reclassification warning.
-That warning is benign, and putting the variables before the sections silences
-it.
+- **Above the first section.** Nothing has opened yet, so every `KEY=VALUE`
+  line is a top-level variable.
+- **Inside an `[env]` section.** `[env]` is a reserved section name, never a
+  service: every line inside it is a top-level variable, exactly like the
+  top-of-file block. `[env]` may appear more than once; each occurrence
+  switches back into variable context, so you can group a service's variables
+  near its own section:
+
+  ```ini
+  [postgres]
+  image=postgres:16-alpine
+  port=5432
+
+  [env]
+  DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
+
+  [redis]
+  image=redis:7-alpine
+  port=6379
+
+  [env]
+  REDIS_URL=redis://localhost:${redis.port}
+  ```
+
+A bare `KEY=VALUE` written directly after a service section, with no `[env]`,
+is a **hard parse error**:
+
+```
+'DATABASE_URL' at line 5 looks like an environment variable, but it is inside
+service 'postgres' (sections do not end at blank lines). To set it in the
+container, write env.DATABASE_URL=...; to export it from `eph env`, move it
+into an [env] section or above the first section
+```
+
+The conventional layout is variables first, then services, then a trailing
+`[env]` section for anything that needs to reference a service:
+
+```ini
+APP_ENV=development
+
+[postgres]
+image=postgres:16-alpine
+port=5432
+
+[env]
+DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
+```
+
+A misspelled `[env]` (`[envs]`, `[vars]`, `[variables]`, `[environment]`) is
+rejected with a hint pointing at `[env]` rather than being treated as an
+unknown, unclassified service.
 
 ## Service sections
 
@@ -127,9 +185,21 @@ before any `eph up`:
 service 'redis' has no source defined (set one of image/dockerfile/compose/run)
 ```
 
-Declare exactly one source. If a section lists several, the last one silently
-wins; this is not validated, so treat it as a mistake to avoid. The four
-sources are covered in depth in [Defining Services](services.md).
+Declare exactly one source. A section that declares a second one, whether the
+same key twice (`image=` twice) or two different keys (`image=` and `run=`),
+is a parse error naming the service and line. The four sources are covered in
+depth in [Defining Services](services.md).
+
+Service names must match `^[a-z][a-z0-9-]*$`: lowercase letters, digits, and
+hyphens, starting with a letter. The rule is strict because a service name
+becomes three other things: a container name, the `service` half of a
+`${service.property}` reference (a `.` would split at the wrong place), and
+the `EPH_<NAME>_*` metadata variables (allowing both `-` and `_` would let
+`auth-db` and `auth_db` collide once both are upper-cased). `[My-Service]`,
+`[auth_db]`, and `[1db]` are all rejected.
+
+Reopening a section name later in the file (`[db]` ... `[db]` again) is a
+parse error naming both line numbers; sections are never silently merged.
 
 ### Service properties
 
@@ -141,10 +211,10 @@ sources are covered in depth in [Defining Services](services.md).
 | `compose=` | no | Path to a Docker Compose file to delegate to. |
 | `run=` | no | Shell command for a non-Docker service. |
 | `role=` | no | The role (tier) this service belongs to; a free-form name you choose, such as `dep` or `app`. See [Roles and ordering](#roles-and-ordering). |
-| `command=` | no | Override the container's default command (`image` and `dockerfile` only). |
-| `port=` | yes | A container port to publish on a random host port. For `run=` services, `port=auto` makes eph allocate the port (see [Running Your App](run-your-app.md#portauto)). |
-| `port.<name>=` | yes | A **named** port, for multi-port services. `port.<name>=auto` is allowed for `run=` services. |
-| `env.<KEY>=` | yes | An environment variable passed into the container. |
+| `command=` | no | Override the container's default command. Only legal for `image=`/`dockerfile=` services: a `run=` service's command *is* its `run=` value, and a compose service's command lives in the compose file, so `command=` there is a parse error. |
+| `port=` | no (one per service) | A container port to publish on a random host port. For `run=` services, `port=auto` makes eph allocate the port (see [Running Your App](run-your-app.md#portauto)). Illegal on `compose=` services; use `expose.<name>=` there instead. |
+| `port.<name>=` | one per distinct name | A **named** port, for multi-port services. `port.<name>=auto` is allowed for `run=` services. Same restrictions as `port=`. |
+| `env.<KEY>=` | one per distinct key | An environment variable passed into the container. |
 | `volume=` | yes | A volume mount: `name:/path` (named) or `./host:/path` (bind). |
 | `healthcheck=` | no | Command that must succeed before the service counts as ready. |
 | `ready-timeout=` | no | Seconds to wait for the `healthcheck` (default 30; 60 for compose). Ignored when no `healthcheck` is set. |
@@ -152,10 +222,26 @@ sources are covered in depth in [Defining Services](services.md).
 | `post-start=` | yes | Hook run after every service in the `up` is healthy. |
 | `pre-stop=` | yes | Hook run before the service is stopped. |
 | `post-stop=` | yes | Hook run after the service has stopped. |
-| `expose.<name>=` | yes | For `compose=`: expose a port for interpolation. |
+| `expose.<name>=` | one per distinct name | For `compose=`: expose a port for interpolation. Illegal on every other source; those use `port=`/`port.<name>=`. |
 
 "Repeatable" means the property can appear multiple times and every value is
-kept; several `post-start=` lines run in order.
+kept; several `post-start=` lines run in order. Every non-repeatable property
+is single-valued: a second occurrence (even of a differently-named
+`port.<name>=` that repeats an already-used name) is a parse error naming the
+property, service, and line. Hooks and `volume=` are the only properties
+designed to repeat and accumulate.
+
+An unknown property, of any case, is a parse error listing every known
+property name. There is no reclassification: a stray `HEALTHCHECK=...` inside
+a section is rejected with a hint to write `env.HEALTHCHECK=...` (to set it in
+the container) or move it into `[env]` (to export it from your shell), the
+same distinction as the [top-level-variable rule](#where-to-put-top-level-variables)
+above.
+
+Every property except `env.<KEY>=` rejects an empty value: `image=`,
+`volume=`, `healthcheck=`, `post-start=`, and the rest are parse errors with
+nothing after the `=`. `env.<KEY>=` alone stays legal, since setting a
+container variable to the empty string is a real thing to want.
 
 ## Ports
 
@@ -177,10 +263,19 @@ port.console=9001
 command=server /data --console-address ":9001"
 ```
 
+Port names follow the same rule as service names (`^[a-z][a-z0-9-]*$`): they
+become part of `${service.port.<name>}` interpolation and the
+`EPH_<SERVICE>_PORT_<NAME>` metadata variable.
+
 Reference them as `${minio.port.api}` and `${minio.port.console}`. For a
 single-port service, `${service.port}` is the one port. For a multi-port
 service, always use the named form; `${service.port}` is not well-defined when
 there are several.
+
+`port=` and `port.<name>=` are only for services eph itself publishes:
+`image=`, `dockerfile=`, and `run=`. On a `compose=` service they are a parse
+error; declare `expose.<name>=` instead (see
+[Defining Services](services.md#compose-delegate-to-docker-compose)).
 
 ## Volumes
 
@@ -266,6 +361,7 @@ healthcheck=pg_isready -U dev
 post-start=psql "$DATABASE_URL" -f schema.sql
 pre-stop=./scripts/backup.sh
 
+[env]
 DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 ```
 
@@ -404,7 +500,9 @@ for a straight chain.
 The `[roles_order]` section may appear anywhere in the file, including before
 the services it names. Every line inside it is a role edge (role names are
 free-form, so nothing is reinterpreted as an environment variable), so keep
-top-level variables outside the section.
+top-level variables outside the section. A misspelled section name
+(`[role_order]`, `[roles-order]`, `[roles]`, and similar) is rejected with a
+hint pointing at `[roles_order]`.
 
 ### Ordering in roles mode
 
@@ -420,7 +518,8 @@ order.
 
 ## Interpolation
 
-Top-level environment variable values may reference running services:
+Top-level environment variable values, and a service's `env.<KEY>=` values,
+may reference other services:
 
 ```ini
 [postgres]
@@ -431,6 +530,7 @@ port=5432
 image=minio/minio
 port.api=9000
 
+[env]
 DATABASE_URL=postgres://localhost:${postgres.port}/db
 S3_ENDPOINT=http://localhost:${minio.port.api}
 HOST=${postgres.host}
@@ -442,10 +542,33 @@ HOST=${postgres.host}
 | `${service.port.name}` | Named port |
 | `${service.host}` | `localhost` |
 
-Interpolation is resolved by `eph env` (and by hooks, `eph run`, and `run=`
-service environments) against services that are **currently running**. An
-unresolved reference (a stopped service, or a typo'd name) is left in place
-verbatim rather than blanked out, so mistakes stay visible.
+Two different things happen at two different times:
+
+- **At parse time**, `eph check` (and every other command) validates the
+  *shape* of every placeholder in a top-level variable or `env.<KEY>=` value:
+  an unterminated `${` is an error, a placeholder that is not the two-part
+  `${service.property}` form is an error, and a placeholder naming a service
+  that is not defined anywhere in the file is an error. A service defined
+  later in the file is fine; the check runs after the whole file is read, so
+  forward references work. A literal `${` that is not meant as a placeholder
+  is written `$${`, which renders as `${` and is never validated as a
+  reference:
+
+  ```ini
+  [env]
+  TEMPLATE=cost: $${not.a.placeholder}
+  ```
+
+- **At runtime**, `eph env` (and hooks, `eph run`, and `run=` service
+  environments) resolve each placeholder against **currently running**
+  services. A reference that parsed fine but names a service that is not
+  running right now is left in place verbatim rather than blanked, so an
+  unresolved reference stays visible instead of silently disappearing.
+
+`run=`, hook (`pre-start`/`post-start`/`pre-stop`/`post-stop`), and
+`healthcheck=` command strings are never scanned for placeholders: those are
+shell commands, and `${VAR}` there is the shell's own parameter expansion, not
+eph's interpolation.
 
 For a `compose` service, the ports you declared with `expose.<name>=` resolve
 as `${service.port.<name>}`.
@@ -491,6 +614,7 @@ port.web=8025
 # Environment variables
 # =============================================================================
 
+[env]
 DATABASE_URL=postgres://app:dev@localhost:${postgres.port}/myapp_dev
 REDIS_URL=redis://localhost:${redis.port}
 S3_ENDPOINT=http://localhost:${minio.port.api}

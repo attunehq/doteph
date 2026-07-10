@@ -75,6 +75,10 @@ post-stop=rm -rf .cache/uploads
 # Environment Variables
 # =============================================================================
 
+# Top-level variables that follow a service section live in an [env] section
+# (a bare KEY=VALUE line there would otherwise be ambiguous with the section's
+# own properties). Variables written above the first section need no [env].
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 REDIS_URL=redis://localhost:${redis.port}
 

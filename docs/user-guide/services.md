@@ -15,11 +15,12 @@ Every service declares a **source**: the thing `eph` starts. There are four:
 | `compose=` | A multi-container subsystem you already maintain as Compose. |
 | `run=` | A plain process on the host: your own app, a local binary. |
 
-Declare exactly one per service. If several are listed, the last silently
-wins, so treat that as a mistake. This page covers the first three in depth
-and introduces `run=`; [Running Your App](run-your-app.md) is the full story
-for first-party apps. The [common definitions](#common-service-definitions) at
-the end are ready to paste.
+Declare exactly one per service. A section that declares a second one (the
+same key twice, or two different keys) is a parse error. This page covers the
+first three in depth and introduces `run=`; [Running Your App](run-your-app.md)
+is the full story for first-party apps. The
+[common definitions](#common-service-definitions) at the end are ready to
+paste.
 
 ## `image=`: Docker image services
 
@@ -170,6 +171,7 @@ image=minio/minio
 port.api=9000
 port.console=9001
 
+[env]
 S3_ENDPOINT=http://localhost:${minio.port.api}
 S3_CONSOLE=http://localhost:${minio.port.console}
 ```
@@ -193,6 +195,7 @@ env.POSTGRES_DB=myapp
 volume=pgdata:/var/lib/postgresql/data
 healthcheck=pg_isready -U dev
 
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 ```
 
@@ -209,6 +212,7 @@ env.MYSQL_PASSWORD=dev
 volume=mysqldata:/var/lib/mysql
 healthcheck=mysqladmin ping -h localhost
 
+[env]
 DATABASE_URL=mysql://dev:dev@localhost:${mysql.port}/myapp
 ```
 
@@ -220,6 +224,7 @@ image=redis:7-alpine
 port=6379
 healthcheck=redis-cli ping
 
+[env]
 REDIS_URL=redis://localhost:${redis.port}
 ```
 
@@ -234,6 +239,7 @@ env.MONGO_INITDB_ROOT_PASSWORD=dev
 volume=mongodata:/data/db
 healthcheck=mongosh --eval db.adminCommand(ping)
 
+[env]
 MONGO_URL=mongodb://dev:dev@localhost:${mongo.port}
 ```
 
@@ -253,6 +259,7 @@ env.MINIO_ROOT_PASSWORD=devdevdev
 command=server /data --console-address ":9001"
 volume=miniodata:/data
 
+[env]
 S3_ENDPOINT=http://localhost:${minio.port.api}
 S3_ACCESS_KEY=dev
 S3_SECRET_KEY=devdevdev
@@ -266,6 +273,7 @@ image=mailhog/mailhog
 port.smtp=1025
 port.web=8025
 
+[env]
 SMTP_HOST=localhost
 SMTP_PORT=${mailhog.port.smtp}
 MAIL_WEB_UI=http://localhost:${mailhog.port.web}
@@ -282,6 +290,7 @@ env.RABBITMQ_DEFAULT_USER=dev
 env.RABBITMQ_DEFAULT_PASS=dev
 healthcheck=rabbitmq-diagnostics -q ping
 
+[env]
 AMQP_URL=amqp://dev:dev@localhost:${rabbitmq.port.amqp}
 ```
 

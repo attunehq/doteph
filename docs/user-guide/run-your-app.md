@@ -39,6 +39,7 @@ run=npm run dev
 port=auto
 env.PORT=${web.port}
 
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 APP_URL=http://localhost:${web.port}
 ```
@@ -58,7 +59,8 @@ allocate a free host port and hand it to the process through its environment.
 [web]
 run=npm run dev
 port=auto
-env.PORT=${web.port}              # tell your framework which port to bind
+# tell your framework which port to bind
+env.PORT=${web.port}
 ```
 
 How it behaves:

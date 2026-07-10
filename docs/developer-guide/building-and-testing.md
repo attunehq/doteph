@@ -52,9 +52,11 @@ Three layers, plus a heavyweight fourth:
 
 - **Unit tests** (`src/**`, inline `#[cfg(test)]`): parsing, env rendering,
   and workspace IDs. Pure and fast, no Docker. The parser (`src/parser.rs`)
-  and env rendering (`src/env.rs`) carry the densest coverage: parsing rules,
-  the SCREAMING_SNAKE_CASE reclassification, quote stripping, interpolation,
-  and shell escaping. Run with `make test-unit` (`cargo test --lib`).
+  and env rendering (`src/env.rs`) carry the densest coverage: the `[env]`
+  section and top-level variable placement, duplicate sections/properties/
+  names, service and port name validation, quote stripping, interpolation
+  (including the `$${` escape and unknown-service validation), and shell
+  escaping. Run with `make test-unit` (`cargo test --lib`).
 - **Doctests**: the public-API examples in `///` docs are compiled and run,
   so they cannot drift from the code. Included in `cargo test`.
 - **Integration tests** (`tests/integration.rs`, with helpers in

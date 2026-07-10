@@ -90,21 +90,34 @@ volume=pgdata:/var/lib/postgresql/data
 healthcheck=pg_isready -U dev
 post-start=npm run db:migrate
 
+[env]
 DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 ```
 
 - A service names exactly one source: `image=`, `dockerfile=` (+ `context=`),
-  `compose=` (+ `expose.<name>=`), or `run=` (a host process via `sh -c`).
+  `compose=` (+ `expose.<name>=`), or `run=` (a host process via `sh -c`). A
+  section with none, or with two, is a parse error.
 - `port=` is a *container* port published on a random host port; `${svc.port}`
   in a top-level variable resolves to the assigned host port at `eph env` time.
+  `port=`/`port.<name>=` are illegal on `compose=` services (use
+  `expose.<name>=` there instead).
 - For a `run=` service (a first-party app eph launches), `port=auto` /
   `port.<name>=auto` make eph allocate a free host port and inject it into the
   process; reference the service's own assigned port as `${svc.port}` in its
   `env.X` (e.g. `env.PORT=${web.port}`). eph keeps the port stable across
   restarts and re-launches the app on a fresh port if it dies on a port
-  conflict. Still never hardcode it — read it via `eph env` / `${svc.port}`.
-- `env.X=` is set inside the container; the trailing `DATABASE_URL=` is a shell
-  env var emitted by `eph env`.
+  conflict. Still never hardcode it: read it via `eph env` / `${svc.port}`.
+- `env.X=` is set **inside the container**; it is a different namespace from
+  the top-level `DATABASE_URL=` above, which is a **shell**
+  variable emitted by `eph env`. **Top-level variables only parse in two
+  places**: above the first section, or inside a reserved `[env]` section
+  (shown above, right after `postgres`'s properties). `[env]` may repeat, so
+  you can group a variable near the service it describes. Sections do **not**
+  end at blank lines: a bare `KEY=VALUE` written directly after a service
+  section (with no `[env]`) is a parse error, not a silently-accepted trailing
+  variable. If you generate a `.eph` file and want a variable to reach the
+  container instead of the shell, use `env.KEY=` inside the section, not a
+  bare `KEY=` after it.
 - `volume=name:/path` is a per-workspace named volume; `healthcheck` for an image
   service runs with no shell (whitespace-split, `docker exec`); the lifecycle
   hooks run on the host via `sh -c` with eph's resolved environment injected (see
@@ -119,7 +132,8 @@ first-party app you are building (start it on demand; it may bind preview ports
 or run side effects). Roles let you bring up one tier without the other.
 
 ```ini
-roles_order=dep,app            # dep services come up before the app
+# dep services come up before the app
+roles_order=dep,app
 
 [postgres]
 image=postgres:16
@@ -198,13 +212,21 @@ Four hooks bracket a service, in order: `pre-start` (before it is created),
 in their environment, so a database migration or codegen step just works:
 
 ```ini
+[postgres]
+image=postgres:16-alpine
+port=5432
+
 [api]
 run=./bin/server
-pre-start=go generate ./...                     # runs before the server boots
-post-start=psql "$DATABASE_URL" -f schema.sql   # DATABASE_URL is already set
+# runs before the server boots
+pre-start=go generate ./...
+# DATABASE_URL is already set
+post-start=psql "$DATABASE_URL" -f schema.sql
 pre-stop=./scripts/backup.sh
-post-stop=rm -rf .cache/scratch                 # cleanup eph cannot do itself
+# cleanup eph cannot do itself
+post-stop=rm -rf .cache/scratch
 
+[env]
 DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 ```
 

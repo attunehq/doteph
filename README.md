@@ -74,6 +74,7 @@ env.POSTGRES_PASSWORD=dev
 env.POSTGRES_DB=myapp
 healthcheck=pg_isready -U dev
 
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 ```
 

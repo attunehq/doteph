@@ -83,6 +83,15 @@ Because ports are dynamic, your environment variables reference services
 symbolically:
 
 ```ini
+[postgres]
+image=postgres:16-alpine
+port=5432
+
+[redis]
+image=redis:7-alpine
+port=6379
+
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 REDIS_URL=redis://localhost:${redis.port}
 ```

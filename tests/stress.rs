@@ -82,6 +82,7 @@ port.console=9001
 env.MINIO_ROOT_USER=minioadmin
 env.MINIO_ROOT_PASSWORD=minioadmin
 
+[env]
 DATABASE_URL=postgres://test:test@localhost:${postgres.port}/test
 REDIS_URL=redis://localhost:${redis.port}
 MINIO_ENDPOINT=http://localhost:${minio.port.api}
@@ -105,6 +106,7 @@ ready-timeout=60
 image=redis:7-alpine
 port=6379
 
+[env]
 DATABASE_URL=postgres://test:test@localhost:${postgres.port}/test
 REDIS_URL=redis://localhost:${redis.port}
 "#;
@@ -515,7 +517,7 @@ async fn source_type_run_shell_command() {
         p
     };
     let eph = format!(
-        "[web]\nrun=python3 -m http.server {port}\nport={port}\n\nWEB_URL=http://localhost:${{web.port}}\n"
+        "[web]\nrun=python3 -m http.server {port}\nport={port}\n\n[env]\nWEB_URL=http://localhost:${{web.port}}\n"
     );
     let ws = TestWorkspace::new(&eph);
 
@@ -600,7 +602,7 @@ async fn source_type_compose() {
         // key must match the compose service (`redis`), and the URL interpolates
         // it explicitly as `${cache.port.redis}` rather than relying on it
         // happening to be the sole (and thus default) port.
-        "[cache]\ncompose=docker-compose.yml\nexpose.redis=6379\n\nREDIS_URL=redis://localhost:${cache.port.redis}\n",
+        "[cache]\ncompose=docker-compose.yml\nexpose.redis=6379\n\n[env]\nREDIS_URL=redis://localhost:${cache.port.redis}\n",
     );
     ws.write_file(
         "docker-compose.yml",

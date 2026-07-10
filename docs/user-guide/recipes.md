@@ -62,6 +62,7 @@ image=redis:7-alpine
 port=6379
 healthcheck=redis-cli ping
 
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 REDIS_URL=redis://localhost:${redis.port}
 ```
@@ -93,6 +94,7 @@ healthcheck=pg_isready -U dev
 post-start=npm run db:migrate
 post-start=npm run db:seed
 
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 ```
 
@@ -167,6 +169,7 @@ role=app
 port=auto
 env.PORT=${web.port}
 
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 ```
 

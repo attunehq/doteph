@@ -58,37 +58,79 @@ pub use workspace::Workspace;
   role, every role is backed, edges known, graph acyclic) happens at parse
   time so a broken graph never reaches `eph up`.
 
-**`parse(input) -> Result<EphFile>`** is a single line-oriented pass:
+**`parse(input) -> Result<EphFile>`** strips a leading UTF-8 BOM, then makes a
+single line-oriented pass tracking a `Context` (`TopLevel`, `Env`,
+`RolesOrder`, or `Service(usize)`) that says how to interpret the current
+line:
 
 - Blank lines and `#`-leading lines are skipped. There is no inline-comment
   stripping, which is why a `#` after a value becomes part of the value.
-- `[name]` opens a section; an empty `[]` is an error. `[roles_order]` is the
-  one reserved section name and parses as role edges rather than a service.
-  Sections are kept in a `Vec<ServiceBuilder>` with a name-to-index map, so
-  re-opening a section name appends to the same builder and finalization
-  order stays deterministic.
+- `[name]` opens a section; an empty `[]` is an error. `[env]` and
+  `[roles_order]` are reserved names: `[env]` switches `Context` back to
+  `Env` (top-level variables) rather than opening a service, and may repeat;
+  `[roles_order]` switches to `Context::RolesOrder` (role edges). Any other
+  name must match `is_valid_service_name` (`^[a-z][a-z0-9-]*$`) and must not
+  repeat an earlier section; both are hard errors, and `reserved_section_hint`
+  recognizes common misspellings of `[env]`/`[roles_order]` and names the
+  correct one instead of treating the typo as an ordinary unknown section.
+  Sections are kept in a `Vec<ServiceBuilder>` with a name-to-index map,
+  populated once per section (a repeat is rejected, not appended to), so
+  finalization order stays deterministic.
 - `key=value` splits on the first `=`; both sides are trimmed; a single
-  matching pair of surrounding quotes is stripped (`strip_quotes`).
-- Inside a section, `parse_service_property` interprets known keys (`image`,
-  `dockerfile`, `compose`, `run`, `role`, `command`, `port`, `port.<name>`,
-  `env.<KEY>`, `volume`, `pre-start`, `post-start`, `pre-stop`, `post-stop`,
-  `healthcheck`, `ready-timeout`, `context`, `expose.<name>`). Numeric values
-  (`port`, `ready-timeout`, named ports, expose) error on bad input.
-- An **unknown** key inside a section: if it looks like an env var name
-  (`is_env_var_name`: non-empty SCREAMING_SNAKE_CASE), the section is ended
-  and the key becomes a top-level `EnvVar` (with a `tracing::warn!`);
-  otherwise it is a hard error. This is the deliberate "trailing env vars
-  after sections" affordance that also swallows miscased property typos.
-- After the pass, each `ServiceBuilder` is finalized with
-  `ServiceBuilder::finish`, which **requires a source**. This is where the
-  "service with no source" state is rejected, keeping it out of the returned
-  `EphFile` entirely.
+  matching pair of surrounding quotes is stripped by `strip_quotes`, which
+  only strips when the pair is unambiguous (>= 2 chars, matching outer quotes,
+  no interior occurrence of that quote), so `"a" and "b"` and a bare `"` both
+  pass through unchanged.
+- In `Context::TopLevel` or `Context::Env`, every line is a top-level
+  `EnvVar`: the key must satisfy `is_valid_env_name` (`^[A-Za-z_][A-Za-z0-9_]*$`)
+  and must not repeat a name already seen in `env_lines`, a `HashMap` shared
+  across the top-of-file block and every `[env]` section so the two forms
+  share one duplicate check. Interpolation placeholders in the value are
+  validated immediately with `scan_placeholders` (see below).
+- In `Context::Service(index)`, `parse_service_property` interprets known keys
+  (`image`, `dockerfile`, `compose`, `run`, `role`, `command`, `port`,
+  `port.<name>`, `env.<KEY>`, `volume`, `pre-start`, `post-start`, `pre-stop`,
+  `post-stop`, `healthcheck`, `ready-timeout`, `context`, `expose.<name>`).
+  Single-valued properties go through `set_once` (source properties through
+  `set_source`), which rejects a second occurrence rather than overwriting;
+  hooks and `volume` push onto a `Vec` and accumulate. Most properties reject
+  an empty value up front (`env.<KEY>` is the exception). `port`/`port.<name>`
+  and `expose.<name>` are collected separately (`ServiceBuilder::ports` vs
+  `expose`) and reconciled in `finish` (below). Numeric values (`port`,
+  `ready-timeout`, named ports, expose) error on bad input; `port`/`port.<name>`
+  additionally accept the literal `auto`.
+- An **unknown** key inside a section is always a hard error listing every
+  known property (`KNOWN_PROPERTIES`). If the key also looks like an
+  environment variable name (`is_valid_env_name` and starts uppercase), the
+  error additionally suggests `env.<key>=` (container) or moving it to
+  `[env]` (shell) rather than silently reclassifying it, which is what the
+  parser did before this rewrite.
+- After the line-by-line pass, each `ServiceBuilder` is finalized with
+  `ServiceBuilder::finish`, which **requires a source** (rejecting the "no
+  source" state), rejects `port=auto`/`port.<name>=auto` on anything but a
+  `run=` service, rejects `command=` on anything but `image=`/`dockerfile=`,
+  and reconciles `ports` vs `expose` against the source (`port`/`port.<name>`
+  on a `compose=` service, or `expose.<name>` on anything else, is an error).
+- Every `${service.property}` placeholder collected by `scan_placeholders`
+  during the pass (from top-level values and `env.<KEY>` values; **not** from
+  `run=`, hook, or `healthcheck=` values, which are shell commands) is checked
+  against the final service list once the whole file has been read, so a
+  variable may reference a service defined later in the file. An unterminated
+  `${`, a placeholder with no `.` splitting it into `service` and `property`,
+  or a reference to a service that does not exist, is a parse error. A
+  literal `${` is written `$${` and is skipped by the scanner entirely.
+- Finally, `validate_roles` checks the role graph (linear or DAG form,
+  desugared into one `RolesOrder`) against the services: every service must
+  be tagged if any is, every tag must resolve, and the graph must be acyclic.
 
 **`resolve_interpolations(input, resolver) -> String`** scans for `${...}`,
-splits the content on the first `.` into `(service, property)`, and
-substitutes `resolver(service, property)`. Anything the resolver declines
-(`None`), or a placeholder with no `.`, is left verbatim. The resolver is
-supplied by the caller (`cmd_env` in `main.rs`) and reads from running
+treating `$${` as an escaped literal `${`, splits the content on the first
+`.` into `(service, property)`, and substitutes `resolver(service, property)`.
+Anything the resolver declines (`None`), or a placeholder with no `.`, is left
+verbatim; an unterminated `${` is copied through rather than repaired, since
+`parse` already guarantees a parsed file has none. The resolver is supplied by
+the caller (`cmd_env` in `main.rs` and `service::resolve_against`) and reads
+from running
 services.
 
 ## workspace

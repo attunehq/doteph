@@ -17,15 +17,26 @@
 //! env.POSTGRES_DB=app
 //! post-start=cargo sqlx migrate run
 //!
-//! # Environment variables can interpolate service properties
+//! # After the first service section, top-level variables live in an [env]
+//! # section. They can interpolate service properties.
+//! [env]
 //! DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/app
 //! ```
+//!
+//! # Where variables may appear
+//!
+//! Top-level environment variables (what `eph env` emits) are declared either
+//! above the first section or inside an `[env]` section, which may appear any
+//! number of times. A bare `KEY=VALUE` after a service section is a parse
+//! error: sections do not end at blank lines, so the parser would otherwise
+//! have to guess whether the key was a service property or a variable. The
+//! old parser guessed (any unknown `SCREAMING_SNAKE_CASE` key silently ended
+//! the section); this one refuses and tells you where the variable belongs.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context as _, Result, bail};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::warn;
 
 // ============================================================================
 // AST Types
@@ -37,7 +48,8 @@ use tracing::warn;
 /// [`Service`] definitions extracted from the file.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct EphFile {
-    /// Top-level environment variables, in declaration order.
+    /// Top-level environment variables, in declaration order. Declared above
+    /// the first section or inside `[env]` sections; both spellings land here.
     pub env_vars: Vec<EnvVar>,
     /// Service definitions, keyed by service name (the section header), kept in
     /// declaration order so start sequencing and command output are
@@ -361,6 +373,35 @@ pub struct PortMapping {
 // Parser
 // ============================================================================
 
+/// The names of every property a service section accepts, for error messages.
+const KNOWN_PROPERTIES: &str = "image, dockerfile, compose, run, role, command, port, \
+     port.<name>, expose.<name>, env.<KEY>, volume, pre-start, post-start, pre-stop, \
+     post-stop, healthcheck, ready-timeout, context";
+
+/// What the parser is currently reading: top-of-file variables, an `[env]`
+/// section, the `[roles_order]` section, or a service section.
+#[derive(Clone, Copy)]
+enum Context {
+    /// Before the first section: bare `KEY=VALUE` lines are top-level variables.
+    TopLevel,
+    /// Inside an `[env]` section: every line is a top-level variable.
+    Env,
+    /// Inside the `[roles_order]` section: every line is a `role=deps` edge.
+    RolesOrder,
+    /// Inside the service section at this index in the builders list.
+    Service(usize),
+}
+
+/// A `${service.property}` reference found while parsing, kept for validation
+/// once every section has been read (so forward references work).
+struct PlaceholderRef {
+    service: String,
+    line: usize,
+    /// Where the reference appeared, for the error message (e.g. "value of
+    /// DATABASE_URL" or "env.PORT of service 'web'").
+    context: String,
+}
+
 /// A service section while it is still being parsed.
 ///
 /// The source is optional here because a section accumulates properties line by
@@ -370,9 +411,15 @@ pub struct PortMapping {
 #[derive(Default)]
 struct ServiceBuilder {
     name: String,
+    /// The line the section header appeared on, for duplicate-section errors.
+    first_line: usize,
     role: Option<String>,
     source: Option<ServiceSource>,
     ports: Vec<PortMapping>,
+    /// Ports declared with `expose.<name>=`, kept separate from `ports` until
+    /// [`finish`](Self::finish) so the parser can enforce that `expose.` is used
+    /// with `compose=` services and `port=`/`port.<name>=` with everything else.
+    expose: Vec<PortMapping>,
     env: HashMap<String, String>,
     volumes: Vec<String>,
     pre_start: Vec<String>,
@@ -386,9 +433,10 @@ struct ServiceBuilder {
 }
 
 impl ServiceBuilder {
-    /// Finalize the section into a [`Service`], requiring a concrete source.
-    fn finish(self) -> Result<Service> {
-        let source = self.source.ok_or_else(|| {
+    /// Finalize the section into a [`Service`], requiring a concrete source and
+    /// enforcing the property/source pairings that only make sense together.
+    fn finish(mut self) -> Result<Service> {
+        let source = self.source.take().ok_or_else(|| {
             anyhow::anyhow!(
                 "service '{}' has no source defined (set one of image/dockerfile/compose/run)",
                 self.name
@@ -414,11 +462,55 @@ impl ServiceBuilder {
                 which
             );
         }
+        // `command=` overrides an image's CMD; a `run=` service's command IS its
+        // source and a compose service's command lives in the compose file, so on
+        // those a `command=` would silently do nothing. Reject it instead.
+        if self.command_override.is_some()
+            && !matches!(
+                source,
+                ServiceSource::Image(_) | ServiceSource::Dockerfile(_)
+            )
+        {
+            bail!(
+                "service '{}' sets `command=`, which only applies to image= or \
+                 dockerfile= services (a run= service's command is the run= value \
+                 itself; a compose service's command belongs in the compose file)",
+                self.name
+            );
+        }
+        // `expose.<name>=` names ports of services inside a compose project;
+        // `port=`/`port.<name>=` declare ports eph itself publishes. Each is
+        // meaningless for the other backend, so a mix-up is caught here.
+        let ports = if matches!(source, ServiceSource::Compose(_)) {
+            if let Some(p) = self.ports.first() {
+                let which = p
+                    .name
+                    .as_deref()
+                    .map_or_else(|| "port".to_string(), |n| format!("port.{n}"));
+                bail!(
+                    "compose service '{}' declares `{}`; compose services name \
+                     their ports with `expose.<name>=<container-port>` instead",
+                    self.name,
+                    which
+                );
+            }
+            self.expose
+        } else {
+            if let Some(p) = self.expose.first() {
+                bail!(
+                    "service '{}' declares `expose.{}`, which only applies to \
+                     compose= services; use `port=` or `port.<name>=` instead",
+                    self.name,
+                    p.name.as_deref().unwrap_or_default()
+                );
+            }
+            self.ports
+        };
         Ok(Service {
             name: self.name,
             role: self.role,
             source,
-            ports: self.ports,
+            ports,
             env: self.env,
             volumes: self.volumes,
             pre_start: self.pre_start,
@@ -431,24 +523,38 @@ impl ServiceBuilder {
             command_override: self.command_override,
         })
     }
+
+    /// True if a port with this name (or an unnamed port, for `None`) has
+    /// already been declared via either `port` or `expose`.
+    fn has_port_named(&self, name: Option<&str>) -> bool {
+        self.ports
+            .iter()
+            .chain(self.expose.iter())
+            .any(|p| p.name.as_deref() == name)
+    }
 }
 
 /// Parse an `.eph` file from a string into an [`EphFile`].
 ///
-/// Top-level `KEY=VALUE` lines become [`EnvVar`]s and `[name]` sections become
-/// [`Service`]s. Each returned [`Service`] is guaranteed to carry a concrete
-/// [`ServiceSource`], because a section that declares no source is rejected
-/// here rather than at runtime.
+/// Top-level `KEY=VALUE` lines (above the first section, or inside an `[env]`
+/// section) become [`EnvVar`]s and `[name]` sections become [`Service`]s. Each
+/// returned [`Service`] is guaranteed to carry a concrete [`ServiceSource`],
+/// because a section that declares no source is rejected here rather than at
+/// runtime. A leading UTF-8 byte-order mark is ignored.
 ///
 /// # Errors
 ///
 /// Returns an error if:
 /// - a line is neither a comment, a section header, nor `KEY=VALUE`
-/// - a section header is empty (`[]`)
-/// - a service property has an invalid value (e.g. a non-numeric `port`)
-/// - an unknown, non-`SCREAMING_SNAKE_CASE` property appears inside a section
-///   (a likely typo). An unknown but `SCREAMING_SNAKE_CASE` key is instead
-///   reclassified as a trailing top-level variable, with a warning.
+/// - a section name is empty, is not `[a-z][a-z0-9-]*`, or repeats an earlier
+///   section
+/// - a service property is unknown, duplicated (for single-valued properties),
+///   or has an invalid or empty value
+/// - a bare `KEY=VALUE` appears after a service section (move it into `[env]`)
+/// - a top-level variable name is not a valid environment variable name, or is
+///   declared twice
+/// - an interpolation is malformed (`${` without `}`, or not
+///   `${service.property}`) or references an unknown service
 /// - a section declares no source (no `image`/`dockerfile`/`compose`/`run`)
 ///
 /// # Examples
@@ -462,26 +568,46 @@ impl ServiceBuilder {
 /// # }
 /// ```
 ///
+/// Variables after a service section live in an `[env]` section:
+///
+/// ```
+/// # fn main() -> anyhow::Result<()> {
+/// let eph = eph::parser::parse(
+///     "[redis]\nimage=redis:7\nport=6379\n\n[env]\nREDIS_URL=redis://localhost:${redis.port}\n",
+/// )?;
+/// assert_eq!(eph.env_vars[0].name, "REDIS_URL");
+/// # Ok(())
+/// # }
+/// ```
+///
 /// A section without a source is rejected:
 ///
 /// ```
 /// assert!(eph::parser::parse("[redis]\nport=6379\n").is_err());
 /// ```
 pub fn parse(input: &str) -> Result<EphFile> {
+    // Windows editors love to prepend a UTF-8 BOM; without this it would end up
+    // glued to the first variable's name and break the emitted `export` line.
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
+
     let mut env_vars: Vec<EnvVar> = Vec::new();
+    // Top-level variable names already seen, for duplicate detection. The
+    // top-of-file block and every [env] section share one namespace.
+    let mut env_lines: HashMap<String, usize> = HashMap::new();
     // Preserve insertion order of service sections so that finalization (and
     // any error it reports) is deterministic.
     let mut builders: Vec<ServiceBuilder> = Vec::new();
     let mut index_by_name: HashMap<String, usize> = HashMap::new();
-    let mut current_service: Option<usize> = None;
+    let mut context = Context::TopLevel;
+    // Every ${service.property} reference seen, validated against the full
+    // service list after the whole file is read so forward references work.
+    let mut refs: Vec<PlaceholderRef> = Vec::new();
 
     // The role graph, accumulated from whichever form the file uses. The linear
     // `roles_order=a,b,c` key and the `[roles_order]` section are mutually
-    // exclusive; `roles_order_dag` holds the section form's adjacency list, and
-    // `in_roles_order` tracks whether we are currently inside that section.
+    // exclusive; `roles_order_dag` holds the section form's adjacency list.
     let mut roles_order_linear: Option<Vec<String>> = None;
     let mut roles_order_dag: Option<IndexMap<String, Vec<String>>> = None;
-    let mut in_roles_order = false;
 
     for (line_num, line) in input.lines().enumerate() {
         let line_num = line_num + 1; // 1-indexed
@@ -509,19 +635,49 @@ pub fn parse(input: &str) -> Result<EphFile> {
                     );
                 }
                 roles_order_dag.get_or_insert_with(IndexMap::new);
-                current_service = None;
-                in_roles_order = true;
+                context = Context::RolesOrder;
                 continue;
             }
-            in_roles_order = false;
-            let index = *index_by_name.entry(name.to_string()).or_insert_with(|| {
-                builders.push(ServiceBuilder {
-                    name: name.to_string(),
-                    ..Default::default()
-                });
-                builders.len() - 1
+            // `[env]` is a reserved section for top-level variables. It may
+            // repeat: each occurrence just switches back to variable context, so
+            // variables can be grouped near the services they describe.
+            if name == "env" {
+                context = Context::Env;
+                continue;
+            }
+            if let Some(canonical) = reserved_section_hint(name) {
+                bail!(
+                    "unknown section [{}] at line {}; did you mean [{}]?",
+                    name,
+                    line_num,
+                    canonical
+                );
+            }
+            if !is_valid_service_name(name) {
+                bail!(
+                    "invalid service name '{}' at line {}: service names are \
+                     lowercase letters, digits, and hyphens, starting with a letter \
+                     (they become container names, ${{name.property}} references, \
+                     and EPH_<NAME>_* variables)",
+                    name,
+                    line_num
+                );
+            }
+            if let Some(&existing) = index_by_name.get(name) {
+                bail!(
+                    "duplicate section [{}] at line {} (first defined at line {})",
+                    name,
+                    line_num,
+                    builders[existing].first_line
+                );
+            }
+            builders.push(ServiceBuilder {
+                name: name.to_string(),
+                first_line: line_num,
+                ..Default::default()
             });
-            current_service = Some(index);
+            index_by_name.insert(name.to_string(), builders.len() - 1);
+            context = Context::Service(builders.len() - 1);
             continue;
         }
 
@@ -536,77 +692,77 @@ pub fn parse(input: &str) -> Result<EphFile> {
         // Remove optional quotes from value
         let value = strip_quotes(value);
 
-        // Inside `[roles_order]`, every line is a `role=dep1,dep2` edge (an empty
-        // value declares a root that depends on nothing). Role names are
-        // free-form, so a key here is never reinterpreted as an env var the way a
-        // service-section key can be: declare top-level env vars outside the
-        // section (before the first section, or after the services).
-        if in_roles_order {
-            let dag = roles_order_dag
-                .as_mut()
-                .expect("dag is initialized on entering [roles_order]");
-            if dag.contains_key(key) {
-                bail!(
-                    "line {}: duplicate role '{}' in [roles_order]",
-                    line_num,
-                    key
-                );
-            }
-            dag.insert(key.to_string(), split_roles(value));
-            continue;
-        }
-
-        // A top-level `roles_order=a,b,c` is the linear shorthand for the graph.
-        // It is mutually exclusive with the `[roles_order]` section.
-        if current_service.is_none() && key == "roles_order" {
-            if roles_order_dag.is_some() {
-                bail!(
-                    "line {}: cannot use both a top-level `roles_order=` and a \
-                     [roles_order] section; pick one",
-                    line_num
-                );
-            }
-            if roles_order_linear.is_some() {
-                bail!("line {}: duplicate top-level `roles_order=`", line_num);
-            }
-            roles_order_linear = Some(split_roles_checked(value, line_num)?);
-            continue;
-        }
-
-        if let Some(index) = current_service {
-            // We're inside a service section - try to parse as service property
-            let service = &mut builders[index];
-            match parse_service_property(service, key, value, line_num) {
-                Ok(()) => continue,
-                Err(_) if is_env_var_name(key) => {
-                    // Unknown property, but the key looks like a SCREAMING_SNAKE_CASE
-                    // env var name. We intentionally end the current section here and
-                    // reclassify this key as a top-level environment variable. This
-                    // supports files that list service sections first and trailing
-                    // env vars without a blank line, but it also silently swallows
-                    // typos in service property names, so emit a warning to make the
-                    // behavior discoverable.
-                    warn!(
-                        "Key '{}' inside section [{}] at line {} is not a known service \
-                         property; it looks like an environment variable, so the section \
-                         was ended and the key was treated as a top-level variable. If you \
-                         meant a service property, check for a typo.",
-                        key, service.name, line_num
+        match context {
+            // Inside `[roles_order]`, every line is a `role=dep1,dep2` edge (an
+            // empty value declares a root that depends on nothing).
+            Context::RolesOrder => {
+                let dag = roles_order_dag
+                    .as_mut()
+                    .expect("dag is initialized on entering [roles_order]");
+                if dag.contains_key(key) {
+                    bail!(
+                        "line {}: duplicate role '{}' in [roles_order]",
+                        line_num,
+                        key
                     );
-                    current_service = None;
-                    env_vars.push(EnvVar {
-                        name: key.to_string(),
-                        value: value.to_string(),
-                    });
                 }
-                Err(e) => return Err(e),
+                dag.insert(key.to_string(), split_roles(value));
             }
-        } else {
-            // Top-level environment variable
-            env_vars.push(EnvVar {
-                name: key.to_string(),
-                value: value.to_string(),
-            });
+
+            // Top-of-file: bare variables, plus the linear `roles_order=` form.
+            Context::TopLevel if key == "roles_order" => {
+                if roles_order_dag.is_some() {
+                    bail!(
+                        "line {}: cannot use both a top-level `roles_order=` and a \
+                         [roles_order] section; pick one",
+                        line_num
+                    );
+                }
+                if roles_order_linear.is_some() {
+                    bail!("line {}: duplicate top-level `roles_order=`", line_num);
+                }
+                roles_order_linear = Some(split_roles_checked(value, line_num)?);
+            }
+
+            Context::TopLevel | Context::Env => {
+                if key == "roles_order" {
+                    // Only reachable in Context::Env thanks to the arm above.
+                    bail!(
+                        "line {}: `roles_order=` is reserved and cannot be declared \
+                         inside [env]; declare it above the first section",
+                        line_num
+                    );
+                }
+                if !is_valid_env_name(key) {
+                    bail!(
+                        "invalid environment variable name '{}' at line {}: names \
+                         are letters, digits, and underscores, not starting with a \
+                         digit (the shell rejects anything else at `eval` time)",
+                        key,
+                        line_num
+                    );
+                }
+                if let Some(first) = env_lines.get(key) {
+                    bail!(
+                        "duplicate environment variable '{}' at line {} (first \
+                         defined at line {})",
+                        key,
+                        line_num,
+                        first
+                    );
+                }
+                scan_placeholders(value, line_num, &format!("the value of {}", key), &mut refs)?;
+                env_lines.insert(key.to_string(), line_num);
+                env_vars.push(EnvVar {
+                    name: key.to_string(),
+                    value: value.to_string(),
+                });
+            }
+
+            Context::Service(index) => {
+                let service = &mut builders[index];
+                parse_service_property(service, key, value, line_num, &mut refs)?;
+            }
         }
     }
 
@@ -618,6 +774,21 @@ pub fn parse(input: &str) -> Result<EphFile> {
     for builder in builders {
         let service = builder.finish()?;
         services.insert(service.name.clone(), service);
+    }
+
+    // Every ${service.property} must name a defined service. Checked after the
+    // whole file is read so a variable may reference a service defined later.
+    for r in &refs {
+        if !services.contains_key(&r.service) {
+            bail!(
+                "unknown service '{}' referenced from {} at line {} (known \
+                 services: {})",
+                r.service,
+                r.context,
+                r.line,
+                services.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
     }
 
     // Collapse the two spellings into one graph: the linear form desugars into an
@@ -769,30 +940,118 @@ fn validate_roles(
     Ok(())
 }
 
-/// Returns `true` if `key` looks like an environment variable name, i.e. a
-/// non-empty `SCREAMING_SNAKE_CASE` identifier: only ASCII uppercase letters,
-/// digits, and `_`, starting with an uppercase letter.
+/// Returns `true` if `name` is a legal service name: lowercase ASCII letters,
+/// digits, and hyphens, starting with a letter.
 ///
-/// Used by [`parse`] to decide whether an unknown key inside a section is a
-/// trailing top-level env var (reclassified, with a warning) or a typo'd
-/// service property (a hard error).
-fn is_env_var_name(key: &str) -> bool {
-    !key.is_empty()
-        && key
-            .chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-        && key.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+/// The rule is deliberately strict because a service name leaks into several
+/// other namespaces: Docker container names, `${name.property}` interpolation
+/// (where a `.` would be split as a property separator), and `EPH_<NAME>_*`
+/// metadata variables (where uppercasing and `-` -> `_` mapping must stay
+/// collision-free; allowing both `-` and `_` would let `auth-db` and `auth_db`
+/// collide).
+fn is_valid_service_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Returns `true` if `name` is a valid environment variable name for the
+/// shells `eph env` targets: letters, digits, and underscores, not starting
+/// with a digit. Anything else would make the emitted `export NAME=...` line
+/// fail at `eval` time.
+fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// If `name` looks like a misspelling of a reserved section, the canonical
+/// name to suggest. Normalizes case and hyphens so `[Role-Order]` and
+/// `[roles-order]` both point at `[roles_order]`.
+fn reserved_section_hint(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().replace('-', "_").as_str() {
+        "roles_order" | "role_order" | "rolesorder" | "roleorder" | "roles" => Some("roles_order"),
+        "env" | "envs" | "environment" | "variables" | "vars" => Some("env"),
+        _ => None,
+    }
 }
 
 /// Strips a single matching pair of surrounding single or double quotes from
-/// `s`, returning the inner slice. A string without matching surrounding quotes
-/// (or one too short to be quoted) is returned unchanged.
+/// `s`, returning the inner slice.
+///
+/// The pair is only stripped when the result is unambiguous: the string is at
+/// least two characters, starts and ends with the same quote, and contains no
+/// further occurrence of that quote in between. A value like `"a" and "b"` is
+/// returned unchanged rather than mangled to `a" and "b`, and a bare `"` (too
+/// short to be a pair) is returned as-is.
 fn strip_quotes(s: &str) -> &str {
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-        &s[1..s.len() - 1]
-    } else {
-        s
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let q = bytes[0];
+        if (q == b'"' || q == b'\'')
+            && bytes[bytes.len() - 1] == q
+            && !s[1..s.len() - 1].contains(q as char)
+        {
+            return &s[1..s.len() - 1];
+        }
     }
+    s
+}
+
+/// Validate the `${service.property}` placeholders in `value`, recording each
+/// referenced service in `refs` for the post-parse existence check.
+///
+/// Rejects an unterminated `${` and any placeholder that is not of the
+/// two-part `service.property` form. A literal `${` can be written as `$${`;
+/// [`resolve_interpolations`] collapses that escape when the value is
+/// rendered. `context` describes where the value came from, for error
+/// messages.
+fn scan_placeholders(
+    value: &str,
+    line: usize,
+    context: &str,
+    refs: &mut Vec<PlaceholderRef>,
+) -> Result<()> {
+    let mut i = 0;
+    while i < value.len() {
+        let rest = &value[i..];
+        if rest.starts_with("$${") {
+            i += 3;
+            continue;
+        }
+        if let Some(tail) = rest.strip_prefix("${") {
+            let Some(end) = tail.find('}') else {
+                bail!(
+                    "unterminated '${{' in {} at line {}; close it with '}}', or \
+                     write a literal '${{' as '$${{'",
+                    context,
+                    line
+                );
+            };
+            let content = &tail[..end];
+            match content.split_once('.') {
+                Some((service, property)) if !service.is_empty() && !property.is_empty() => {
+                    refs.push(PlaceholderRef {
+                        service: service.to_string(),
+                        line,
+                        context: context.to_string(),
+                    });
+                }
+                _ => bail!(
+                    "invalid interpolation '${{{}}}' in {} at line {}: expected \
+                     ${{service.property}} (e.g. ${{postgres.port}}); write a \
+                     literal '${{' as '$${{'",
+                    content,
+                    context,
+                    line
+                ),
+            }
+            i += 2 + end + 1;
+            continue;
+        }
+        i += rest.chars().next().map_or(1, char::len_utf8);
+    }
+    Ok(())
 }
 
 /// Parse a port property's value into `(container_port, auto)`.
@@ -810,23 +1069,118 @@ fn parse_port_value(value: &str, line_num: usize) -> Result<(u16, bool)> {
     Ok((port, false))
 }
 
+/// Set a single-valued property, rejecting a second occurrence. The old parser
+/// silently let a later `image=`/`healthcheck=`/etc. overwrite an earlier one
+/// (while list-valued properties accumulated), which made a duplicated line a
+/// silent no-op; now it is an error.
+fn set_once<T>(
+    slot: &mut Option<T>,
+    value: T,
+    key: &str,
+    service: &str,
+    line_num: usize,
+) -> Result<()> {
+    if slot.is_some() {
+        bail!(
+            "duplicate '{}' in service '{}' at line {}; it was already set earlier \
+             in the section",
+            key,
+            service,
+            line_num
+        );
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
+/// Set a service's source, rejecting a second one whatever its spelling:
+/// `image=` twice, or `image=` plus `run=`, both leave the file's intent
+/// ambiguous.
+fn set_source(service: &mut ServiceBuilder, source: ServiceSource, line_num: usize) -> Result<()> {
+    if service.source.is_some() {
+        bail!(
+            "service '{}' declares more than one source at line {}; set exactly \
+             one of image/dockerfile/compose/run",
+            service.name,
+            line_num
+        );
+    }
+    service.source = Some(source);
+    Ok(())
+}
+
 fn parse_service_property(
     service: &mut ServiceBuilder,
     key: &str,
     value: &str,
     line_num: usize,
+    refs: &mut Vec<PlaceholderRef>,
 ) -> Result<()> {
+    // Most properties are meaningless with an empty value, and an empty value
+    // usually means a templating or editing accident, so reject it up front.
+    // `env.<KEY>=` stays legal: setting a variable to the empty string is
+    // a real thing to want.
+    let needs_value = matches!(
+        key,
+        "image"
+            | "dockerfile"
+            | "compose"
+            | "run"
+            | "role"
+            | "command"
+            | "volume"
+            | "pre-start"
+            | "post-start"
+            | "pre-stop"
+            | "post-stop"
+            | "healthcheck"
+            | "context"
+    );
+    if needs_value && value.is_empty() {
+        bail!(
+            "empty value for '{}' in service '{}' at line {}",
+            key,
+            service.name,
+            line_num
+        );
+    }
+
     match key {
-        "image" => service.source = Some(ServiceSource::Image(value.to_string())),
-        "dockerfile" => service.source = Some(ServiceSource::Dockerfile(value.to_string())),
-        "compose" => service.source = Some(ServiceSource::Compose(value.to_string())),
+        "image" => set_source(service, ServiceSource::Image(value.to_string()), line_num)?,
+        "dockerfile" => set_source(
+            service,
+            ServiceSource::Dockerfile(value.to_string()),
+            line_num,
+        )?,
+        "compose" => set_source(service, ServiceSource::Compose(value.to_string()), line_num)?,
         // Shell command to run (non-Docker)
-        "run" => service.source = Some(ServiceSource::Command(value.to_string())),
+        "run" => set_source(service, ServiceSource::Command(value.to_string()), line_num)?,
         // The role this service belongs to (see `Service::role`).
-        "role" => service.role = Some(value.to_string()),
+        "role" => {
+            let v = value.to_string();
+            let name = service.name.clone();
+            set_once(&mut service.role, v, key, &name, line_num)?;
+        }
         // Container command override (for use with image/dockerfile)
-        "command" => service.command_override = Some(value.to_string()),
+        "command" => {
+            let v = value.to_string();
+            set_once(
+                &mut service.command_override,
+                v,
+                key,
+                &service.name,
+                line_num,
+            )?;
+        }
         "port" => {
+            if service.has_port_named(None) {
+                bail!(
+                    "duplicate 'port' in service '{}' at line {}; name additional \
+                     ports with port.<name>=",
+                    service.name,
+                    line_num
+                );
+            }
             let (port, auto) = parse_port_value(value, line_num)?;
             service.ports.push(PortMapping {
                 name: None,
@@ -850,16 +1204,32 @@ fn parse_service_property(
             service.post_stop.push(value.to_string());
         }
         "healthcheck" => {
-            service.healthcheck = Some(value.to_string());
+            let v = value.to_string();
+            set_once(&mut service.healthcheck, v, key, &service.name, line_num)?;
         }
         "ready-timeout" => {
             let secs: u64 = value
                 .parse()
                 .with_context(|| format!("invalid timeout at line {}", line_num))?;
-            service.ready_timeout_secs = Some(secs);
+            set_once(
+                &mut service.ready_timeout_secs,
+                secs,
+                key,
+                &service.name,
+                line_num,
+            )?;
         }
         key if key.starts_with("port.") => {
             let port_name = &key[5..];
+            validate_port_name(port_name, "port", &service.name, line_num)?;
+            if service.has_port_named(Some(port_name)) {
+                bail!(
+                    "duplicate 'port.{}' in service '{}' at line {}",
+                    port_name,
+                    service.name,
+                    line_num
+                );
+            }
             let (port, auto) = parse_port_value(value, line_num)?;
             service.ports.push(PortMapping {
                 name: Some(port_name.to_string()),
@@ -869,15 +1239,48 @@ fn parse_service_property(
         }
         key if key.starts_with("env.") => {
             let env_name = &key[4..];
+            if !is_valid_env_name(env_name) {
+                bail!(
+                    "invalid environment variable name '{}' in 'env.{}' of service \
+                     '{}' at line {}",
+                    env_name,
+                    env_name,
+                    service.name,
+                    line_num
+                );
+            }
+            if service.env.contains_key(env_name) {
+                bail!(
+                    "duplicate 'env.{}' in service '{}' at line {}",
+                    env_name,
+                    service.name,
+                    line_num
+                );
+            }
+            scan_placeholders(
+                value,
+                line_num,
+                &format!("env.{} of service '{}'", env_name, service.name),
+                refs,
+            )?;
             service.env.insert(env_name.to_string(), value.to_string());
         }
         // For compose-based services, expose maps service ports
         key if key.starts_with("expose.") => {
             let port_name = &key[7..];
+            validate_port_name(port_name, "expose", &service.name, line_num)?;
+            if service.has_port_named(Some(port_name)) {
+                bail!(
+                    "duplicate 'expose.{}' in service '{}' at line {}",
+                    port_name,
+                    service.name,
+                    line_num
+                );
+            }
             let port: u16 = value
                 .parse()
                 .with_context(|| format!("invalid port number at line {}", line_num))?;
-            service.ports.push(PortMapping {
+            service.expose.push(PortMapping {
                 name: Some(port_name.to_string()),
                 container_port: port,
                 auto: false,
@@ -885,11 +1288,77 @@ fn parse_service_property(
         }
         // Build context for Dockerfiles
         "context" => {
-            service.build_context = Some(value.to_string());
+            let v = value.to_string();
+            set_once(&mut service.build_context, v, key, &service.name, line_num)?;
+        }
+        "roles_order" => {
+            bail!(
+                "'roles_order' at line {} must be declared at top level, above the \
+                 first section, not inside service '{}'",
+                line_num,
+                service.name
+            );
         }
         _ => {
-            bail!("unknown service property '{}' at line {}", key, line_num);
+            // The old parser reclassified an unknown SCREAMING_SNAKE_CASE key as
+            // a trailing top-level variable, silently ending the section and
+            // swallowing everything after it. That guess is gone; instead, say
+            // where each kind of thing belongs.
+            if is_valid_env_name(key) && key.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            {
+                bail!(
+                    "'{}' at line {} looks like an environment variable, but it is \
+                     inside service '{}' (sections do not end at blank lines). To \
+                     set it in the container, write env.{}=...; to export it from \
+                     `eph env`, move it into an [env] section or above the first \
+                     section",
+                    key,
+                    line_num,
+                    service.name,
+                    key
+                );
+            }
+            // A lowercase unknown key is most likely a typo'd property, but if
+            // it is also a legal variable name, mention the other reading.
+            let env_hint = if is_valid_env_name(key) {
+                "; if you meant a top-level environment variable, move it into an \
+                 [env] section"
+            } else {
+                ""
+            };
+            bail!(
+                "unknown service property '{}' at line {} (known properties: {}){}",
+                key,
+                line_num,
+                KNOWN_PROPERTIES,
+                env_hint
+            );
         }
+    }
+    Ok(())
+}
+
+/// Validate a `port.<name>`/`expose.<name>` port name: same shape as a service
+/// name (it becomes part of `${service.port.<name>}` and `EPH_<SVC>_PORT_<NAME>`),
+/// and never empty (a bare `port.=` is always an editing accident).
+fn validate_port_name(name: &str, kind: &str, service: &str, line_num: usize) -> Result<()> {
+    if name.is_empty() {
+        bail!(
+            "empty port name in '{}.' of service '{}' at line {}; write {}.<name>=<port>",
+            kind,
+            service,
+            line_num,
+            kind
+        );
+    }
+    if !is_valid_service_name(name) {
+        bail!(
+            "invalid port name '{}' in service '{}' at line {}: port names are \
+             lowercase letters, digits, and hyphens, starting with a letter",
+            name,
+            service,
+            line_num
+        );
     }
     Ok(())
 }
@@ -902,10 +1371,16 @@ fn parse_service_property(
 ///
 /// For each placeholder, `resolver` is called with the `service` and `property`
 /// parts. If it returns `Some(value)`, the placeholder is replaced; if it
-/// returns `None`, or the placeholder has no `.` separator, the original
-/// `${...}` text is left untouched so it can be surfaced unresolved. Text
-/// outside placeholders is copied verbatim. This is the resolver used to expand
-/// [`EnvVar`] values once services are running.
+/// returns `None`, the original `${...}` text is left untouched so it can be
+/// surfaced unresolved. The escape `$${` renders as a literal `${` without
+/// being treated as a placeholder. Text outside placeholders is copied
+/// verbatim. This is the resolver used to expand [`EnvVar`] values once
+/// services are running.
+///
+/// The parser guarantees every placeholder in a parsed file is well-formed
+/// (`${service.property}` with a closing brace), so the lenient handling here
+/// of malformed input (copied through verbatim) only matters for strings that
+/// did not come from [`parse`].
 ///
 /// # Examples
 ///
@@ -920,13 +1395,13 @@ fn parse_service_property(
 /// assert_eq!(out, "redis://localhost:6379");
 /// ```
 ///
-/// An unresolved reference is left intact:
+/// An unresolved reference is left intact, and `$${` escapes to a literal:
 ///
 /// ```
 /// use eph::parser::resolve_interpolations;
 ///
-/// let out = resolve_interpolations("${db.port}", |_, _| None);
-/// assert_eq!(out, "${db.port}");
+/// assert_eq!(resolve_interpolations("${db.port}", |_, _| None), "${db.port}");
+/// assert_eq!(resolve_interpolations("$${db.port}", |_, _| None), "${db.port}");
 /// ```
 #[must_use]
 pub fn resolve_interpolations<F>(input: &str, resolver: F) -> String
@@ -934,37 +1409,44 @@ where
     F: Fn(&str, &str) -> Option<String>,
 {
     let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        if c == '$' && chars.peek() == Some(&'{') {
-            chars.next(); // consume '{'
-            let mut content = String::new();
-
-            while let Some(&c) = chars.peek() {
-                if c == '}' {
-                    chars.next();
-                    break;
-                }
-                content.push(c);
-                chars.next();
-            }
-
-            if let Some((service, property)) = content.split_once('.') {
-                if let Some(value) = resolver(service, property) {
-                    result.push_str(&value);
-                } else {
-                    // Keep original if not resolved
-                    result.push_str(&format!("${{{}}}", content));
-                }
-            } else {
-                result.push_str(&format!("${{{}}}", content));
-            }
-        } else {
-            result.push(c);
+    let mut i = 0;
+    while i < input.len() {
+        let rest = &input[i..];
+        if rest.starts_with("$${") {
+            result.push_str("${");
+            i += 3;
+            continue;
         }
+        if let Some(tail) = rest.strip_prefix("${") {
+            if let Some(end) = tail.find('}') {
+                let content = &tail[..end];
+                match content.split_once('.') {
+                    Some((service, property)) => match resolver(service, property) {
+                        Some(value) => result.push_str(&value),
+                        None => {
+                            // Keep original if not resolved
+                            result.push_str("${");
+                            result.push_str(content);
+                            result.push('}');
+                        }
+                    },
+                    None => {
+                        result.push_str("${");
+                        result.push_str(content);
+                        result.push('}');
+                    }
+                }
+                i += 2 + end + 1;
+                continue;
+            }
+            // No closing brace: copy the tail verbatim rather than inventing one.
+            result.push_str(rest);
+            break;
+        }
+        let c = rest.chars().next().expect("i < input.len()");
+        result.push(c);
+        i += c.len_utf8();
     }
-
     result
 }
 
@@ -975,6 +1457,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------------
+    // Basics
+    // ------------------------------------------------------------------------
 
     #[test]
     fn test_parse_simple_env() {
@@ -1035,22 +1521,6 @@ compose=docker-compose.yml
     }
 
     #[test]
-    fn test_parse_interpolation() {
-        let input = r#"
-[postgres]
-image=postgres:16
-port=5432
-
-DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/app
-"#;
-        let result = parse(input).unwrap();
-        assert_eq!(
-            result.env_vars[0].value,
-            "postgres://dev:dev@localhost:${postgres.port}/app"
-        );
-    }
-
-    #[test]
     fn test_parse_post_start() {
         let input = r#"
 [postgres]
@@ -1089,31 +1559,140 @@ post-stop=./scripts/deregister.sh
     }
 
     #[test]
-    fn test_env_looking_key_in_section_ends_section() {
-        // A SCREAMING_SNAKE_CASE key that is not a known service property is
-        // intentionally and deterministically reclassified as a top-level env
-        // var, ending the current section. (A tracing::warn! is emitted to make
-        // this discoverable, but behavior is unchanged.)
+    fn a_utf8_bom_is_ignored() {
+        // Windows editors prepend a BOM; it must not end up in the first
+        // variable's name (where it would break the emitted `export` line).
+        let result = parse("\u{feff}APP=one\nB=two\n").unwrap();
+        assert_eq!(result.env_vars[0].name, "APP");
+        assert_eq!(result.env_vars[1].name, "B");
+    }
+
+    // ------------------------------------------------------------------------
+    // The [env] section and variable placement
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn env_section_declares_trailing_variables() {
         let input = r#"
 [postgres]
 image=postgres:16
 port=5432
-DATABASE_URL=postgres://localhost/app
-LOG_LEVEL=debug
+
+[env]
+DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/app
 "#;
         let result = parse(input).unwrap();
-
-        // The service only captured the known properties before the env-looking key.
-        let pg = result.services.get("postgres").unwrap();
-        assert!(matches!(&pg.source, ServiceSource::Image(img) if img == "postgres:16"));
-        assert_eq!(pg.ports.len(), 1);
-        assert!(!pg.env.contains_key("DATABASE_URL"));
-
-        // The env-looking keys ended the section and became top-level vars.
-        let names: Vec<&str> = result.env_vars.iter().map(|v| v.name.as_str()).collect();
-        assert_eq!(names, vec!["DATABASE_URL", "LOG_LEVEL"]);
-        assert_eq!(result.env_vars[0].value, "postgres://localhost/app");
+        assert_eq!(result.env_vars.len(), 1);
+        assert_eq!(result.env_vars[0].name, "DATABASE_URL");
+        // Interpolation placeholders are stored verbatim; resolution is later.
+        assert_eq!(
+            result.env_vars[0].value,
+            "postgres://dev:dev@localhost:${postgres.port}/app"
+        );
     }
+
+    #[test]
+    fn env_section_may_repeat_and_order_is_preserved() {
+        let input = r#"
+FIRST=1
+
+[redis]
+image=redis:7
+port=6379
+
+[env]
+SECOND=redis://localhost:${redis.port}
+
+[web]
+run=serve
+port=auto
+
+[env]
+THIRD=3
+"#;
+        let result = parse(input).unwrap();
+        let names: Vec<&str> = result.env_vars.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["FIRST", "SECOND", "THIRD"]);
+    }
+
+    #[test]
+    fn bare_variable_after_a_section_is_rejected_with_guidance() {
+        // The old parser silently ended the section here (and silently
+        // reinterpreted every following line). Now it is a hard error that
+        // says where the variable belongs.
+        let input = "[postgres]\nimage=postgres:16\n\nDATABASE_URL=postgres://x\n";
+        let err = parse(input).expect_err("bare trailing variable must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("DATABASE_URL"), "got: {msg}");
+        assert!(msg.contains("[env]"), "got: {msg}");
+        assert!(msg.contains("env.DATABASE_URL"), "got: {msg}");
+    }
+
+    #[test]
+    fn misspelled_env_property_inside_section_is_rejected() {
+        // The classic trap: POSTGRES_PASSWORD instead of env.POSTGRES_PASSWORD.
+        // The old parser silently made it a shell variable and detached the rest
+        // of the section; now the error names both possible intents.
+        let input = "[postgres]\nimage=postgres:16\nPOSTGRES_PASSWORD=dev\nport=5432\n";
+        let err = parse(input).expect_err("uppercase key inside a section must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("env.POSTGRES_PASSWORD"), "got: {msg}");
+        assert!(msg.contains("[env]"), "got: {msg}");
+    }
+
+    #[test]
+    fn unknown_lowercase_key_in_section_lists_known_properties() {
+        let input = "[postgres]\nimage=postgres:16\nprot=5432\n";
+        let err = parse(input).expect_err("typo'd property must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown service property 'prot'"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("healthcheck"), "got: {msg}");
+    }
+
+    #[test]
+    fn duplicate_top_level_variable_is_rejected() {
+        let err = parse("FOO=first\nFOO=second\n").expect_err("duplicate var must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate environment variable 'FOO'"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn duplicate_across_top_level_and_env_section_is_rejected() {
+        // The top-of-file block and [env] sections share one namespace.
+        let input = "FOO=first\n\n[web]\nrun=serve\n\n[env]\nFOO=second\n";
+        assert!(parse(input).is_err());
+    }
+
+    #[test]
+    fn invalid_variable_name_is_rejected() {
+        // `export 1BAD=x` would fail at eval time; catch it at parse time.
+        let err = parse("1BAD=x\n").expect_err("invalid identifier must be rejected");
+        assert!(err.to_string().contains("1BAD"), "got: {err}");
+    }
+
+    #[test]
+    fn lowercase_variable_names_are_allowed_at_top_level() {
+        // Names only need to be shell-legal; case is the author's business.
+        let result = parse("flask_debug=1\n").unwrap();
+        assert_eq!(result.env_vars[0].name, "flask_debug");
+    }
+
+    #[test]
+    fn roles_order_inside_env_section_is_rejected() {
+        let input = "[db]\nimage=postgres:16\nrole=dep\n\n[env]\nroles_order=dep\n";
+        let err = parse(input).expect_err("roles_order inside [env] must be rejected");
+        assert!(err.to_string().contains("reserved"), "got: {err}");
+    }
+
+    // ------------------------------------------------------------------------
+    // Section names and duplicates
+    // ------------------------------------------------------------------------
 
     #[test]
     fn test_section_without_source_is_rejected_at_parse_time() {
@@ -1141,16 +1720,112 @@ env.POSTGRES_USER=dev
     }
 
     #[test]
-    fn test_unknown_non_env_key_in_section_errors() {
-        // A non-env-looking unknown property is still a hard error (not silently
-        // reclassified), so genuine typos in lowercase keys are caught.
-        let input = r#"
-[postgres]
-image=postgres:16
-prot=5432
-"#;
-        assert!(parse(input).is_err());
+    fn duplicate_section_is_rejected() {
+        // The old parser silently merged reopened sections (with later scalar
+        // keys overwriting earlier ones, so [db] could end up running mysql
+        // with postgres's port). Now a reopened section is an error.
+        let input = "[db]\nimage=postgres:16\nport=5432\n\n[db]\nimage=mysql:8\n";
+        let err = parse(input).expect_err("duplicate section must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate section [db]"), "got: {msg}");
+        assert!(msg.contains("first defined at line 1"), "got: {msg}");
     }
+
+    #[test]
+    fn invalid_service_names_are_rejected() {
+        // Names leak into container names, ${name.prop} interpolation (dots
+        // would split wrong), and EPH_<NAME>_* variables (where `-` and `_`
+        // must not collide), so the character set is strict.
+        for name in ["My-Service", "my db", "db.primary", "auth_db", "-db", "1db"] {
+            let input = format!("[{name}]\nimage=busybox\n");
+            assert!(parse(&input).is_err(), "[{name}] must be rejected");
+        }
+    }
+
+    #[test]
+    fn misspelled_reserved_sections_get_a_hint() {
+        let err = parse("[db]\nimage=postgres:16\nrole=dep\n[role_order]\ndep=\n")
+            .expect_err("[role_order] must be rejected");
+        assert!(err.to_string().contains("[roles_order]"), "got: {err}");
+
+        let err = parse("[web]\nrun=serve\n[vars]\nFOO=1\n").expect_err("[vars] must be rejected");
+        assert!(err.to_string().contains("[env]"), "got: {err}");
+    }
+
+    // ------------------------------------------------------------------------
+    // Property values and duplicates
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn duplicate_source_is_rejected_even_across_spellings() {
+        assert!(parse("[db]\nimage=postgres:16\nimage=mysql:8\n").is_err());
+        let err = parse("[db]\nimage=postgres:16\nrun=serve\n")
+            .expect_err("two sources must be rejected");
+        assert!(
+            err.to_string().contains("more than one source"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_scalar_properties_are_rejected() {
+        assert!(parse("[db]\nimage=postgres:16\nhealthcheck=a\nhealthcheck=b\n").is_err());
+        assert!(parse("[db]\nimage=postgres:16\nready-timeout=5\nready-timeout=9\n").is_err());
+        assert!(parse("[db]\nimage=postgres:16\ncommand=a\ncommand=b\n").is_err());
+    }
+
+    #[test]
+    fn duplicate_ports_and_env_keys_are_rejected() {
+        assert!(parse("[web]\nrun=serve\nport=3000\nport=4000\n").is_err());
+        assert!(parse("[web]\nrun=serve\nport.api=3000\nport.api=4000\n").is_err());
+        assert!(parse("[db]\nimage=postgres:16\nenv.X=1\nenv.X=2\n").is_err());
+    }
+
+    #[test]
+    fn empty_values_are_rejected_for_most_properties() {
+        assert!(parse("[db]\nimage=\n").is_err());
+        assert!(parse("[db]\nimage=postgres:16\nhealthcheck=\n").is_err());
+        assert!(parse("[db]\nimage=postgres:16\nvolume=\n").is_err());
+        assert!(parse("[db]\nimage=postgres:16\npost-start=\n").is_err());
+        // Setting a container variable to the empty string stays legal.
+        let eph = parse("[db]\nimage=postgres:16\nenv.EMPTY=\n").unwrap();
+        assert_eq!(eph.services["db"].env.get("EMPTY"), Some(&String::new()));
+    }
+
+    #[test]
+    fn empty_and_invalid_dotted_names_are_rejected() {
+        assert!(parse("[web]\nrun=serve\nport.=8080\n").is_err());
+        assert!(parse("[web]\nrun=serve\nenv.=x\n").is_err());
+        assert!(parse("[web]\nrun=serve\nport.API=8080\n").is_err());
+        assert!(parse("[web]\nrun=serve\nenv.1BAD=x\n").is_err());
+        assert!(parse("[stack]\ncompose=dc.yml\nexpose.=9000\n").is_err());
+    }
+
+    #[test]
+    fn command_is_only_legal_for_image_and_dockerfile_services() {
+        // On run=/compose= services a command= was silently ignored; now it
+        // is rejected where it can do nothing.
+        assert!(parse("[m]\nimage=minio/minio\ncommand=server /data\n").is_ok());
+        let err = parse("[w]\nrun=serve\ncommand=other\n").expect_err("command on run=");
+        assert!(err.to_string().contains("command"), "got: {err}");
+        assert!(parse("[s]\ncompose=dc.yml\ncommand=other\n").is_err());
+    }
+
+    #[test]
+    fn expose_and_port_are_tied_to_their_backends() {
+        // expose.<name>= names compose-project ports; port= is for services eph
+        // publishes itself. Each is rejected on the other backend.
+        assert!(parse("[stack]\ncompose=dc.yml\nexpose.api=9000\n").is_ok());
+        let err =
+            parse("[db]\nimage=postgres:16\nexpose.api=9000\n").expect_err("expose on image=");
+        assert!(err.to_string().contains("compose"), "got: {err}");
+        let err = parse("[stack]\ncompose=dc.yml\nport=9000\n").expect_err("port on compose=");
+        assert!(err.to_string().contains("expose"), "got: {err}");
+    }
+
+    // ------------------------------------------------------------------------
+    // Ports
+    // ------------------------------------------------------------------------
 
     #[test]
     fn test_parse_auto_port_for_run_service() {
@@ -1211,6 +1886,10 @@ port.api=5000
         assert!(parse("[web]\nrun=serve\nport=nope\n").is_err());
     }
 
+    // ------------------------------------------------------------------------
+    // Interpolation
+    // ------------------------------------------------------------------------
+
     #[test]
     fn test_resolve_interpolations() {
         let input = "postgres://localhost:${postgres.port}/db";
@@ -1226,28 +1905,91 @@ port.api=5000
 
     #[test]
     fn resolve_interpolations_passes_through_unresolved_reference() {
-        // Arrange: a well-formed `${service.property}` reference whose resolver
-        // always declines to resolve it.
+        // A well-formed reference whose resolver declines stays verbatim, so the
+        // unresolved reference is visible downstream.
         let input = "redis://localhost:${redis.port}/0";
-
-        // Act
         let result = resolve_interpolations(input, |_service, _property| None);
-
-        // Assert: the original placeholder is preserved verbatim, surrounding
-        // text included, so the unresolved reference stays visible downstream.
         assert_eq!(result, "redis://localhost:${redis.port}/0");
     }
 
     #[test]
+    fn resolve_interpolations_honors_the_escape() {
+        let result = resolve_interpolations("cost: $${redis.port}", |_s, _p| {
+            Some("should not be used".to_string())
+        });
+        assert_eq!(result, "cost: ${redis.port}");
+    }
+
+    #[test]
+    fn resolve_interpolations_copies_an_unterminated_placeholder_verbatim() {
+        // The old implementation invented a closing brace; the tail must now
+        // pass through untouched. (parse() rejects this shape anyway; this
+        // matters for strings that did not come from the parser.)
+        let result = resolve_interpolations("x ${db.port", |_s, _p| Some("5432".to_string()));
+        assert_eq!(result, "x ${db.port");
+    }
+
+    #[test]
+    fn unterminated_placeholder_is_a_parse_error() {
+        let input = "[db]\nimage=postgres:16\n\n[env]\nURL=postgres://x:${db.port\n";
+        let err = parse(input).expect_err("unterminated ${ must be rejected");
+        assert!(err.to_string().contains("unterminated"), "got: {err}");
+    }
+
+    #[test]
+    fn dotless_placeholder_is_a_parse_error_with_escape_hint() {
+        let input = "[env]\nGREETING=${name}\n";
+        let err = parse(input).expect_err("dotless ${} must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("service.property"), "got: {msg}");
+        assert!(msg.contains("$${"), "got: {msg}");
+    }
+
+    #[test]
+    fn escaped_placeholder_parses_and_needs_no_service() {
+        // $${ is a literal; it must not be validated as a reference.
+        let eph = parse("TEMPLATE=$${not.a.service}\n").unwrap();
+        assert_eq!(eph.env_vars[0].value, "$${not.a.service}");
+    }
+
+    #[test]
+    fn unknown_service_reference_is_a_parse_error() {
+        let input = "[db]\nimage=postgres:16\n\n[env]\nURL=${bd.port}\n";
+        let err = parse(input).expect_err("unknown service reference must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown service 'bd'"), "got: {msg}");
+        assert!(msg.contains("db"), "got: {msg}");
+    }
+
+    #[test]
+    fn forward_reference_to_a_later_service_is_fine() {
+        let input = "URL=${db.port}\n\n[db]\nimage=postgres:16\nport=5432\n";
+        assert!(parse(input).is_ok());
+    }
+
+    #[test]
+    fn service_env_references_are_validated_too() {
+        let input = "[web]\nrun=serve\nport=auto\nenv.PORT=${wbe.port}\n";
+        let err = parse(input).expect_err("unknown service in env.* must be rejected");
+        assert!(err.to_string().contains("wbe"), "got: {err}");
+    }
+
+    #[test]
+    fn hook_and_run_values_are_not_scanned_for_placeholders() {
+        // run=, hooks, and healthchecks are shell commands where ${VAR} is the
+        // shell's own parameter expansion; eph must leave them alone.
+        let input =
+            "[web]\nrun=echo ${PORT}\nhealthcheck=test -n ${HOME}\npost-start=echo ${undefined}\n";
+        assert!(parse(input).is_ok());
+    }
+
+    // ------------------------------------------------------------------------
+    // Quotes
+    // ------------------------------------------------------------------------
+
+    #[test]
     fn strip_quotes_removes_matching_double_quotes() {
-        // Arrange
-        let input = "\"hello\"";
-
-        // Act
-        let result = strip_quotes(input);
-
-        // Assert
-        assert_eq!(result, "hello");
+        assert_eq!(strip_quotes("\"hello\""), "hello");
     }
 
     #[test]
@@ -1268,22 +2010,47 @@ port.api=5000
     }
 
     #[test]
-    fn is_env_var_name_accepts_screaming_snake_case() {
-        // Arrange / Act / Assert
-        assert!(is_env_var_name("DATABASE_URL"));
-        assert!(is_env_var_name("LOG_LEVEL_2"));
-        assert!(is_env_var_name("A"));
+    fn strip_quotes_does_not_mangle_interior_quotes() {
+        // `"a" and "b"` used to become `a" and "b`; if the outer pair is not
+        // unambiguous the value passes through whole.
+        assert_eq!(strip_quotes("\"a\" and \"b\""), "\"a\" and \"b\"");
+        assert_eq!(strip_quotes("\"it's\""), "it's");
     }
 
     #[test]
-    fn is_env_var_name_rejects_non_env_keys() {
-        // Empty, lowercase, leading digit, and dotted property keys are not
-        // env-var names, so unknown such keys stay hard parse errors.
-        assert!(!is_env_var_name(""));
-        assert!(!is_env_var_name("port"));
-        assert!(!is_env_var_name("post-start"));
-        assert!(!is_env_var_name("2FOO"));
-        assert!(!is_env_var_name("env.FOO"));
+    fn strip_quotes_survives_a_single_quote_character() {
+        // A value that is exactly one quote character used to panic the parser.
+        assert_eq!(strip_quotes("\""), "\"");
+        assert_eq!(strip_quotes("'"), "'");
+        let eph = parse("FOO=\"\n").unwrap();
+        assert_eq!(eph.env_vars[0].value, "\"");
+    }
+
+    // ------------------------------------------------------------------------
+    // Name helpers
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn service_name_rules() {
+        assert!(is_valid_service_name("db"));
+        assert!(is_valid_service_name("auth-db2"));
+        assert!(!is_valid_service_name(""));
+        assert!(!is_valid_service_name("Db"));
+        assert!(!is_valid_service_name("auth_db"));
+        assert!(!is_valid_service_name("2db"));
+        assert!(!is_valid_service_name("-db"));
+        assert!(!is_valid_service_name("a.b"));
+    }
+
+    #[test]
+    fn env_name_rules() {
+        assert!(is_valid_env_name("DATABASE_URL"));
+        assert!(is_valid_env_name("_private"));
+        assert!(is_valid_env_name("flask_debug"));
+        assert!(!is_valid_env_name(""));
+        assert!(!is_valid_env_name("1BAD"));
+        assert!(!is_valid_env_name("foo-bar"));
+        assert!(!is_valid_env_name("a.b"));
     }
 
     // ========================================================================
@@ -1473,9 +2240,16 @@ port.api=5000
     }
 
     #[test]
+    fn duplicate_role_property_in_a_service_is_rejected() {
+        let input = "roles_order=dep\n\n[db]\nimage=postgres:16\nrole=dep\nrole=dep\n";
+        let err = parse(input).expect_err("a duplicate role= line must be rejected");
+        assert!(err.to_string().contains("duplicate 'role'"), "got: {err}");
+    }
+
+    #[test]
     fn role_names_are_free_form_including_uppercase() {
         // Role names are not restricted to any case: an uppercase role works in
-        // both the section and linear forms, and is never mistaken for an env var.
+        // both the section and linear forms.
         let eph = parse("[db]\nimage=postgres:16\nrole=DEP\n\n[roles_order]\nDEP=\n").unwrap();
         assert_eq!(eph.services["db"].role.as_deref(), Some("DEP"));
         assert!(eph.roles_order.as_ref().unwrap().deps.contains_key("DEP"));

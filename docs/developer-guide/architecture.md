@@ -111,10 +111,16 @@ The `.eph` format was designed to be:
 | HCL | Learning curve, overkill |
 
 The trade-off is a small custom parser (see [Internals](internals.md#parser))
-and a couple of sharp edges documented for users: comments must be on their
-own line, and an unknown `SCREAMING_SNAKE_CASE` key inside a section is
-reclassified as a trailing top-level variable (with a warning) rather than an
-error.
+and one sharp edge documented for users: comments must be on their own line,
+since there is no inline-comment stripping. The parser favors hard errors over
+guessing: an unknown key inside a section, a duplicated section or property, an
+invalid service or variable name, and a malformed interpolation are all
+rejected at parse time rather than silently reinterpreted or overwritten. A
+top-level variable placed directly after a service section is the sharpest
+case of this: sections do not end at blank lines, so it is rejected rather
+than treated as ending the section, and the error names the two places a
+variable can legally go (above the first section, or inside a reserved
+`[env]` section).
 
 ## Service types
 

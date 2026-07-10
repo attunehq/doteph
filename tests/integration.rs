@@ -221,6 +221,7 @@ port=5432
 env.POSTGRES_USER=dev
 env.POSTGRES_DB=test
 
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/test
 "#,
         &["postgres"],
@@ -303,6 +304,7 @@ async fn service_redis_starts_and_stops() {
 image=redis:7-alpine
 port=6379
 
+[env]
 REDIS_URL=redis://localhost:${redis.port}
 "#,
     );
@@ -349,6 +351,7 @@ env.POSTGRES_USER=testuser
 env.POSTGRES_PASSWORD=testpass
 env.POSTGRES_DB=testdb
 
+[env]
 DATABASE_URL=postgres://testuser:testpass@localhost:${postgres.port}/testdb
 "#,
     );
@@ -385,6 +388,7 @@ image=redis:7-alpine
 port.primary=6379
 port.secondary=6380
 
+[env]
 PRIMARY_URL=redis://localhost:${multi.port.primary}
 SECONDARY_URL=redis://localhost:${multi.port.secondary}
 "#,
@@ -592,6 +596,7 @@ port=6379
 run={}
 pre-start={}
 
+[env]
 REDIS_URL=redis://localhost:${{redis.port}}
 "#,
         run_append_and_wait("app", "order"),
@@ -689,6 +694,7 @@ image=redis:7-alpine
 port=6379
 post-start={}
 
+[env]
 REDIS_URL=redis://localhost:${{redis.port}}
 "#,
         hook_touch_marker()
@@ -718,6 +724,7 @@ image=redis:7-alpine
 port=6379
 post-start={}
 
+[env]
 REDIS_URL=redis://localhost:${{redis.port}}
 "#,
         hook_write_env_lines()
@@ -766,6 +773,7 @@ image=redis:7-alpine
 port=6379
 post-start={}
 
+[env]
 REDIS_URL=redis://localhost:${{redis.port}}
 "#,
         hook_write_redis_url("worker-saw")
@@ -946,14 +954,14 @@ async fn pre_stop_skipped_for_non_running_service() {
 image=redis:7-alpine
 port=6379
 
-[never_started]
+[never-started]
 image=redis:7-alpine
 port=6379
 pre-stop=exit 1
 "#,
     );
 
-    // Bring up only redis; `never_started` stays down with its failing hook.
+    // Bring up only redis; `never-started` stays down with its failing hook.
     ws.eph_ok(&["up", "redis"]).await;
     sleep(Duration::from_secs(1)).await;
 
@@ -1024,6 +1032,7 @@ image=redis:7-alpine
 port=6379
 pre-stop={}
 
+[env]
 REDIS_URL=redis://localhost:${{redis.port}}
 "#,
         hook_write_redis_url("pre-stop-env")
@@ -1091,6 +1100,7 @@ image=redis:7-alpine
 port=6379
 post-stop={}
 
+[env]
 REDIS_URL=redis://localhost:${{redis.port}}
 "#,
         hook_write_redis_url("post-stop-env")
@@ -1188,7 +1198,7 @@ async fn post_stop_skipped_for_non_running_service() {
 image=redis:7-alpine
 port=6379
 
-[never_started]
+[never-started]
 image=redis:7-alpine
 port=6379
 post-stop=exit 1
@@ -1220,6 +1230,7 @@ async fn eph_run_injects_resolved_env() {
 image=redis:7-alpine
 port=6379
 
+[env]
 REDIS_URL=redis://localhost:${redis.port}
 "#,
     );
@@ -1328,6 +1339,7 @@ env.POSTGRES_DB=test
 healthcheck=pg_isready -U test
 ready-timeout=30
 
+[env]
 DATABASE_URL=postgres://test:test@localhost:${postgres.port}/test
 "#,
     );
@@ -1434,6 +1446,7 @@ run=echo "BOUND_PORT=$PORT" && sleep 300
 port=auto
 env.PORT=${web.port}
 
+[env]
 APP_URL=http://localhost:${web.port}
 "#,
     );
@@ -1493,6 +1506,7 @@ async fn run_service_auto_port_is_stable_across_restart() {
 run=sleep 300
 port=auto
 
+[env]
 APP_URL=http://localhost:${web.port}
 "#,
     );
