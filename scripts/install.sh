@@ -13,6 +13,15 @@ set -euo pipefail
 #   -b, --bin-dir    Specify the installation directory (default: $HOME/.local/bin)
 #   -t, --tmp-dir    Specify the temporary directory (default: system temp directory)
 #   -h, --help       Show help message
+#
+# Environment overrides (the same ones eph's own `eph update` self-updater
+# honors, so a fork and a script-installed user converge on the same bits):
+#   EPH_REPO         GitHub owner/repo to install from (default: attunehq/doteph)
+#   EPH_BASE_URL     Overrides the download base entirely, replacing
+#                    https://github.com/<repo>/releases/download/<tag>. No tag
+#                    directory is appended after it: point it at wherever the
+#                    archive and checksums.txt already live (a mirror, or a
+#                    local test server).
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -20,9 +29,9 @@ YELLOW='\033[0;33m'
 NC='\033[0m' # No Color
 
 # GitHub repository configuration
-REPO="attunehq/doteph"
+REPO="${EPH_REPO:-attunehq/doteph}"
 GITHUB_API="https://api.github.com/repos/${REPO}/releases"
-GITHUB_DOWNLOAD="https://github.com/${REPO}/releases/download"
+GITHUB_DOWNLOAD_DEFAULT="https://github.com/${REPO}/releases/download"
 
 # Fail with an error message
 fail() {
@@ -208,8 +217,18 @@ install_binary() {
 
   version="${version#v}"
   local tag="v${version}"
-  local download_url="${GITHUB_DOWNLOAD}/${tag}/${archive_name}"
-  local checksums_url="${GITHUB_DOWNLOAD}/${tag}/checksums.txt"
+  # EPH_BASE_URL, when set, replaces the tag-scoped GitHub download URL
+  # entirely (no tag directory appended), mirroring `Updater::download_base`
+  # in src/update.rs so a script install and `eph update` agree on where an
+  # overridden base points.
+  local download_base
+  if [[ -n "${EPH_BASE_URL:-}" ]]; then
+    download_base="${EPH_BASE_URL%/}"
+  else
+    download_base="${GITHUB_DOWNLOAD_DEFAULT}/${tag}"
+  fi
+  local download_url="${download_base}/${archive_name}"
+  local checksums_url="${download_base}/checksums.txt"
 
   # Create temporary directory
   local workdir="$tmp_dir/eph-install-$$"

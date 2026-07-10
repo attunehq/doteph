@@ -42,6 +42,14 @@ healthcheck=pg_isready -U dev
 to loopback, applies your `env.*` and `volume=` settings, and waits for the
 `healthcheck`.
 
+An `env.<KEY>=` value can reference another service with
+`${service.property}`, resolved against whichever services are already
+running at the moment this container is created, the same interpolation as a
+top-level `[env]` variable. See
+[Interpolation](eph-file.md#interpolation) for the full contract, including
+why the resolved value (a host-facing `localhost:PORT`) usually is not the
+right address for one container to reach another.
+
 Use `command=` to override the image's default command:
 
 ```ini
@@ -97,7 +105,12 @@ expose.zookeeper=2181
 - `expose.<name>=<container_port>` makes a port available for interpolation as
   `${kafka.port.kafka}` and so on. `eph` asks `docker compose port` for the
   real mapped host port and falls back to the declared value if Compose does
-  not report one.
+  not report one (with a warning, since the declared port is usually not the
+  actual mapped one).
+- `env.<KEY>=`, with `${service.property}` references resolved against
+  running services first, is exported into the process environment `docker
+  compose up` and `docker compose down` themselves run with, so your compose
+  file's own `${VAR}` substitution can read it.
 - Compose services are tracked by `eph status` and `eph env`. Compose names its
   own containers, so `eph` finds the project by its
   `com.docker.compose.project` label rather than by container name.
@@ -108,7 +121,7 @@ expose.zookeeper=2181
 ### How compose services differ
 
 Compose support is intentionally thin: `eph` shells out to `docker compose`
-and lets it own the container lifecycle. Two differences from the other
+and lets it own the container lifecycle. Three differences from the other
 sources are worth knowing:
 
 - **Teardown is coarser.** Both `eph down` and `eph down --rm` run
@@ -118,6 +131,10 @@ sources are worth knowing:
   the named volumes you declare with `volume=` in the `.eph` file. Volumes
   defined inside the Compose file belong to `docker compose`; run
   `docker compose ... down -v` yourself if you need to drop them.
+- **A failed `docker compose down` is a real error.** If the compose file is
+  broken or the `docker compose` plugin is missing, `eph down` and
+  `eph clean` stop and report it rather than treating it as success; fix the
+  underlying problem and re-run.
 
 ## `run=`: a process instead of a container
 

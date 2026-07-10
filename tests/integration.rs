@@ -66,6 +66,33 @@ fn hook_success() -> &'static str {
     "ver >NUL"
 }
 
+/// A hook that sleeps for roughly `secs` seconds, used to widen a lock-holding
+/// window so a concurrency test's overlap is deterministic rather than a race
+/// against process scheduling.
+#[cfg(unix)]
+fn hook_sleep(secs: u32) -> String {
+    format!("sleep {secs}")
+}
+
+#[cfg(windows)]
+fn hook_sleep(secs: u32) -> String {
+    // `ping -n N` waits roughly N-1 seconds between its N echo requests, since
+    // there is no bundled `sleep` on Windows.
+    format!("ping -n {} 127.0.0.1 >NUL", secs + 1)
+}
+
+/// A hook that writes the resolved value of env var `name` to `file`, so a test
+/// can compare what a lifecycle hook saw against what `eph env` resolves.
+#[cfg(unix)]
+fn hook_write_var(name: &str, file: &str) -> String {
+    format!(r#"printf '%s' "${name}" > {file}"#)
+}
+
+#[cfg(windows)]
+fn hook_write_var(name: &str, file: &str) -> String {
+    format!("echo %{name}%> {file}")
+}
+
 /// A hook that creates the named marker file (its existence is the signal).
 #[cfg(unix)]
 fn hook_touch(file: &str) -> String {
@@ -123,6 +150,30 @@ fn exit_7_command() -> Vec<&'static str> {
 #[cfg(windows)]
 fn exit_7_command() -> Vec<&'static str> {
     vec!["run", "cmd", "/C", "exit /B 7"]
+}
+
+/// An `eph run` invocation whose command echoes back every argument it was
+/// given, including several flag-shaped ones (`-v`, `-h`, `-V`, `--weird`).
+/// Used to prove those tokens reached the command untouched rather than being
+/// intercepted by eph's own flag parsing.
+#[cfg(unix)]
+fn echo_flags_command() -> Vec<&'static str> {
+    vec![
+        "run",
+        "sh",
+        "-c",
+        "echo \"$@\"",
+        "_",
+        "-v",
+        "-h",
+        "-V",
+        "--weird",
+    ]
+}
+
+#[cfg(windows)]
+fn echo_flags_command() -> Vec<&'static str> {
+    vec!["run", "cmd", "/C", "echo", "-v", "-h", "-V", "--weird"]
 }
 
 // ============================================================================
@@ -1366,6 +1417,391 @@ DATABASE_URL=postgres://test:test@localhost:${postgres.port}/test
 }
 
 // ============================================================================
+// Lifecycle Correctness Tests
+// ============================================================================
+
+/// Read the `Container prefix:` and `State directory:` lines out of `eph info`,
+/// used throughout this section to locate a workspace's containers and
+/// `state.json` without hardcoding eph's platform-specific data directory.
+async fn container_prefix_and_state_dir(ws: &TestWorkspace) -> (String, std::path::PathBuf) {
+    let info = ws.eph_ok(&["info"]).await;
+    let prefix = info
+        .lines()
+        .find_map(|l| l.strip_prefix("Container prefix: "))
+        .expect("info should print the container prefix")
+        .trim()
+        .to_string();
+    let state_dir = info
+        .lines()
+        .find_map(|l| l.strip_prefix("State directory: "))
+        .expect("info should print the state directory")
+        .trim();
+    (prefix, std::path::PathBuf::from(state_dir))
+}
+
+/// Renaming (or deleting) a running service's section leaves its container
+/// recorded in state under the old name. `eph down` must still find and stop
+/// it via `stop_orphan`, and drop it from `state.json`, rather than leaking it
+/// forever because it no longer appears in the `.eph` file.
+#[tokio::test]
+async fn down_stops_container_orphaned_by_a_service_rename() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let (prefix, state_dir) = container_prefix_and_state_dir(&ws).await;
+    let state_path = state_dir.join("state.json");
+    let old_container = format!("{prefix}-redis");
+
+    assert_eq!(
+        common::docker_container_names(&old_container).await,
+        vec![old_container.clone()],
+        "redis container should exist right after up"
+    );
+    let before = std::fs::read_to_string(&state_path).expect("state.json should exist after up");
+    assert!(
+        before.contains("redis"),
+        "state.json should record redis: {before}"
+    );
+
+    // Rename the section: "redis" no longer appears in the .eph file, but its
+    // container is still recorded under the old name.
+    ws.write_file(
+        ".eph",
+        r#"
+[cache]
+image=redis:7-alpine
+port=6379
+"#,
+    );
+
+    // `--rm` so the orphan is fully removed, not merely stopped: `stop_orphan`
+    // is never reached again for this name (it is gone from the .eph file), so
+    // a stopped-but-present container here would be permanently unmanaged.
+    ws.eph_ok(&["down", "--rm"]).await;
+
+    assert!(
+        common::docker_container_names(&old_container)
+            .await
+            .is_empty(),
+        "the renamed-away container should have been stopped and removed by down"
+    );
+    let after = std::fs::read_to_string(&state_path).expect("state.json should still exist");
+    assert!(
+        !after.contains("redis"),
+        "state.json should no longer record the orphaned 'redis' entry: {after}"
+    );
+}
+
+/// `eph clean` on a workspace whose services were never started must report
+/// zero resources removed, not a count derived from the services the `.eph`
+/// file declares.
+#[tokio::test]
+async fn clean_reports_zero_for_never_started_services() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+
+[cache]
+image=redis:7-alpine
+port=6379
+"#,
+    );
+
+    let output = ws.eph_ok(&["clean"]).await;
+    assert!(
+        output.contains("Services stopped and removed: 0"),
+        "clean should report zero removed services for a workspace that never \
+         started anything: {output}"
+    );
+    assert!(
+        output.contains("Named volumes removed: 0"),
+        "clean should report zero removed volumes for a workspace that never \
+         started anything: {output}"
+    );
+}
+
+/// After a real `eph up` then `eph clean`, the reported counts reflect what was
+/// actually stopped and removed.
+#[tokio::test]
+async fn clean_reports_actual_counts_after_up() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+
+[cache]
+image=redis:7-alpine
+port=6379
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let output = ws.eph_ok(&["clean"]).await;
+    assert!(
+        output.contains("Services stopped and removed: 2"),
+        "clean should count both started services as removed: {output}"
+    );
+    assert!(
+        output.contains("Named volumes removed: 0"),
+        "no named volumes were declared: {output}"
+    );
+    assert!(
+        output.contains("Persisted state: removed"),
+        "the state directory should have been removed: {output}"
+    );
+}
+
+/// A corrupt `state.json` (a crash mid-write, a bad hand edit) must not break
+/// eph: the broken file is quarantined to `state.json.corrupt` rather than
+/// failing the command, and a subsequent `eph up` still finds the container
+/// Docker already has by name.
+#[tokio::test]
+async fn corrupt_state_file_is_quarantined_and_up_recovers() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+"#,
+    );
+
+    ws.eph_ok(&["up"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let (_prefix, state_dir) = container_prefix_and_state_dir(&ws).await;
+    let state_path = state_dir.join("state.json");
+    let corrupt_path = state_dir.join("state.json.corrupt");
+
+    // Simulate corruption: a crash mid-write or a bad hand edit.
+    std::fs::write(&state_path, "{not json").expect("failed to corrupt state.json");
+
+    let status = ws.eph(&["status"]).await;
+    assert!(
+        status.status.success(),
+        "status should tolerate a corrupt state file: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        corrupt_path.exists(),
+        "the corrupt state file should be quarantined to state.json.corrupt"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&corrupt_path).unwrap(),
+        "{not json",
+        "the quarantined file should keep the original corrupt contents"
+    );
+    assert!(
+        !state_path.exists(),
+        "state.json should have been moved aside, not left in place"
+    );
+
+    // The container itself was never touched: eph up still finds it in Docker
+    // by name, even though its state entry was just wiped.
+    ws.eph_ok(&["up"]).await;
+    let running = ws.eph_ok(&["status"]).await;
+    assert!(
+        running.contains("redis") && running.contains("localhost:"),
+        "up should recover the still-running container after quarantine: {running}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// When the first of two services starts fine and the second fails, `eph up`
+/// must still persist the first service's state before returning the error, so
+/// a subsequent `eph down` can find and stop it rather than leaking it.
+#[tokio::test]
+async fn up_persists_earlier_services_when_a_later_one_fails() {
+    let ws = TestWorkspace::new(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+
+[broken]
+image=does-not-exist-eph-test:latest
+port=1234
+"#,
+    );
+
+    let (prefix, state_dir) = container_prefix_and_state_dir(&ws).await;
+    let state_path = state_dir.join("state.json");
+    let redis_container = format!("{prefix}-redis");
+
+    let output = ws.eph(&["up"]).await;
+    assert!(
+        !output.status.success(),
+        "up should fail when the second service's image cannot be found"
+    );
+
+    assert_eq!(
+        common::docker_container_names(&redis_container).await,
+        vec![redis_container.clone()],
+        "redis should have started before broken failed"
+    );
+    let state_contents =
+        std::fs::read_to_string(&state_path).expect("state.json should exist after the failure");
+    assert!(
+        state_contents.contains("redis"),
+        "redis should be persisted despite the later failure: {state_contents}"
+    );
+    assert!(
+        !state_contents.contains("broken"),
+        "broken never started, so it should not be recorded: {state_contents}"
+    );
+
+    // A subsequent down must find and stop the service that started before the
+    // failure, even though the last `up` never returned successfully. `--rm` so
+    // the container is fully gone, not merely stopped.
+    ws.eph_ok(&["down", "--rm"]).await;
+    assert!(
+        common::docker_container_names(&redis_container)
+            .await
+            .is_empty(),
+        "down should stop the service recorded before the failed up"
+    );
+}
+
+/// A container service's `env.KEY=${other.port}` is resolved to the other
+/// service's actual host port both inside the container's own environment and
+/// wherever a lifecycle hook sees the resolved environment.
+#[tokio::test]
+async fn container_env_resolves_sibling_service_port() {
+    let ws = TestWorkspace::new(&format!(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+
+[app]
+image=redis:7-alpine
+port=6379
+env.OTHER_PORT=${{redis.port}}
+post-start={}
+
+[env]
+REDIS_PORT=${{redis.port}}
+"#,
+        hook_write_var("OTHER_PORT", "hook-other-port")
+    ));
+
+    ws.eph_ok(&["up"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let (prefix, _state_dir) = container_prefix_and_state_dir(&ws).await;
+    let redis_port = ws
+        .env_json()
+        .await
+        .get("REDIS_PORT")
+        .expect("REDIS_PORT not found")
+        .clone();
+
+    // The container's own environment resolved ${redis.port} at creation time.
+    let app_container = format!("{prefix}-app");
+    let exec = tokio::process::Command::new("docker")
+        .args(["exec", &app_container, "sh", "-c", "echo $OTHER_PORT"])
+        .output()
+        .await
+        .expect("failed to run docker exec");
+    assert!(
+        exec.status.success(),
+        "docker exec into {app_container} failed: {}",
+        String::from_utf8_lossy(&exec.stderr)
+    );
+    let seen_in_container = String::from_utf8_lossy(&exec.stdout).trim().to_string();
+    assert_eq!(
+        seen_in_container, redis_port,
+        "the container's own OTHER_PORT should equal redis's resolved host port"
+    );
+
+    // The service's own post-start hook sees the same resolved value.
+    let seen_by_hook = std::fs::read_to_string(ws.path().join("hook-other-port"))
+        .expect("post-start hook did not write hook-other-port");
+    let seen_by_hook = seen_by_hook.trim_end_matches(['\r', '\n']);
+    assert_eq!(
+        seen_by_hook, redis_port,
+        "the post-start hook should see the same resolved sibling port"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// Two `eph up` runs against the same workspace at once must not race: the
+/// per-workspace lock serializes them, so the service set is started exactly
+/// once and `state.json` stays valid JSON. A `pre-start` hook that sleeps for a
+/// few seconds widens the window the first process holds the lock, so the
+/// second is guaranteed to still be waiting on it rather than merely finishing
+/// first by luck.
+#[tokio::test]
+async fn concurrent_up_serializes_on_the_workspace_lock() {
+    let ws = TestWorkspace::new(&format!(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+pre-start={}
+"#,
+        hook_sleep(3)
+    ));
+
+    let eph_binary = env!("CARGO_BIN_EXE_eph");
+    let run_up = || {
+        tokio::process::Command::new(eph_binary)
+            .arg("up")
+            .current_dir(ws.path())
+            .output()
+    };
+    let (first, second) = tokio::join!(run_up(), run_up());
+    let first = first.expect("failed to spawn the first eph up");
+    let second = second.expect("failed to spawn the second eph up");
+
+    assert!(
+        first.status.success(),
+        "the first concurrent up should succeed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "the second concurrent up should succeed (it should wait on the lock, \
+         not fail): {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let (prefix, state_dir) = container_prefix_and_state_dir(&ws).await;
+    let redis_container = format!("{prefix}-redis");
+    assert_eq!(
+        common::docker_container_names(&redis_container).await,
+        vec![redis_container.clone()],
+        "exactly one redis container should exist; the second up should have \
+         reused it rather than creating a duplicate"
+    );
+
+    let state_contents = std::fs::read_to_string(state_dir.join("state.json"))
+        .expect("state.json should exist after both ups");
+    let parsed: serde_json::Value = serde_json::from_str(&state_contents)
+        .expect("state.json should be valid JSON, not interleaved by the race");
+    assert!(
+        parsed["services"]["redis"].is_object(),
+        "state.json should record redis: {state_contents}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+// ============================================================================
 // Logs Tests
 // ============================================================================
 
@@ -2050,4 +2486,236 @@ async fn dev_forwards_stdio_to_the_foreground_app() {
         "a line written to `eph dev` stdin should reach the app and stream back on \
          stdout; got: {out:?}"
     );
+}
+
+// ============================================================================
+// eph env: unresolved references, powershell format, and json ordering
+// ============================================================================
+
+/// `eph env` omits a variable whose value still contains an unresolved
+/// `${service.property}` reference, names it (and the reference) in a warning
+/// on stderr, and still exits zero. This is `eph env`'s own contract: hooks,
+/// `eph run`, and a service's own `env.` all keep the old leave-verbatim
+/// behavior instead. Once the referenced service actually starts, the same
+/// variable resolves and appears in stdout.
+#[tokio::test]
+async fn env_omits_unresolved_reference_and_warns() {
+    let ws = TestWorkspace::new(
+        r#"
+[db]
+image=redis:7-alpine
+port=6379
+
+[env]
+DATABASE_URL=postgres://user:pass@localhost:${db.port}/app
+"#,
+    );
+
+    // `db` is never started, so DATABASE_URL cannot resolve.
+    let out = ws.eph(&["env"]).await;
+    assert!(
+        out.status.success(),
+        "eph env should still exit 0 with an unresolved reference: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("DATABASE_URL"),
+        "unresolved variable should be omitted from stdout, got:\n{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("DATABASE_URL") && stderr.contains("${db.port}"),
+        "stderr should name the omitted variable and its unresolved reference, got:\n{stderr}"
+    );
+
+    // Once `db` is up, the same variable resolves and appears.
+    ws.eph_ok(&["up", "db"]).await;
+    sleep(Duration::from_secs(1)).await;
+    let resolved = ws.eph_ok(&["env"]).await;
+    assert!(
+        resolved.contains("DATABASE_URL") && !resolved.contains("${"),
+        "DATABASE_URL should resolve once db is running, got:\n{resolved}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// `eph env --format powershell` emits `$env:NAME = 'value'` lines, doubling an
+/// embedded single quote per PowerShell's own single-quoted-string rule.
+#[tokio::test]
+async fn env_format_powershell() {
+    let ws = TestWorkspace::new("APP_NAME=test's app\nDEBUG=true\n");
+
+    let output = ws.eph_ok(&["env", "--format", "powershell"]).await;
+    assert!(
+        output.contains("$env:APP_NAME = 'test''s app'"),
+        "got: {output}"
+    );
+    assert!(output.contains("$env:DEBUG = 'true'"), "got: {output}");
+}
+
+/// `eph env --format json` keys appear in the `.eph` file's declaration order,
+/// not an arbitrary hash-map order.
+#[tokio::test]
+async fn env_format_json_preserves_declaration_order() {
+    let ws = TestWorkspace::new("ZEBRA=z\nAPPLE=a\nMANGO=m\n");
+
+    let output = ws.eph_ok(&["env", "--format", "json"]).await;
+    let zebra = output.find("ZEBRA").expect("ZEBRA missing");
+    let apple = output.find("APPLE").expect("APPLE missing");
+    let mango = output.find("MANGO").expect("MANGO missing");
+    assert!(
+        zebra < apple && apple < mango,
+        "json keys should preserve declaration order, got:\n{output}"
+    );
+}
+
+// ============================================================================
+// eph run: flags belong to the command, not to eph
+// ============================================================================
+
+/// Every token after `run` belongs to the command, even one that looks like
+/// one of eph's own flags (`-v`, `-h`, `-V`) or an arbitrary long flag: none of
+/// them are stolen by eph's global flag parsing.
+#[tokio::test]
+async fn run_passes_through_flag_shaped_arguments() {
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+    let out = ws.eph_ok(&echo_flags_command()).await;
+    assert!(
+        out.contains("-v") && out.contains("-h") && out.contains("-V") && out.contains("--weird"),
+        "expected every flag-shaped token to reach the command untouched, got: {out}"
+    );
+}
+
+/// `eph run -h` is not eph's help: there is no program named `-h`, so it fails
+/// with eph's own "failed to run command" message naming it, and eph's usage
+/// text never appears.
+#[tokio::test]
+async fn run_bare_dash_h_is_the_command_not_help() {
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+    let out = ws.eph(&["run", "-h"]).await;
+    assert!(!out.status.success(), "there is no program named -h");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("failed to run command: -h"),
+        "expected eph's own exec-failure message, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Usage:"),
+        "eph's own help text must not appear for `eph run -h`, got: {stderr}"
+    );
+}
+
+/// `eph run -v` is likewise the command, not eph's verbose flag: there is no
+/// program named `-v`, so it fails the same way `-h` does.
+#[tokio::test]
+async fn run_bare_dash_v_is_the_command_not_verbose() {
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+    let out = ws.eph(&["run", "-v"]).await;
+    assert!(!out.status.success(), "there is no program named -v");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("failed to run command: -v"),
+        "expected eph's own exec-failure message, got: {stderr}"
+    );
+}
+
+/// A flag placed *before* `run` is still eph's own global flag: `eph -v run
+/// ...` keeps enabling verbose logging and must not leak `-v` into the
+/// command's own arguments, the opposite of a flag placed after `run`.
+#[cfg(unix)]
+#[tokio::test]
+async fn verbose_before_run_is_ephs_flag_not_the_commands() {
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+    let out = ws
+        .eph(&["-v", "run", "sh", "-c", "echo \"$1\"", "_", "marker"])
+        .await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "marker",
+        "the command's own args should be unaffected by a -v placed before run"
+    );
+}
+
+// ============================================================================
+// eph up: stale-workspace nudge
+// ============================================================================
+
+/// `eph up` nudges toward `eph system prune` when other workspaces' state
+/// points at deleted checkouts. `EPH_STATE_ROOT` points the whole invocation at
+/// a throwaway directory so the test never touches (or is confused by) the
+/// real per-user state directory.
+#[tokio::test]
+async fn up_nudges_about_stale_workspaces() {
+    let state_root = tempfile::tempdir().unwrap();
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+    let root_str = state_root.path().to_string_lossy().into_owned();
+
+    // A fabricated stale workspace: an 8-hex-digit state dir with metadata
+    // (the exact shape `Workspace::save_metadata` writes) pointing at a path
+    // that does not exist.
+    let stale_dir = state_root.path().join("deadbeef");
+    std::fs::create_dir_all(&stale_dir).unwrap();
+    let metadata = serde_json::json!({
+        "schema": 1,
+        "workspace_id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        "short_id": "deadbeef",
+        "workspace_path": "/this/path/does/not/exist-eph-integration-test",
+        "container_prefix": "eph-deadbeef",
+        "last_seen_unix_secs": 0
+    });
+    std::fs::write(
+        stale_dir.join("workspace.json"),
+        serde_json::to_string_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+
+    let out = ws
+        .eph_with_envs(&["up"], &[("EPH_STATE_ROOT", &root_str)])
+        .await;
+    assert!(
+        out.status.success(),
+        "up should still succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("1 stale eph workspace") && stderr.contains("eph system prune"),
+        "expected a stale-workspace note, got: {stderr}"
+    );
+
+    ws.eph_with_envs(&["down"], &[("EPH_STATE_ROOT", &root_str)])
+        .await;
+}
+
+/// With no stale workspace state recorded, `eph up` prints no nudge at all.
+#[tokio::test]
+async fn up_prints_no_nudge_when_nothing_is_stale() {
+    let state_root = tempfile::tempdir().unwrap();
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+    let root_str = state_root.path().to_string_lossy().into_owned();
+
+    let out = ws
+        .eph_with_envs(&["up"], &[("EPH_STATE_ROOT", &root_str)])
+        .await;
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("stale eph workspace"),
+        "should not nudge with no stale workspaces: {stderr}"
+    );
+
+    ws.eph_with_envs(&["down"], &[("EPH_STATE_ROOT", &root_str)])
+        .await;
 }

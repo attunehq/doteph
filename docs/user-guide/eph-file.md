@@ -559,11 +559,45 @@ Two different things happen at two different times:
   TEMPLATE=cost: $${not.a.placeholder}
   ```
 
-- **At runtime**, `eph env` (and hooks, `eph run`, and `run=` service
-  environments) resolve each placeholder against **currently running**
-  services. A reference that parsed fine but names a service that is not
-  running right now is left in place verbatim rather than blanked, so an
-  unresolved reference stays visible instead of silently disappearing.
+- **At runtime**, `eph env`, hooks, `eph run`, and every service's own
+  `env.<KEY>=` values resolve each placeholder against **currently running**
+  services. This is consistent across every source: an `image=` or
+  `dockerfile=` service's `env.<KEY>=` is resolved just before its container is
+  created, a `compose=` service's `env.<KEY>=` is resolved into the environment
+  `docker compose up` and `docker compose down` themselves run with (so the
+  compose file's own `${VAR}` substitution sees it too), and a `run=` service's
+  `env.<KEY>=` is resolved into the process it launches. For hooks, `eph run`,
+  and every service's own `env.<KEY>=`, a reference that parsed fine but names
+  a service that is not running right now is left in place verbatim rather
+  than blanked, so an unresolved reference stays visible instead of silently
+  disappearing.
+
+  **`eph env` is the one exception.** Its output is handed straight to a
+  shell's `eval`, and a literal `${...}` there is a syntax the shell cannot
+  evaluate. So instead of leaving a raw placeholder, `eph env` drops the whole
+  variable from its output and prints a warning naming the variable and the
+  unresolved reference to stderr, for example:
+
+  ```
+  warning: omitted DATABASE_URL: ${postgres.port} is not resolvable while postgres is not running
+  ```
+
+  The command still exits `0`; run `eph up` and the variable reappears once
+  its service is running. This contract belongs to `eph env` alone: hooks,
+  `eph run`, and a service's own `env.<KEY>=` all keep the leave-verbatim
+  behavior above.
+
+  Resolved values are host-facing: `${service.port}` is the port Docker
+  published on the host's loopback interface, and `${service.host}` is always
+  `localhost` as seen **from the host**. That is exactly right for a hook,
+  `eph run`, or a `run=` process, all of which execute on the host. It is
+  usually the wrong address for one container reaching another: a `postgres`
+  container's `env.DATABASE_URL=...${redis.port}` receives a literal
+  `localhost:PORT`, but inside that container `localhost` means the container
+  itself, not the host, so it will not reach `redis`. Reach a sibling service
+  from inside a container through `host.docker.internal` (Docker Desktop) or by
+  addressing the sibling on a shared Docker network by its container name and
+  **container** port, not through eph's interpolated, host-facing value.
 
 `run=`, hook (`pre-start`/`post-start`/`pre-stop`/`post-stop`), and
 `healthcheck=` command strings are never scanned for placeholders: those are

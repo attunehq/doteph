@@ -81,6 +81,23 @@ impl TestWorkspace {
         String::from_utf8_lossy(&output.stdout).to_string()
     }
 
+    /// Run an `eph` subcommand with additional environment variables set (on
+    /// top of the inherited process environment), returning the raw output.
+    ///
+    /// Used by tests that need `eph` to see an override the plain
+    /// `eph`/`eph_ok` helpers do not set, e.g. `EPH_STATE_ROOT` for a
+    /// hermetic state root.
+    pub async fn eph_with_envs(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
+        let eph_binary = env!("CARGO_BIN_EXE_eph");
+        Command::new(eph_binary)
+            .args(args)
+            .current_dir(self.dir.path())
+            .envs(envs.iter().copied())
+            .output()
+            .await
+            .expect("Failed to run eph")
+    }
+
     /// Convenience: run `eph env -f json` and parse the result.
     pub async fn env_json(&self) -> HashMap<String, String> {
         let output = self.eph_ok(&["env", "-f", "json"]).await;

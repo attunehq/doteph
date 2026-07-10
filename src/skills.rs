@@ -107,10 +107,18 @@ pub struct InstallOutcome {
 /// `--dir ../other` or `--dir /etc` would write or read outside the checkout.
 /// Confine every directory to `root` up front so a stray `--dir` cannot.
 ///
+/// A Windows drive-relative path like `C:foo` is a third way to escape: it is
+/// not absolute (`Path::is_absolute` requires both a prefix *and* a root), yet
+/// `root.join("C:foo")` still replaces `root` outright, exactly like an
+/// absolute path would, because any path carrying a
+/// [`Component::Prefix`](std::path::Component::Prefix) makes `join` discard the
+/// base entirely. Rejecting that component catches it too.
+///
 /// # Errors
 ///
-/// Returns an error naming the first directory that is absolute or contains a
-/// parent-directory (`..`) component.
+/// Returns an error naming the first directory that is absolute, contains a
+/// parent-directory (`..`) component, or carries a drive/UNC prefix like
+/// `C:foo` or `\\server\share`.
 fn confine_to_root(dirs: &[PathBuf]) -> Result<()> {
     for dir in dirs {
         if dir.is_absolute() {
@@ -122,6 +130,14 @@ fn confine_to_root(dirs: &[PathBuf]) -> Result<()> {
         if dir.components().any(|c| c == Component::ParentDir) {
             bail!(
                 "skill directory {} must stay within the repository root (no `..` components)",
+                dir.display()
+            );
+        }
+        if dir.components().any(|c| matches!(c, Component::Prefix(_))) {
+            bail!(
+                "skill directory {} must be a plain relative path, with no drive letter \
+                 or UNC prefix (e.g. `C:foo`): joining a path like that onto the \
+                 repository root replaces the root instead of nesting inside it",
                 dir.display()
             );
         }
@@ -340,6 +356,37 @@ mod tests {
         let ok = [PathBuf::from("vendor/skills")];
         assert!(install(root, &ok, false).is_ok());
         assert!(root.join("vendor/skills/using-eph/SKILL.md").exists());
+    }
+
+    /// A Windows drive-relative path (`C:foo`, no separator after the colon) is
+    /// not absolute (`Path::is_absolute` requires a root as well as a
+    /// prefix), yet `root.join("C:foo")` still discards `root` outright, the
+    /// same escape an absolute path or a `..` gets. `Component::Prefix` only
+    /// ever appears on Windows: on Unix, "C:foo" parses as one ordinary
+    /// relative `Normal` component, so it is accepted there like any other
+    /// relative directory, and this test asserts that platform split directly
+    /// rather than skipping either half.
+    #[test]
+    fn windows_drive_relative_dir_is_rejected_only_where_it_is_dangerous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dirs = [PathBuf::from("C:foo")];
+
+        #[cfg(windows)]
+        {
+            assert!(
+                install(root, &dirs, true).is_err(),
+                "C:foo must be rejected: it would replace root when joined"
+            );
+            assert!(check(root, &dirs).is_err());
+        }
+        #[cfg(not(windows))]
+        {
+            // On Unix "C:foo" is an ordinary relative component; it is accepted
+            // and stays within root like any other relative directory.
+            assert!(install(root, &dirs, true).is_ok());
+            assert!(root.join("C:foo/using-eph/SKILL.md").exists());
+        }
     }
 
     #[test]

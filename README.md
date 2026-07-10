@@ -37,6 +37,11 @@ or download a `tar.gz` directly from the
 binaries cover macOS (x86_64, arm64), Linux glibc and musl (x86_64, arm64),
 and Windows (x86_64).
 
+Set `EPH_REPO` (an `owner/repo`, default `attunehq/doteph`) or `EPH_BASE_URL`
+(replaces the GitHub download base entirely, with no release tag appended
+after it) to install from a fork or a mirror; `eph update` honors the same two
+variables.
+
 Once installed, keep it current with the built-in updater, which downloads the
 latest release, verifies its SHA-256 checksum, and swaps the binary in place:
 

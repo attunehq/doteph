@@ -7,19 +7,19 @@
 //! produce the resolved pairs live in the binary.
 
 use anyhow::{Result, bail};
-use std::collections::HashMap;
 
 /// Render resolved environment variables in the requested shell format.
 ///
 /// `format` is one of `export` (bash/sh/zsh, see [`render_export`]), `fish`
-/// (see [`render_fish`]), or `json` (see [`render_json`]). The `export` and
-/// `fish` variants delegate directly; `json` appends a trailing newline so the
-/// output occupies a clean terminal line.
+/// (see [`render_fish`]), `powershell` (see [`render_powershell`]), or `json`
+/// (see [`render_json`]). The `export`, `fish`, and `powershell` variants
+/// delegate directly; `json` appends a trailing newline so the output occupies
+/// a clean terminal line.
 ///
 /// # Errors
 ///
-/// Returns an error if `format` is none of `export`, `fish`, or `json`, or if
-/// JSON serialization fails (see [`render_json`]).
+/// Returns an error if `format` is none of `export`, `fish`, `powershell`, or
+/// `json`, or if JSON serialization fails (see [`render_json`]).
 ///
 /// # Examples
 ///
@@ -27,7 +27,7 @@ use std::collections::HashMap;
 /// # fn main() -> anyhow::Result<()> {
 /// let vars = vec![("PORT".to_string(), "6379".to_string())];
 /// assert_eq!(eph::render(&vars, "export")?, "export PORT=\"6379\"\n");
-/// assert!(eph::render(&vars, "powershell").is_err());
+/// assert_eq!(eph::render(&vars, "powershell")?, "$env:PORT = '6379'\n");
 /// # Ok(())
 /// # }
 /// ```
@@ -35,10 +35,15 @@ pub fn render(env_vars: &[(String, String)], format: &str) -> Result<String> {
     match format {
         "export" => Ok(render_export(env_vars)),
         "fish" => Ok(render_fish(env_vars)),
-        // The `export`/`fish` variants already terminate each line; the JSON
-        // object does not, so add a trailing newline for a clean terminal line.
+        "powershell" => Ok(render_powershell(env_vars)),
+        // The `export`/`fish`/`powershell` variants already terminate each
+        // line; the JSON object does not, so add a trailing newline for a
+        // clean terminal line.
         "json" => Ok(format!("{}\n", render_json(env_vars)?)),
-        _ => bail!("unknown format: {}, use: export, fish, json", format),
+        _ => bail!(
+            "unknown format: {}, use: export, fish, powershell, json",
+            format
+        ),
     }
 }
 
@@ -60,7 +65,24 @@ pub fn render_fish(env_vars: &[(String, String)]) -> String {
     out
 }
 
+/// Render `$env:NAME = 'value'` lines for PowerShell.
+///
+/// Piping this through `Out-String | Invoke-Expression` (or dot-sourcing it)
+/// sets each variable in the caller's session, mirroring what `export` does
+/// for bash/sh/zsh and `set -gx` does for fish.
+pub fn render_powershell(env_vars: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (name, value) in env_vars {
+        out.push_str(&format!("$env:{} = '{}'\n", name, escape_powershell(value)));
+    }
+    out
+}
+
 /// Render the variables as a pretty-printed JSON object (no trailing newline).
+///
+/// Keys appear in `env_vars`' input order (the `.eph` file's declaration
+/// order), not an arbitrary hash order: `serde_json::Map` is insertion-ordered
+/// with the `preserve_order` feature this crate enables.
 ///
 /// # Errors
 ///
@@ -68,10 +90,10 @@ pub fn render_fish(env_vars: &[(String, String)]) -> String {
 /// this does not happen for a map of strings, but the fallible signature mirrors
 /// [`serde_json::to_string_pretty`].
 pub fn render_json(env_vars: &[(String, String)]) -> Result<String> {
-    let map: HashMap<&str, &str> = env_vars
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.as_str()))
-        .collect();
+    let mut map = serde_json::Map::with_capacity(env_vars.len());
+    for (name, value) in env_vars {
+        map.insert(name.clone(), serde_json::Value::String(value.clone()));
+    }
     Ok(serde_json::to_string_pretty(&map)?)
 }
 
@@ -88,6 +110,16 @@ pub fn escape_fish(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('$', "\\$")
+}
+
+/// Escape a value for a PowerShell single-quoted string.
+///
+/// A single-quoted PowerShell string is the literal-string form: `$`,
+/// backticks, and double quotes all pass through unchanged (nothing is
+/// interpolated), so the single quote that delimits the string is the only
+/// character that needs escaping, doubled per PowerShell's own quoting rule.
+pub fn escape_powershell(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 #[cfg(test)]
@@ -179,8 +211,51 @@ mod tests {
     }
 
     #[test]
+    fn test_render_json_preserves_declaration_order() {
+        // A HashMap-backed implementation would scramble this; the point of
+        // `preserve_order` is that it cannot.
+        let vars = vec![
+            ("ZEBRA".to_string(), "z".to_string()),
+            ("APPLE".to_string(), "a".to_string()),
+            ("MANGO".to_string(), "m".to_string()),
+        ];
+        let json = render_json(&vars).unwrap();
+        let zebra = json.find("ZEBRA").expect("ZEBRA missing");
+        let apple = json.find("APPLE").expect("APPLE missing");
+        let mango = json.find("MANGO").expect("MANGO missing");
+        assert!(
+            zebra < apple && apple < mango,
+            "keys should preserve input order, got:\n{json}"
+        );
+    }
+
+    #[test]
+    fn test_escape_powershell_doubles_single_quotes() {
+        assert_eq!(escape_powershell("'"), "''");
+        assert_eq!(escape_powershell("it's"), "it''s");
+        // Nothing else is special in a single-quoted PowerShell string.
+        assert_eq!(escape_powershell("$env:PATH"), "$env:PATH");
+        assert_eq!(escape_powershell("`backtick`"), "`backtick`");
+        assert_eq!(escape_powershell("\n"), "\n");
+        assert_eq!(escape_powershell("\"quoted\""), "\"quoted\"");
+    }
+
+    #[test]
+    fn test_render_powershell_format() {
+        let vars = vec![
+            ("APP".to_string(), "myapp".to_string()),
+            ("MSG".to_string(), "it's here".to_string()),
+        ];
+        assert_eq!(
+            render_powershell(&vars),
+            "$env:APP = 'myapp'\n$env:MSG = 'it''s here'\n"
+        );
+    }
+
+    #[test]
     fn test_render_unknown_format_errors() {
         let vars = vec![("APP".to_string(), "myapp".to_string())];
-        assert!(render(&vars, "powershell").is_err());
+        let err = render(&vars, "yaml").unwrap_err().to_string();
+        assert!(err.contains("export, fish, powershell, json"), "got: {err}");
     }
 }

@@ -258,7 +258,7 @@ checkout's services, and `eph info` shows the differing short IDs.
 
 When you later delete a checkout (a finished worktree, an abandoned
 experiment), its containers and volumes do not die with the directory. Run
-[`eph system prune`](command-reference.md#eph-system-prune---dry-run---compatibility-v042)
+[`eph system prune`](command-reference.md#eph-system-prune---dry-run---compatibility-v042---force-live--y---yes)
 from anywhere to sweep up resources belonging to workspaces whose directory no
 longer exists.
 

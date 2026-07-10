@@ -1450,6 +1450,58 @@ where
     result
 }
 
+/// Like [`resolve_interpolations`], but also returns every `${service.property}`
+/// reference `resolver` could not resolve, as `(service, property)` pairs in
+/// the order they appear. The `$${` escape is never a reference (it is
+/// consumed by [`resolve_interpolations`] before `resolver` is ever called for
+/// it), so it never appears in the returned list.
+///
+/// This is `eph env`'s hook into resolution: unlike every other `${...}`
+/// consumer (lifecycle hooks, `eph run`, a service's own `env.` entries), which
+/// all leave an unresolved reference verbatim so a hook that runs before its
+/// referenced service starts still gets a placeholder it can recognize, `eph
+/// env`'s output is meant to be handed straight to `eval`. A literal `${...}`
+/// there would break the caller's shell, so its caller needs to know which
+/// variables to omit instead.
+///
+/// # Examples
+///
+/// ```
+/// use eph::parser::resolve_interpolations_tracked;
+///
+/// let (out, unresolved) = resolve_interpolations_tracked("${db.port}", |_, _| None);
+/// assert_eq!(out, "${db.port}");
+/// assert_eq!(unresolved, vec![("db".to_string(), "port".to_string())]);
+///
+/// // The `$${` escape is not a reference, so it is never reported.
+/// let (out, unresolved) = resolve_interpolations_tracked("$${db.port}", |_, _| None);
+/// assert_eq!(out, "${db.port}");
+/// assert!(unresolved.is_empty());
+/// ```
+#[must_use]
+pub fn resolve_interpolations_tracked<F>(
+    input: &str,
+    resolver: F,
+) -> (String, Vec<(String, String)>)
+where
+    F: Fn(&str, &str) -> Option<String>,
+{
+    // `resolve_interpolations` requires a plain `Fn`, so interior mutability
+    // (rather than a `FnMut` capture) is what lets this wrapping closure record
+    // a miss without duplicating the placeholder-scanning logic above.
+    let unresolved = std::cell::RefCell::new(Vec::new());
+    let result = resolve_interpolations(input, |service, property| {
+        let value = resolver(service, property);
+        if value.is_none() {
+            unresolved
+                .borrow_mut()
+                .push((service.to_string(), property.to_string()));
+        }
+        value
+    });
+    (result, unresolved.into_inner())
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2264,5 +2316,44 @@ port.api=5000
         .unwrap();
         let order: Vec<&str> = eph.start_order().iter().map(|s| s.as_str()).collect();
         assert_eq!(order, ["db", "web"]);
+    }
+
+    // ------------------------------------------------------------------------
+    // resolve_interpolations_tracked
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn tracked_resolve_reports_a_genuine_unresolved_reference() {
+        let (out, unresolved) = resolve_interpolations_tracked("${db.port}", |_, _| None);
+        assert_eq!(out, "${db.port}");
+        assert_eq!(unresolved, vec![("db".to_string(), "port".to_string())]);
+    }
+
+    #[test]
+    fn tracked_resolve_does_not_report_the_escaped_form() {
+        // `$${` is a literal `${` and is never treated as a reference, so it
+        // must never show up as unresolved.
+        let (out, unresolved) = resolve_interpolations_tracked("$${db.port}", |_, _| None);
+        assert_eq!(out, "${db.port}");
+        assert!(unresolved.is_empty());
+    }
+
+    #[test]
+    fn tracked_resolve_does_not_report_a_resolvable_reference() {
+        let (out, unresolved) = resolve_interpolations_tracked("${db.port}", |svc, prop| {
+            (svc == "db" && prop == "port").then(|| "5432".to_string())
+        });
+        assert_eq!(out, "5432");
+        assert!(unresolved.is_empty());
+    }
+
+    #[test]
+    fn tracked_resolve_reports_only_the_references_that_actually_missed() {
+        let (out, unresolved) = resolve_interpolations_tracked(
+            "${redis.host}:${redis.port}/${db.port}",
+            |svc, prop| (svc == "redis").then(|| format!("{svc}-{prop}")),
+        );
+        assert_eq!(out, "redis-host:redis-port/${db.port}");
+        assert_eq!(unresolved, vec![("db".to_string(), "port".to_string())]);
     }
 }

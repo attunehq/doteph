@@ -83,6 +83,35 @@ impl ProcessIdentity {
     fn has_distinguishing_fields(&self) -> bool {
         self.cwd.is_some() || self.exe.is_some() || !self.cmd.is_empty()
     }
+
+    /// Whether `other` plausibly describes the same process, tolerating the
+    /// ways two honest snapshots of one process can disagree.
+    ///
+    /// Exact equality is the wrong test here: sysinfo's `start_time` can
+    /// jitter by a second between two queries of the same process, and a
+    /// field the OS declined to expose on one query (a just-spawned process's
+    /// `cwd`/`exe`/`cmd` on Windows, for instance) comes back `None`/empty
+    /// rather than wrong. A false mismatch is not the safe direction: it
+    /// makes teardown treat a live service as already dead and leak it, and
+    /// makes prune skip a process it should reap. So `start_time` matches
+    /// within one second, and a `cwd`/`exe`/`cmd` missing on either side is
+    /// unknown rather than a conflict. Fields present on both sides must
+    /// still agree exactly, which keeps the PID-reuse guard: a recycled PID
+    /// slips through only with the same exe, cwd, and command line inside the
+    /// same one-second start window.
+    fn matches(&self, other: &Self) -> bool {
+        fn known_fields_agree<T: PartialEq>(a: &Option<T>, b: &Option<T>) -> bool {
+            match (a, b) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+        }
+
+        self.start_time.abs_diff(other.start_time) <= 1
+            && known_fields_agree(&self.cwd, &other.cwd)
+            && known_fields_agree(&self.exe, &other.exe)
+            && (self.cmd.is_empty() || other.cmd.is_empty() || self.cmd == other.cmd)
+    }
 }
 
 /// Build a [`TokioCommand`] that runs `cmd` through the platform shell.
@@ -156,9 +185,10 @@ pub(crate) fn identity(pid: NonZeroU32) -> Option<ProcessIdentity> {
     system.process(pid).and_then(ProcessIdentity::from_process)
 }
 
-/// Whether `pid` still names the process represented by `expected`.
+/// Whether `pid` still names the process represented by `expected` (see
+/// [`ProcessIdentity::matches`] for what "the same process" tolerates).
 pub(crate) fn identity_matches(pid: NonZeroU32, expected: &ProcessIdentity) -> bool {
-    identity(pid).as_ref() == Some(expected)
+    identity(pid).is_some_and(|current| current.matches(expected))
 }
 
 /// Whether a process with `pid` is present in the OS process table (a native
@@ -246,9 +276,13 @@ fn process_tree(system: &System, root: Pid) -> Vec<Pid> {
 /// have it).
 fn signal_tree(pid: NonZeroU32, signal: Signal) {
     // A full snapshot is needed (not just `pid`): the parent links of every
-    // process are what let us find the descendants to signal.
+    // process are what let us find the descendants to signal. Only the bare
+    // enumeration is collected (`ProcessRefreshKind::nothing()`): parent PIDs
+    // come with it, and collecting more (cwd, cmd, exe) opens and queries
+    // every process on the machine, which turns teardown from milliseconds
+    // into tens of seconds on a busy system.
     let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::All, true);
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
 
     for target in process_tree(&system, Pid::from_u32(pid.get())) {
         if let Some(process) = system.process(target)
@@ -386,6 +420,60 @@ mod tests {
         assert_kill_ends(spawn_sleeper(), terminate).await;
     }
 
+    fn sample_identity() -> ProcessIdentity {
+        ProcessIdentity {
+            start_time: 1000,
+            cwd: Some(PathBuf::from("/work")),
+            exe: Some(PathBuf::from("/bin/sleep")),
+            cmd: vec!["sleep".to_string(), "30".to_string()],
+        }
+    }
+
+    #[test]
+    fn identity_match_tolerates_start_time_jitter_of_one_second() {
+        let recorded = sample_identity();
+        let mut current = recorded.clone();
+        current.start_time = recorded.start_time + 1;
+        assert!(current.matches(&recorded));
+        assert!(recorded.matches(&current));
+
+        current.start_time = recorded.start_time + 2;
+        assert!(
+            !current.matches(&recorded),
+            "two seconds apart is a different process, not jitter"
+        );
+    }
+
+    #[test]
+    fn identity_match_treats_missing_fields_as_unknown() {
+        let recorded = sample_identity();
+        let degraded = ProcessIdentity {
+            start_time: recorded.start_time,
+            cwd: None,
+            exe: None,
+            cmd: Vec::new(),
+        };
+        assert!(degraded.matches(&recorded));
+        assert!(recorded.matches(&degraded));
+    }
+
+    #[test]
+    fn identity_match_rejects_conflicting_known_fields() {
+        let recorded = sample_identity();
+
+        let mut other_cmd = recorded.clone();
+        other_cmd.cmd = vec!["nginx".to_string()];
+        assert!(!other_cmd.matches(&recorded));
+
+        let mut other_exe = recorded.clone();
+        other_exe.exe = Some(PathBuf::from("/bin/nginx"));
+        assert!(!other_exe.matches(&recorded));
+
+        let mut other_cwd = recorded.clone();
+        other_cwd.cwd = Some(PathBuf::from("/elsewhere"));
+        assert!(!other_cwd.matches(&recorded));
+    }
+
     #[tokio::test]
     async fn identity_matches_the_spawned_process() {
         let mut child = spawn_sleeper();
@@ -404,7 +492,11 @@ mod tests {
     async fn wait_for_descendants(root: NonZeroU32) -> Vec<NonZeroU32> {
         for _ in 0..50 {
             let mut system = System::new();
-            system.refresh_processes(ProcessesToUpdate::All, true);
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing(),
+            );
             let kids: Vec<NonZeroU32> = process_tree(&system, Pid::from_u32(root.get()))
                 .into_iter()
                 .filter(|p| p.as_u32() != root.get())

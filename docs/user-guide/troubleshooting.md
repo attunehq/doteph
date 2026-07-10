@@ -203,6 +203,45 @@ state ever looks wrong, `eph clean` resets the workspace completely (removing
 containers, named volumes, and the state file), after which `eph up` rebuilds
 from scratch.
 
+Renaming or deleting a service's section from the `.eph` file does not orphan
+its container: a bare `eph down` and `eph clean` both also tear down whatever
+`state.json` remembers starting under a name no longer in the file. If you
+still find a container `docker ps -a` shows but `eph status` does not, run
+`eph clean`, which additionally sweeps any leftover container or volume
+carrying the workspace's `eph-<short_id>-` prefix even if state does not know
+about it.
+
+## "state file ... is corrupt"
+
+If `state.json` cannot be parsed (a hand edit, disk corruption, damage from
+something outside eph), the next `eph` command logs a warning, moves the
+broken file aside to `state.json.corrupt`, and continues as if the workspace
+had no recorded state, rather than aborting. Containers and compose projects
+are found again from Docker by name on the next `eph up` or `eph status`; a
+`run=` service's PID is the one thing this cannot recover, since the PID lived
+only in the corrupted file, so stop a leftover `run=` process by hand
+(`docker ps` will not show it) if `eph status` still reports it running.
+
+## "another eph command is running in this workspace; waiting for it"
+
+`eph up`, `eph down`, and `eph clean` on one workspace exclude each other with
+an OS-level lock, so two overlapping runs never race the same `state.json`.
+This message just means a second command has to wait; it clears on its own
+once the first command finishes. If it never clears, the first command is
+still genuinely running (check `eph -v up`'s output or `docker ps`) rather
+than stuck: the lock is an OS file lock released automatically when the
+holding process exits, so a crashed or killed `eph` cannot leave a later
+command wedged.
+
+## `docker compose down` failed during `eph down` or `eph clean`
+
+A compose service's teardown failure (a broken compose file, a missing
+`docker compose` plugin) is a real error and stops the rest of the teardown,
+rather than being silently treated as success. Fix the underlying problem
+(`docker compose -f <file> -p eph-<short_id>-<service> down` reproduces it
+directly) and re-run `eph down` or `eph clean`. `--skip-hooks` does not help
+here: it only skips lifecycle hooks, not the compose command itself.
+
 If the workspace directory itself was deleted, run `eph system prune` from
 anywhere. It scans all eph state directories and removes resources for
 recorded workspace paths that are missing or are now empty folders. Use
@@ -242,6 +281,8 @@ builtins). Two ways to handle it:
 Under WSL, `eph` is a Linux process, so its state directory is the **Linux**
 path (`~/.local/share/eph/<short_id>/`), not the Windows `%LOCALAPPDATA%`
 path. The `%LOCALAPPDATA%` location applies only to a native Windows build.
+(`EPH_STATE_ROOT` overrides either default; see
+[Core Concepts](concepts.md#persisted-state).)
 
 ### Relative bind mounts on Windows
 

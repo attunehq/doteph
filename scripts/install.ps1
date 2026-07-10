@@ -10,6 +10,15 @@
 #   Version      Specify a version (default: latest)
 #   BinDir       Specify the installation directory (default: $env:LOCALAPPDATA\Programs\eph)
 #   Help         Show help message (set $env:Help="true")
+#
+# Environment overrides (the same ones eph's own `eph update` self-updater
+# honors, so a fork and a script-installed user converge on the same bits):
+#   EPH_REPO       GitHub owner/repo to install from (default: attunehq/doteph)
+#   EPH_BASE_URL   Overrides the download base entirely, replacing
+#                  https://github.com/<repo>/releases/download/<tag>. No tag
+#                  directory is appended after it: point it at wherever the
+#                  archive and checksums.txt already live (a mirror, or a
+#                  local test server).
 
 param(
     [string]$Version = $env:Version,
@@ -18,9 +27,9 @@ param(
 )
 
 # GitHub repository configuration
-$REPO = "attunehq/doteph"
+$REPO = if ($env:EPH_REPO) { $env:EPH_REPO } else { "attunehq/doteph" }
 $GITHUB_API = "https://api.github.com/repos/$REPO/releases"
-$GITHUB_DOWNLOAD = "https://github.com/$REPO/releases/download"
+$GITHUB_DOWNLOAD_DEFAULT = "https://github.com/$REPO/releases/download"
 
 function Write-Info {
     param([string]$Message)
@@ -98,8 +107,18 @@ function Install-Binary {
     $Version = $Version -replace '^v', ''
     $archiveName = "eph-$Platform.tar.gz"
     $tag = "v$Version"
-    $downloadUrl = "$GITHUB_DOWNLOAD/$tag/$archiveName"
-    $checksumsUrl = "$GITHUB_DOWNLOAD/$tag/checksums.txt"
+    # EPH_BASE_URL, when set, replaces the tag-scoped GitHub download URL
+    # entirely (no tag directory appended), mirroring `Updater::download_base`
+    # in src/update.rs so a script install and `eph update` agree on where an
+    # overridden base points.
+    if ($env:EPH_BASE_URL) {
+        $downloadBase = $env:EPH_BASE_URL.TrimEnd('/')
+    }
+    else {
+        $downloadBase = "$GITHUB_DOWNLOAD_DEFAULT/$tag"
+    }
+    $downloadUrl = "$downloadBase/$archiveName"
+    $checksumsUrl = "$downloadBase/checksums.txt"
 
     Write-Info "Downloading eph $Version for $Platform..."
 

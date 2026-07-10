@@ -27,10 +27,16 @@ tests/
 The public API is whatever `src/lib.rs` re-exports:
 
 ```rust
-pub use env::{escape_bash, escape_fish, render, render_export, render_fish, render_json};
+pub use env::{
+    escape_bash, escape_fish, escape_powershell, render, render_export, render_fish,
+    render_json, render_powershell,
+};
 pub use parser::{EphFile, Service, ServiceSource, parse, resolve_interpolations};
-pub use prune::{PruneOptions, PruneReport, prune};
-pub use service::{LogOptions, RunningService, ServiceManager, resolve_env_vars};
+pub use prune::{ConfirmationOutcome, PruneOptions, PruneReport, confirmation_outcome, prune};
+pub use service::{
+    Hooks, LogOptions, OmittedVar, RunningService, ServiceManager, resolve_env_vars,
+    resolve_env_vars_for_eval,
+};
 pub use workspace::Workspace;
 ```
 
@@ -129,9 +135,18 @@ treating `$${` as an escaped literal `${`, splits the content on the first
 Anything the resolver declines (`None`), or a placeholder with no `.`, is left
 verbatim; an unterminated `${` is copied through rather than repaired, since
 `parse` already guarantees a parsed file has none. The resolver is supplied by
-the caller (`cmd_env` in `main.rs` and `service::resolve_against`) and reads
-from running
-services.
+the caller (`service::resolve_against`, used for hooks, `eph run`, and every
+service's own `env.<KEY>=`) and reads from running services.
+
+**`resolve_interpolations_tracked(input, resolver) -> (String, Vec<(String,
+String)>)`** wraps `resolve_interpolations` (via a `RefCell`-captured closure,
+since `resolve_interpolations` requires a plain `Fn`) to additionally return
+every reference the resolver declined, as `(service, property)` pairs. This is
+`eph env`'s own hook into resolution (through `service::resolve_against_tracked`
+and `service::resolve_env_vars_for_eval`, called from `cmd_env` in `main.rs`):
+unlike every other consumer, which leaves an unresolved reference verbatim,
+`eph env` needs to know which variables to omit instead, since its output is
+handed straight to a shell's `eval`.
 
 ## workspace
 
@@ -146,7 +161,15 @@ canonicalization and the data-dir lookup.
   every command.
 - Naming helpers: `container_prefix()` (`eph-<short_id>`),
   `container_name(svc)`, `volume_name(svc, vol)`, `eph_file_path()`.
-- `state_dir()` returns `<dirs::data_local_dir()>/eph/<short_id>`.
+- `state_dir()` returns `state_root()?.join(&self.short_id)`.
+- `state_root()` (a public, module-level function, not a `Workspace` method,
+  since `count_stale_workspaces` in `prune.rs` needs it before any particular
+  workspace is resolved) is `<dirs::data_local_dir()>/eph`, or `EPH_STATE_ROOT`
+  when that variable is set to a non-empty (post-trim) value; a whitespace-only
+  override falls back to the default rather than resolving to a bogus path
+  built from blank text. The override is what lets an integration test point a
+  whole `eph` invocation at a throwaway state root instead of the real
+  per-user data directory.
 - `save_metadata()` writes `<state_dir>/workspace.json`, which records the
   canonical workspace path for cross-workspace pruning.
 
@@ -163,68 +186,144 @@ lifecycle engine.
   filter is a prefix match), returning id, running state, and port bindings.
 - `run_image(...)` ensures the image (`ensure_image` pulls if
   `inspect_image` fails), builds port bindings (host port `None` = random,
-  host IP `127.0.0.1`), env, and volume binds (named volumes are prefixed via
-  `Workspace::volume_name`; path-shaped hosts become bind mounts resolved
-  against the workspace), creates and starts the container, then reads back
-  the assigned ports and maps them to declared names.
+  host IP `127.0.0.1`), resolves each `env.<KEY>` value's `${service.property}`
+  references against the services already running (the same `resolve_against`
+  the `run=` path uses, so a container service's `env.DATABASE_URL=${postgres.port}`
+  no longer ships as a literal placeholder), builds volume binds (named
+  volumes are prefixed via `Workspace::volume_name`; path-shaped hosts become
+  bind mounts resolved against the workspace), creates and starts the
+  container, then reads back the assigned ports and maps them to declared
+  names.
 - `build_and_run(...)` shells out to `docker build -t eph-<short_id>-<svc>`
   then delegates to `run_image`.
 - `exec_in_container(...)` runs a health-check command via the exec API and
   returns the exit code.
 - `stop_container` / `remove_container` / `remove_volume` are best-effort
-  helpers (`remove_volume` treats a 404 as success).
+  helpers (`remove_volume` treats a 404 as success), each returning whether it
+  actually stopped/removed/found something so `clean` can report measured
+  counts instead of counting declared services.
+- `containers_with_prefix(prefix)` / `volumes_with_prefix(prefix)` list every
+  container/volume whose name starts with `eph-<short_id>-`, regardless of
+  whether eph's own state knows about them. `clean` uses these for a final
+  sweep, since a service renamed before state recorded it, or a resource left
+  behind by a crash before state was written, would otherwise survive a
+  "full reset".
 
 **`ServiceManager`** owns the `Workspace`, a `DockerClient`, and the loaded
 `ServiceState`:
 
-- `start_services` is the entry point and runs in two phases. Phase 1 walks
-  the targets in start order (role topological order in roles mode;
-  declaration order with `run=` services last in legacy mode), running each
-  service's `pre-start` hooks just before bringing it to a healthy state with
-  `create_service`, then saves state. Phase 2 runs every target's
-  `post-start` hooks with the resolved environment. A `resolved` map, seeded
-  from `status` and grown as each service comes up, is threaded through both
-  phases so a `pre-start` hook sees the services already up and phase 2
-  reuses the same snapshot. `start_all` is a thin wrapper with an empty
-  filter. A `skip_hooks` flag (CLI `--skip-hooks`) short-circuits both hook
-  phases.
+- `start_services` opens the workspace's `WorkspaceLock` (below), reloads
+  state under it, then runs in two phases over the targets in start order
+  (role topological order in roles mode; declaration order with `run=`
+  services last in legacy mode). Phase 1 walks the targets one at a time,
+  running each service's `pre-start` hooks (via `run_service_pre_start`) just
+  before bringing it to a healthy state with `create_service`, then saves
+  state to disk immediately, before moving to the next target: if a later
+  target's hook or creation fails, whatever already started is still on disk
+  for `eph down` to find, rather than living only in the discarded in-memory
+  state. Phase 2 runs every target's `post-start` hooks with the fully
+  resolved environment. A `resolved` map, seeded from `status` and grown as
+  each service comes up, is threaded through both phases so a `pre-start`
+  hook sees the services already up and phase 2 reuses the same snapshot.
+  `start_all` is a thin wrapper with an empty filter. A `hooks: Hooks`
+  parameter (`All`, `None`, or `PreStartOnly`) selects which phases run:
+  `eph up` passes `Hooks::from_skip_flag(--skip-hooks)` (`All` or `None`);
+  `eph dev` passes `PreStartOnly` for its backing services so pre-start stays
+  interleaved per service exactly as under `up`, while post-start is deferred
+  until the foregrounded app is also healthy (see `run_all_post_start` below).
+- `run_service_pre_start` / `run_service_post_start` run one service's hooks
+  against an already-resolved `running` map; they are the shared core behind
+  both `start_services`' phases and the two public single-purpose methods
+  below.
+- `run_pre_start_for(eph, name)` runs one named service's `pre-start` hooks
+  against the services currently up. `eph dev` calls this for the foreground
+  app immediately before spawning it, so the hook is interleaved the same way
+  `eph up` interleaves every other service's: it sees the backing services
+  already up, never its own not-yet-assigned port. There is no
+  `run_all_pre_start` any more; interleaving replaced the old front-loaded
+  pass where every service's `pre-start` ran before anything existed.
+- `run_all_post_start(eph)` runs every declared service's `post-start` hooks
+  once, in start order, against a single resolved snapshot. `eph dev` calls
+  it after the backing services and the foreground app are all up, so a hook
+  can still reference any service's assigned port.
 - `create_service` is the idempotent core that produces a healthy
   `RunningService` (no hooks). For `run=` services it first probes the
-  tracked PID (a native liveness check via `proc::is_alive`) to avoid
+  tracked PID via `Backend::process_is_alive` (a liveness check that also
+  compares the recorded `ProcessIdentity`, not just PID presence, so a PID
+  reused by an unrelated process is never mistaken for the original) to avoid
   spawning duplicates. For Docker services it checks for an existing
   container: running means reuse, stopped means restart, absent means create
   fresh via the matching source path.
-- `run_all_pre_start` / `run_all_post_start` run every service's hooks in one
-  pass; `eph dev`, which drives the backing/foreground split by hand, uses
-  them to bracket its startup (`pre-start` up front, then `post-start` once
-  the foregrounded app is healthy).
 - `wait_for_healthy` polls `exec_in_container` (image/dockerfile) on a 1s
   interval under a `tokio::time::timeout`; no health check means a 500 ms
   sleep. `start_shell_command` and `start_compose` have their own host-side
   platform-shell health-check loops (compose default 60s).
-- `stop_service` takes the loaded `EphFile` and a snapshot of running
-  services, runs `pre-stop` with the resolved environment (a failure is
-  **propagated**, aborting teardown, unless `--skip-hooks`), then stops by
-  source type, then runs `post-stop` against the same pre-teardown snapshot
-  (also propagated on failure, but the service is already stopped, so it will
-  not re-run on a later `down`). Stopping goes by source type: Docker (stop,
+- `stop_all` opens the `WorkspaceLock`, reloads state, snapshots running
+  services, then stops every declared service (via `stop_service`, in the
+  reverse of start order) followed by every `orphaned_state_entries` (via
+  `stop_orphan`), saving state once at the end. There is no wholesale
+  `state.services.clear()`: each `stop_service` / `stop_orphan` call removes
+  only its own entry as it actually tears the service down, so a service that
+  fails to stop is not silently forgotten from state. `stop_selected` is the
+  same shape restricted to an explicit subset (a filtered `eph down`, or
+  `eph dev` tearing down only what it brought up).
+- `stop_service` runs `pre-stop` with the resolved environment (a failure is
+  **propagated**, aborting teardown, unless `--skip-hooks`), stops by source
+  type, then runs `post-stop` against the same pre-teardown snapshot (also
+  propagated on failure, but the service is already stopped, so it will not
+  re-run on a later `down`). Stopping goes by source type: Docker (stop,
   optionally remove), `run` (graceful terminate via `proc::terminate`, wait,
-  then `proc::force_kill`), or compose (`docker compose down`). For `run`,
-  teardown targets the whole process tree the shell spawned, not just the
-  wrapper PID: on Unix the shell is spawned in its own process group
-  (`process_group(0)`) and terminate/kill signal the group with `killpg`
-  (`SIGTERM` then `SIGKILL`, race-free), falling back to a `sysinfo`
-  descendant walk only for legacy non-grouped state; on Windows, which has no
-  signals and no reattachable process group, they walk and hard-terminate the
-  descendant tree. `stop_all` and `clean` snapshot running services once up
-  front and thread `skip_hooks` through; `stop_all` clears state.
+  then `proc::force_kill`, skipped entirely when `process_is_alive` is
+  already false), or compose (`docker compose down`, invoked only when
+  `running` or recorded state has the project up; a failure here is a real
+  error and propagates, no longer swallowed). For `run`, teardown targets the
+  whole process tree the shell spawned, not just the wrapper PID: on Unix the
+  shell is spawned in its own process group (`process_group(0)`) and
+  terminate/kill signal the group with `killpg` (`SIGTERM` then `SIGKILL`,
+  race-free), falling back to a `sysinfo` descendant walk only for legacy
+  non-grouped state; on Windows, which has no signals and no reattachable
+  process group, they walk and hard-terminate the descendant tree. Returns
+  `bool`: whether something was actually stopped or removed, so callers (in
+  particular `clean`) can report measured counts instead of counting declared
+  services. `stop_orphan` is the same teardown for a state entry whose
+  section was renamed or deleted from the `.eph` file: it works entirely from
+  the recorded `Backend` (no `Service` definition exists any more, so no
+  hooks run and no volumes are known), and also returns `bool`.
+  `orphaned_state_entries` is the plain diff (state keys minus declared
+  service names) both `stop_all` and `clean` use to find them.
 - `resolve_env_vars` / `command_env` / `hook_env` build the resolved
-  environment shared by `eph env`, `eph run`, and the lifecycle hooks.
-- `clean` stops and removes everything, removes per-workspace named volumes
-  (skipping bind mounts), clears state, and deletes the state directory,
-  returning a `CleanSummary`.
+  environment shared by `eph run` and the lifecycle hooks (both leave an
+  unresolved reference verbatim). `hook_env` resolves the owning service's own
+  `env.X` values' `${service.property}` references before overlaying them, so
+  a hook like `post-start` sees the same resolved values the service itself
+  was created with rather than a raw placeholder.
+- `resolve_env_vars_for_eval(eph, running) -> (Vec<(String, String)>,
+  Vec<OmittedVar>)` is `eph env`'s own resolver, used by `cmd_env` in
+  `main.rs` instead of `resolve_env_vars`: it calls
+  `resolve_against_tracked` (built on `parser::resolve_interpolations_tracked`)
+  per variable, and any variable with a still-unresolved reference is left out
+  of the returned pairs and reported as an `OmittedVar { name, service,
+  property }` instead (only the first unresolved reference per variable is
+  reported, which is enough to point at the fix). `cmd_env` prints a warning
+  per `OmittedVar` to stderr and exits `0` regardless. `resolve_property` is
+  the single `${service.host}` / `${service.port}` / `${service.port.NAME}`
+  lookup shared by both `resolve_against` (used by `resolve_env_vars` and the
+  Docker-container `env.<KEY>=` path in `DockerClient::run_image`) and
+  `resolve_against_tracked`.
+- `clean` opens the `WorkspaceLock`, reloads state, tears down every declared
+  service (`stop_service`) and every `orphaned_state_entries` (`stop_orphan`),
+  removes each stopped service's per-workspace named volumes (skipping bind
+  mounts), then sweeps Docker directly for any container or volume still
+  carrying the `eph-<short_id>-` prefix (`containers_with_prefix` /
+  `volumes_with_prefix`) to catch a service renamed before state recorded it,
+  or a resource left behind by a crash before state was written. It clears
+  in-memory state and deletes the state directory, and returns a
+  `CleanSummary` whose counts (`services_removed`, `volumes_removed`,
+  `state_removed`) reflect only what was actually removed, not what the
+  `.eph` file declares.
 - `status` reconciles persisted state against live containers and tracked
-  PIDs, returning only what is actually running.
+  PIDs (via `Backend::process_is_alive`, identity-checked), returning only
+  what is actually running.
 
 **State persistence:** `ServiceState { services: HashMap<String,
 ServiceStateEntry>, auto_ports: ... }`, serialized as pretty JSON to
@@ -232,11 +331,34 @@ ServiceStateEntry>, auto_ports: ... }`, serialized as pretty JSON to
 `backend` is a typed `Backend` enum: `Container { id }` for `image=` and
 `dockerfile=`, `Process { pid, identity }` for `run=`, or
 `Compose { project }` for compose. The PID is the addressable handle for
-teardown; `identity` is what `eph system prune` checks to avoid signaling a
-reused PID. `load` migrates a legacy file that used a stringly-typed
-`container_id` (a bare id, `pid:<n>`, or `compose:<project>`) plus a separate
-`processes` map. `auto_ports` records the ports allocated for `port=auto`
-declarations so they can be reused on the next `up` while still free.
+teardown; `identity` (`Backend::process_is_alive`) is what every liveness
+check (`status`, `create_service`'s dedup, `stop_service`, and `eph system
+prune`) compares against the live process before treating a PID as still
+belonging to the service that recorded it, so a PID reused by an unrelated
+process is never mistaken for it or signaled. `load` migrates a legacy file
+that used a stringly-typed `container_id` (a bare id, `pid:<n>`, or
+`compose:<project>`) plus a separate `processes` map; a file that fails to
+parse at all (a crash mid-write, manual editing, disk corruption) is
+quarantined to `state.json.corrupt` with a warning rather than treated as
+fatal, and `load` returns fresh empty state so `eph clean` still has
+something to reset. `save` writes atomically: it serializes to a sibling
+`state.json.tmp` and renames it over `state.json`, so a crash mid-write can
+never leave a truncated file behind. `auto_ports` records the ports allocated
+for `port=auto` declarations so they can be reused on the next `up` while
+still free.
+
+**`WorkspaceLock`** serializes the state-mutating commands (`start_services`,
+`stop_all`, `stop_selected`, `clean`) for one workspace. It is an
+`fd_lock::RwLock` write guard on `<state_dir's parent>/<dir_name>.lock`, a
+file next to (not inside) the state directory: `clean` deletes the state
+directory while holding this lock, and on Windows a directory cannot be fully
+removed while an open, locked file still lives inside it. Being an OS
+advisory lock rather than a marker file, it releases automatically when the
+holding process exits for any reason, so a killed `eph up` can never wedge
+the next command the way a stale marker file would. Every lock-holding method
+reloads `ServiceState` from disk immediately after acquiring the lock, since
+another command may have run and changed it between this `ServiceManager`'s
+construction and the lock actually being acquired.
 
 **`RunningService`** is the runtime handle returned to callers: `host()`
 (always `localhost`), `port()` (the `default` port, else any),
@@ -251,7 +373,10 @@ invocation, spawning places the child in its own process group on Unix,
 `is_alive` probes liveness (group probe on Unix, process-table lookup on
 Windows), and `terminate` / `force_kill` implement graceful-then-forced
 teardown of the whole tree. `ProcessIdentity` captures the launch-time
-identity (used by prune to refuse to kill a reused PID).
+identity, and `identity_matches` compares it against a live PID's current
+identity; both are used everywhere a recorded PID's liveness is checked
+(`ServiceManager` and `eph system prune` alike) to refuse to act on a PID that
+has been reused by an unrelated process.
 
 ## prune
 
@@ -262,25 +387,81 @@ has no path to check, so it is skipped unless the CLI passes
 `--compatibility-v042`; even then, the state directory name must look like an
 8-hex workspace short ID.
 
-System prune removes Docker resources by namespace prefix
-(`eph-<short_id>-`), so it does not need the original `.eph` or compose file.
-It removes containers first, then volumes, networks, images, and the state
-directory. For `run=` services it reads `state.json` and terminates only a
-PID whose current `ProcessIdentity` exactly matches the saved identity; old
-entries without identity, and mismatches, become warnings.
+Before removing anything for a stale-pathed workspace, `prune_workspace`
+checks it for signs of life: any container matching the `eph-<short_id>-`
+prefix that Docker reports as running, or any `run=` service whose recorded
+PID's `ProcessIdentity` still matches. A workspace that was only moved or
+renamed (rather than truly deleted) reads exactly like a dead one by path
+alone, so this guard is what keeps that case from having its live containers
+and processes force-killed; either count above zero reports the workspace as
+skipped (with a reason naming what is still alive) instead of pruning it.
+`PruneOptions::force_live` bypasses the guard entirely, restoring the
+unconditional old behavior. The same check runs during `--dry-run`, so the
+preview `eph system prune` shows before prompting matches what a real run
+would actually do.
+
+Once a workspace clears the liveness guard (or `force_live` is set), removal
+proceeds by namespace prefix (`eph-<short_id>-`), so it does not need the
+original `.eph` or compose file: containers first, then volumes, networks,
+images, and the state directory. For `run=` services it reads `state.json`
+and terminates only a PID whose current `ProcessIdentity` exactly matches the
+saved identity; old entries without identity, and mismatches, become
+warnings.
+
+`prune()` itself is made mutually exclusive across concurrent invocations by
+`open_prune_lock`, an `fd_lock::RwLock` write guard held on `<state_root>/
+prune.lock` for the call's duration. This replaced an earlier `PruneLock` that
+`create_new`'d the lock file and relied on `Drop` to delete it: a crash skipped
+`Drop`, so the file (and the lock) outlived the process, wedging every
+subsequent prune, including `--dry-run`, until someone deleted it by hand. The
+OS-level advisory lock releases the instant the holding process exits, crash
+or not.
+
+`eph system prune`'s confirmation prompt is decided by the pure
+`confirmation_outcome(would_remove, yes, stdin_is_terminal) -> ConfirmationOutcome`
+(`Proceed`, `Prompt`, or `RequireYes`), kept separate from the actual
+`std::io::stdin()` read so the decision is unit-testable without a real
+terminal: nothing to remove or `--yes` passed means proceed silently; an
+interactive terminal means show the "Remove these resources? [y/N]" prompt;
+a non-interactive stdin with something to remove and no `--yes` means refuse
+with an actionable error rather than silently doing nothing or silently
+proceeding. The CLI (`cmd_system_prune` in `main.rs`) runs `prune` once as a
+dry-run preview to decide and display what would happen, resolves the
+confirmation, then (if confirmed) runs `prune` again for real.
+
+`count_stale_workspaces(root, exclude_short_id) -> usize` is the cheap,
+Docker-free half of the same staleness check, reused for `eph up`'s passive
+nudge (`print_stale_workspace_nudge` in `main.rs`, run after every successful
+`up`): it walks `state_dirs(root)`, and for each directory whose name is a
+workspace short ID (skipping anything else, or a directory whose metadata
+cannot be loaded) checks `classify_workspace_path` on the recorded path,
+excluding `exclude_short_id` (the current workspace) so `up` never nudges
+about itself. It never touches Docker and never errors: an unreadable state
+root reads as zero, since the count must never turn a successful `up` into a
+failure.
 
 ## env
 
 `src/env.rs` is the pure rendering half of `eph env` (the workspace lookup
-and interpolation live in `main.rs`):
+lives in `cmd_env` in `main.rs`; interpolation lives in
+`service::resolve_env_vars_for_eval`, which `cmd_env` calls):
 
 - `render(vars, format)` dispatches to `render_export` / `render_fish` /
-  `render_json` and errors on an unknown format.
+  `render_powershell` / `render_json` and errors on an unknown format, listing
+  the four valid ones in the message.
 - `render_export` emits `export NAME="value"`; `render_fish` emits
-  `set -gx NAME "value"`; `render_json` emits a pretty JSON object.
+  `set -gx NAME "value"`; `render_powershell` emits `$env:NAME = 'value'`;
+  `render_json` emits a pretty JSON object.
 - `escape_bash` escapes `\ " $ `` ` ``; `escape_fish` escapes `\ " $` (fish
-  does not treat backticks specially in double quotes). Newlines are
-  preserved. The unit tests pin these exact strings.
+  does not treat backticks specially in double quotes); `escape_powershell`
+  doubles an embedded `'` (a single-quoted PowerShell string is the literal
+  form: nothing else is interpolated inside it, so nothing else needs
+  escaping). Newlines are preserved. The unit tests pin these exact strings.
+- `render_json` builds a `serde_json::Map` (not a `HashMap`) and inserts in
+  input order, so the emitted keys follow the `.eph` file's declaration order:
+  this crate enables serde_json's `preserve_order` feature specifically so
+  that ordering survives serialization. A `HashMap`-backed implementation
+  would scramble it, which is exactly what the unit tests pin against.
 
 ## skills
 
@@ -288,7 +469,15 @@ and interpolation live in `main.rs`):
 implements `eph skills install` (write into `.claude/skills/` and
 `.agents/skills/` at the git repo root, never clobbering local edits without
 `--force`), `eph skills check` (byte-compare, non-zero exit on drift; CI runs
-this), and `eph skills list`.
+this), and `eph skills list`. `skills_root` (`main.rs`) falls back to the
+current directory when it is not inside a git repo, printing a warning on
+stderr naming that directory so the fallback is never silent. `confine_to_root`
+rejects a `--dir` value that is absolute, contains `..`, or (on Windows) that
+carries a `Component::Prefix` (a drive-relative path like `C:foo`, or a UNC
+path): `C:foo` is not absolute by `Path::is_absolute`'s rules (it needs both a
+prefix *and* a root), yet `root.join("C:foo")` still discards `root` entirely
+because any `Prefix` component makes `join` do that, the same escape an
+absolute path or a `..` gets.
 
 ## update
 
@@ -300,16 +489,69 @@ and a detached `__update-check` invocation (a hidden subcommand) refreshes
 the cache at most once a day. `EPH_REPO` / `EPH_BASE_URL` override the
 source; `EPH_NO_UPDATE_CHECK` silences the nag.
 
+`effective_repo()` (`env_nonempty("EPH_REPO")` or `DEFAULT_REPO`) is the single
+source `Updater::new`, the passive nag, and the background refresh worker all
+read, so the three agree on which repo's releases they mean. `cache_path(repo)`
+namespaces the cache file by that repo: `<dirs::cache_dir()>/eph/update-check-
+<sanitized-repo>.json`, where `sanitize_repo_for_filename` replaces anything
+outside `[A-Za-z0-9._-]` (crucially the `/` between owner and repo) with `-`,
+so `attunehq/doteph` becomes `update-check-attunehq-doteph.json`. Before this,
+`eph update` and the passive nag shared one unnamespaced cache file, so
+pointing `EPH_REPO` at a fork to test a build would poison (or read stale data
+from) the default repo's cached nag; per-repo namespacing keeps that from
+happening. `read_cache(repo)` / `write_cache(repo, cache)` take the repo
+explicitly rather than re-deriving it, so the caller decides which repo's
+cache it means.
+
 ## main
 
-`src/main.rs` defines the `clap` `Cli`/`Commands`, initializes `tracing`
-(debug if `--verbose`, else info) writing to **stderr** so stdout stays clean
-for `eph env`, and dispatches to `cmd_*` functions. Each `cmd_*` resolves the
-workspace, loads and parses `.eph` (`load_eph_file`), and drives the relevant
-`ServiceManager` calls. `cmd_env` and `cmd_run` resolve the environment
-through `service::resolve_env_vars` (and `ServiceManager::command_env` for
-`cmd_run`), the same builder the lifecycle hooks use; `cmd_run` then execs the
-given command with that environment and propagates its exit code. The
-`eph dev` loop and its `--watch` restarts live here too, driving the library
-through the same `ServiceManager` calls; `src/watch.rs` supplies the
-debounced, gitignore-style file watching.
+`src/main.rs` defines the `clap` `Cli`/`Commands`, initializes `tracing` via
+`init_tracing` (debug if `--verbose`, else info) writing to **stderr** so
+stdout stays clean for `eph env`, and dispatches to `cmd_*` functions.
+
+`eph run`'s own argv is special-cased before `Cli::parse()` ever runs:
+`split_run_argv(&argv[1..])` splits the raw process argv into
+`(global_args, command_args)` when the invocation is `eph [-v] run <cmd...>`,
+so every token from `run`'s first argument onward (including one shaped like a
+flag: `-v`, `-h`, `--foo`) reaches `cmd_run` untouched instead of being
+recognized by clap's `global = true` verbose flag or its auto
+`-h`/`--help`/`-V`/`--version`, which would otherwise match anywhere on the
+command line. `split_run_argv` returns `None` (falling through to ordinary
+`Cli::parse()`) when `run` is not the subcommand being invoked at all: no
+`run` token, a non-flag token before it, or (crucially) `eph help run`, so
+clap's generated help keeps working; it also falls through when `run`'s own
+command is empty, so clap's "required argument" error still fires. The
+`Commands::Run` variant itself sets `disable_help_flag` / `disable_version_flag`
+so clap does not try to claim `-h`/`-V` when generating that help text.
+
+Each `cmd_*` resolves the workspace, loads and parses `.eph` (`load_eph_file`),
+and drives the relevant `ServiceManager` calls. `cmd_run` resolves the
+environment through `service::resolve_env_vars` (via
+`ServiceManager::command_env`), the same builder the lifecycle hooks use, and
+leaves an unresolved `${service.property}` reference verbatim; it then execs
+the given command with that environment and propagates its exit code. `cmd_env`
+instead calls `service::resolve_env_vars_for_eval`, printing a `warning:
+omitted ...` line to stderr for each returned `OmittedVar` before rendering the
+resolvable pairs, and always exits `0`. `cmd_up` passes
+`Hooks::from_skip_flag(--skip-hooks)` straight through to `start_services`,
+then calls `print_stale_workspace_nudge` (backed by
+`prune::count_stale_workspaces`) to print the stale-workspace note described in
+[prune](#prune) above; that call is swallowed on any error resolving the state
+root, since it must never turn a successful `up` into a failure.
+
+The `eph dev` loop and its `--watch` restarts live here too, driving the
+library through the same `ServiceManager` calls; `src/watch.rs` supplies the
+debounced, gitignore-style file watching. `dev_bring_up` reproduces `eph up`'s
+hook interleaving by hand for the backing/foreground split: it starts the
+backing services with `Hooks::PreStartOnly` (their `pre-start` hooks run
+per-service, `post-start` deferred), then calls `run_pre_start_for` for the
+foreground app immediately before `start_foreground` spawns it, then finally
+`run_all_post_start` once the foreground app is healthy too, so a seed hook
+can reference the app's own assigned port. `eph dev --skip-hooks` skips all
+three calls, matching `eph up --skip-hooks` / `eph down --skip-hooks`.
+
+`cmd_system_prune` runs `eph::prune` once as a dry-run preview (so the
+confirmation prompt, when shown, describes exactly what is about to happen),
+resolves `eph::confirmation_outcome` against `io::stdin().is_terminal()` and
+the `-y`/`--yes` flag, then (once confirmed, or immediately when nothing
+needs confirming) runs `eph::prune` again for real.
