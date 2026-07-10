@@ -28,6 +28,64 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
+/// One `${service.property}` reference that runtime state could not resolve.
+///
+/// Keeping the reference structured lets every execution boundary report the
+/// exact missing service property without searching a partially expanded
+/// string again.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnresolvedReference {
+    /// Service named by the interpolation.
+    pub service: String,
+    /// Property named by the interpolation.
+    pub property: String,
+}
+
+/// One environment variable that cannot be passed to a child safely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedEnvVar {
+    /// Environment variable name.
+    pub name: String,
+    /// Missing references in first-occurrence order, without duplicates.
+    pub references: Vec<UnresolvedReference>,
+}
+
+/// Failure to resolve a complete environment.
+///
+/// `resolved` is retained so `eph env` can still print safe assignments and
+/// explicit unsets before returning a failure status. Execution paths must use
+/// the `Ok` value and therefore cannot accidentally launch with partial data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedEnvironment {
+    /// Variables that were completely resolved, in declaration order.
+    pub resolved: Vec<(String, String)>,
+    /// Variables containing one or more unavailable references.
+    pub unresolved: Vec<UnresolvedEnvVar>,
+}
+
+impl std::fmt::Display for UnresolvedEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not resolve environment")?;
+        for (index, variable) in self.unresolved.iter().enumerate() {
+            if index == 0 {
+                write!(f, ": ")?;
+            } else {
+                write!(f, "; ")?;
+            }
+            write!(f, "{} requires ", variable.name)?;
+            for (reference_index, reference) in variable.references.iter().enumerate() {
+                if reference_index > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "${{{}.{}}}", reference.service, reference.property)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UnresolvedEnvironment {}
+
 // ============================================================================
 // Running Service Info
 // ============================================================================
@@ -82,14 +140,13 @@ pub struct LogOptions {
 /// [`EphFile`] against the currently running services.
 ///
 /// This expands `${service.host}`, `${service.port}`, and `${service.port.NAME}`
-/// interpolations using the assigned host ports in `running`, and is exactly
-/// the set of pairs that `eph env` emits. A reference to a service that is not
-/// in `running` is left as the literal `${...}` placeholder, matching
-/// [`resolve_interpolations`].
+/// interpolations using the assigned host ports in `running`. A reference to a
+/// service that is not in `running` is left as the literal `${...}` placeholder,
+/// matching [`resolve_interpolations`]. Execution boundaries should use
+/// [`resolve_env_vars_strict`] so a partial environment cannot reach a child.
 ///
-/// It is shared by `eph env` and by the lifecycle-hook / `eph run` machinery so
-/// that a lifecycle hook (`pre-start`, `post-start`, `pre-stop`, `post-stop`)
-/// and a developer's shell all see the same resolved environment.
+/// This permissive form remains available to lifecycle planning code that may
+/// resolve again after another service starts.
 #[must_use]
 pub fn resolve_env_vars(
     eph: &EphFile,
@@ -106,9 +163,8 @@ pub fn resolve_env_vars(
 ///
 /// A reference to a service that is not in `running` (or a property it does not
 /// expose) is left as the literal `${...}` placeholder, matching
-/// [`resolve_interpolations`]. Shared by [`resolve_env_vars`] (top-level `eph
-/// env` variables) and by the managed-app environment so that a `run=` service
-/// can read its own assigned `${self.port}` the same way.
+/// [`resolve_interpolations`]. Use [`resolve_against_strict`] before passing the
+/// result to a process, container, or Compose invocation.
 #[must_use]
 pub fn resolve_against(value: &str, running: &HashMap<String, RunningService>) -> String {
     resolve_interpolations(value, |service, property| {
@@ -135,8 +191,7 @@ fn resolve_property(
 }
 
 /// Like [`resolve_against`], but also returns every unresolved
-/// `${service.property}` reference in `value`, for `eph env`'s omit-and-warn
-/// contract (see [`resolve_env_vars_for_eval`]).
+/// `${service.property}` reference in `value`.
 fn resolve_against_tracked(
     value: &str,
     running: &HashMap<String, RunningService>,
@@ -146,59 +201,58 @@ fn resolve_against_tracked(
     })
 }
 
-/// One `eph env` variable omitted from the resolved output because its value
-/// still contained an unresolved `${service.property}` reference (typically:
-/// the referenced service is not running).
+/// Resolve a value completely or return its unavailable references.
 ///
-/// Carries enough for a specific stderr warning naming both the omitted
-/// variable and the one reference that failed; see [`resolve_env_vars_for_eval`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OmittedVar {
-    /// The top-level variable name that was omitted.
-    pub name: String,
-    /// The `service` half of the reference that could not be resolved.
-    pub service: String,
-    /// The `property` half of the reference that could not be resolved.
-    pub property: String,
-}
-
-/// Resolve `eph env`'s top-level variables for direct `eval`, omitting any
-/// variable whose value still contains an unresolved `${service.property}`
-/// reference rather than handing the caller's shell a literal placeholder.
-///
-/// This is `eph env`'s own contract, distinct from [`resolve_env_vars`] (used
-/// by lifecycle hooks, `eph run`, and a service's own `env.` entries), which
-/// all still leave an unresolved reference verbatim: a hook may legitimately
-/// run before the service it references starts, and the placeholder is a
-/// recognizable, documented signal there. `eph env`'s output, by contrast, is
-/// meant to be `eval`'d directly, so a variable that cannot be fully resolved
-/// must not leak `${...}` syntax into the caller's shell.
-///
-/// Returns the resolvable pairs, in declaration order, plus one [`OmittedVar`]
-/// per variable left out (one entry per variable even if its value carries
-/// several unresolved references: only the first is reported, which is enough
-/// to point at the fix). The caller is expected to print a warning for each.
-#[must_use]
-pub fn resolve_env_vars_for_eval(
-    eph: &EphFile,
+/// References are reported in first-occurrence order and deduplicated. The
+/// returned `String` therefore proves that it contains no unresolved eph
+/// interpolation and is safe to pass across an execution boundary.
+pub fn resolve_against_strict(
+    value: &str,
     running: &HashMap<String, RunningService>,
-) -> (Vec<(String, String)>, Vec<OmittedVar>) {
-    let mut resolved = Vec::with_capacity(eph.env_vars.len());
-    let mut omitted = Vec::new();
-    for var in &eph.env_vars {
-        let (value, mut unresolved) = resolve_against_tracked(&var.value, running);
-        if unresolved.is_empty() {
-            resolved.push((var.name.clone(), value));
-        } else {
-            let (service, property) = unresolved.remove(0);
-            omitted.push(OmittedVar {
-                name: var.name.clone(),
-                service,
-                property,
-            });
+) -> std::result::Result<String, Vec<UnresolvedReference>> {
+    let (resolved, references) = resolve_against_tracked(value, running);
+    let mut unique = Vec::new();
+    for (service, property) in references {
+        let reference = UnresolvedReference { service, property };
+        if !unique.contains(&reference) {
+            unique.push(reference);
         }
     }
-    (resolved, omitted)
+    if unique.is_empty() {
+        Ok(resolved)
+    } else {
+        Err(unique)
+    }
+}
+
+/// Resolve every top-level environment variable before execution.
+///
+/// The `Ok` variant is the complete environment in declaration order. On
+/// failure, [`UnresolvedEnvironment`] retains the safe subset for shell output
+/// while making the structured misses available for diagnostics and unsets.
+pub fn resolve_env_vars_strict(
+    eph: &EphFile,
+    running: &HashMap<String, RunningService>,
+) -> std::result::Result<Vec<(String, String)>, UnresolvedEnvironment> {
+    let mut resolved = Vec::with_capacity(eph.env_vars.len());
+    let mut unresolved = Vec::new();
+    for var in &eph.env_vars {
+        match resolve_against_strict(&var.value, running) {
+            Ok(value) => resolved.push((var.name.clone(), value)),
+            Err(references) => unresolved.push(UnresolvedEnvVar {
+                name: var.name.clone(),
+                references,
+            }),
+        }
+    }
+    if unresolved.is_empty() {
+        Ok(resolved)
+    } else {
+        Err(UnresolvedEnvironment {
+            resolved,
+            unresolved,
+        })
+    }
 }
 
 /// Build the `EPH_*` metadata variables describing the workspace and the
@@ -3579,12 +3633,9 @@ impl ServiceManager {
         Ok(())
     }
 
-    /// The environment a non-service command (`eph run`) inherits from eph: the
-    /// resolved top-level `.eph` variables plus the `EPH_*` metadata variables.
-    ///
-    /// This is the same connection environment `eph env` emits, augmented with
-    /// metadata, so an arbitrary command can reach the running services exactly
-    /// as a developer's shell would after `eval "$(eph env)"`.
+    /// Build the partially resolved environment used while lifecycle work is in
+    /// progress. Execution boundaries must use [`Self::command_env_strict`] or
+    /// resolve their final values with [`resolve_against_strict`].
     #[must_use]
     pub fn command_env(
         &self,
@@ -3594,6 +3645,18 @@ impl ServiceManager {
         let mut env = resolve_env_vars(eph, running);
         env.extend(eph_metadata_env(&self.workspace, running));
         env
+    }
+
+    /// Build the complete environment for `eph run`, rejecting unavailable
+    /// top-level service references before a child process is created.
+    pub fn command_env_strict(
+        &self,
+        eph: &EphFile,
+        running: &HashMap<String, RunningService>,
+    ) -> std::result::Result<Vec<(String, String)>, UnresolvedEnvironment> {
+        let mut env = resolve_env_vars_strict(eph, running)?;
+        env.extend(eph_metadata_env(&self.workspace, running));
+        Ok(env)
     }
 
     /// The environment overlaid on a lifecycle hook (`pre-start`, `post-start`,
@@ -3689,72 +3752,70 @@ mod tests {
     }
 
     #[test]
-    fn eval_resolution_omits_a_variable_with_an_unresolved_reference() {
-        let eph = eph_with_env(&[("DATABASE_URL", "postgres://localhost:${db.port}/app")]);
-        let running = HashMap::new(); // db is not running
+    fn strict_resolution_reports_ordered_deduplicated_references() {
+        let eph = eph_with_env(&[
+            (
+                "DATABASE_URL",
+                "${db.port}/${cache.port}/${db.port}/${db.host}",
+            ),
+            ("READY", "yes"),
+        ]);
 
-        let (resolved, omitted) = resolve_env_vars_for_eval(&eph, &running);
-        assert!(resolved.is_empty(), "got: {resolved:?}");
-        assert_eq!(omitted.len(), 1);
-        assert_eq!(omitted[0].name, "DATABASE_URL");
-        assert_eq!(omitted[0].service, "db");
-        assert_eq!(omitted[0].property, "port");
+        let error = resolve_env_vars_strict(&eph, &HashMap::new()).unwrap_err();
+
+        assert_eq!(
+            error.resolved,
+            vec![("READY".to_string(), "yes".to_string())]
+        );
+        assert_eq!(error.unresolved.len(), 1);
+        assert_eq!(error.unresolved[0].name, "DATABASE_URL");
+        assert_eq!(
+            error.unresolved[0].references,
+            vec![
+                UnresolvedReference {
+                    service: "db".to_string(),
+                    property: "port".to_string(),
+                },
+                UnresolvedReference {
+                    service: "cache".to_string(),
+                    property: "port".to_string(),
+                },
+                UnresolvedReference {
+                    service: "db".to_string(),
+                    property: "host".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
-    fn eval_resolution_keeps_a_fully_resolvable_variable() {
-        let eph = eph_with_env(&[("DATABASE_URL", "postgres://localhost:${db.port}/app")]);
-        let running = running_with("db", 5432);
+    fn strict_resolution_returns_only_complete_values() {
+        let eph = eph_with_env(&[("DATABASE_URL", "redis://${db.host}:${db.port}")]);
 
-        let (resolved, omitted) = resolve_env_vars_for_eval(&eph, &running);
-        assert!(omitted.is_empty(), "got: {omitted:?}");
+        let resolved = resolve_env_vars_strict(&eph, &running_with("db", 6379)).unwrap();
+
         assert_eq!(
             resolved,
             vec![(
                 "DATABASE_URL".to_string(),
-                "postgres://localhost:5432/app".to_string()
+                "redis://localhost:6379".to_string(),
             )]
         );
     }
 
     #[test]
-    fn eval_resolution_treats_the_escaped_form_as_resolved() {
-        // `$${` is a literal `${`, never a reference, so it must not be omitted.
+    fn strict_resolution_treats_escaped_interpolation_as_literal_text() {
         let eph = eph_with_env(&[("LITERAL", "cost is $${db.port} dollars")]);
-        let running = HashMap::new();
 
-        let (resolved, omitted) = resolve_env_vars_for_eval(&eph, &running);
-        assert!(omitted.is_empty(), "got: {omitted:?}");
+        let resolved = resolve_env_vars_strict(&eph, &HashMap::new()).unwrap();
+
         assert_eq!(
             resolved,
             vec![(
                 "LITERAL".to_string(),
-                "cost is ${db.port} dollars".to_string()
+                "cost is ${db.port} dollars".to_string(),
             )]
         );
-    }
-
-    #[test]
-    fn eval_resolution_only_omits_the_variable_that_actually_missed() {
-        let eph = eph_with_env(&[
-            ("OK", "${db.port}"),
-            ("MISSING", "${ghost.port}"),
-            ("ALSO_OK", "static"),
-        ]);
-        let running = running_with("db", 5432);
-
-        let (resolved, omitted) = resolve_env_vars_for_eval(&eph, &running);
-        assert_eq!(
-            resolved,
-            vec![
-                ("OK".to_string(), "5432".to_string()),
-                ("ALSO_OK".to_string(), "static".to_string()),
-            ]
-        );
-        assert_eq!(omitted.len(), 1);
-        assert_eq!(omitted[0].name, "MISSING");
-        assert_eq!(omitted[0].service, "ghost");
-        assert_eq!(omitted[0].property, "port");
     }
 
     fn port(name: Option<&str>, container_port: u16) -> PortMapping {

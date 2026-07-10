@@ -148,6 +148,16 @@ fn exit_7_command() -> Vec<&'static str> {
 }
 
 #[cfg(windows)]
+fn exit_301_command() -> Vec<&'static str> {
+    vec!["run", "cmd", "/C", "exit /B 301"]
+}
+
+#[cfg(unix)]
+fn terminate_with_sigterm_command() -> Vec<&'static str> {
+    vec!["run", "sh", "-c", "kill -TERM $$"]
+}
+
+#[cfg(windows)]
 fn exit_7_command() -> Vec<&'static str> {
     vec!["run", "cmd", "/C", "exit /B 7"]
 }
@@ -1330,6 +1340,47 @@ port=6379
     );
 }
 
+/// Windows process statuses are 32-bit values. `eph run` must not narrow them
+/// through Rust's eight-bit `ExitCode` wrapper.
+#[cfg(windows)]
+#[tokio::test]
+async fn eph_run_preserves_windows_exit_codes_above_255() {
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+
+    let output = ws.eph(&exit_301_command()).await;
+
+    assert_eq!(output.status.code(), Some(301));
+}
+
+/// A signal-terminated child maps to the conventional shell status instead of
+/// the unrelated generic failure code 1.
+#[cfg(unix)]
+#[tokio::test]
+async fn eph_run_maps_unix_signals_to_shell_status() {
+    let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
+
+    let output = ws.eph(&terminate_with_sigterm_command()).await;
+
+    assert_eq!(output.status.code(), Some(143));
+}
+
+/// A command is never launched with an unresolved top-level interpolation.
+#[tokio::test]
+async fn eph_run_refuses_an_unresolved_environment() {
+    let ws = TestWorkspace::new(
+        "[db]\nimage=postgres:16\nport=5432\n[env]\nDATABASE_URL=postgres://localhost:${db.port}/app\n",
+    );
+
+    let output = ws.eph(&exit_7_command()).await;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("DATABASE_URL") && stderr.contains("${db.port}"),
+        "got: {stderr}"
+    );
+}
+
 /// Regression for #15: a malformed `command=` override must fail closed even
 /// when the service's container already exists (the reuse fast path), not only
 /// on first create. The error is reported at `up` time, not silently smuggled
@@ -2492,14 +2543,11 @@ async fn dev_forwards_stdio_to_the_foreground_app() {
 // eph env: unresolved references, powershell format, and json ordering
 // ============================================================================
 
-/// `eph env` omits a variable whose value still contains an unresolved
-/// `${service.property}` reference, names it (and the reference) in a warning
-/// on stderr, and still exits zero. This is `eph env`'s own contract: hooks,
-/// `eph run`, and a service's own `env.` all keep the old leave-verbatim
-/// behavior instead. Once the referenced service actually starts, the same
-/// variable resolves and appears in stdout.
+/// `eph env` clears a variable whose value is unresolved, makes the rendered
+/// shell program fail, and exits nonzero itself. Once the referenced service
+/// starts, the same variable resolves normally.
 #[tokio::test]
-async fn env_omits_unresolved_reference_and_warns() {
+async fn env_unsets_unresolved_reference_and_fails_closed() {
     let ws = TestWorkspace::new(
         r#"
 [db]
@@ -2513,20 +2561,16 @@ DATABASE_URL=postgres://user:pass@localhost:${db.port}/app
 
     // `db` is never started, so DATABASE_URL cannot resolve.
     let out = ws.eph(&["env"]).await;
-    assert!(
-        out.status.success(),
-        "eph env should still exit 0 with an unresolved reference: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(!out.status.success(), "unresolved env must exit nonzero");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        !stdout.contains("DATABASE_URL"),
-        "unresolved variable should be omitted from stdout, got:\n{stdout}"
+        stdout.contains("unset DATABASE_URL") && stdout.ends_with("false\n"),
+        "stdout must clear stale state and make eval fail, got:\n{stdout}"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("DATABASE_URL") && stderr.contains("${db.port}"),
-        "stderr should name the omitted variable and its unresolved reference, got:\n{stderr}"
+        "stderr should name the variable and unresolved reference, got:\n{stderr}"
     );
 
     // Once `db` is up, the same variable resolves and appears.
@@ -2539,6 +2583,42 @@ DATABASE_URL=postgres://user:pass@localhost:${db.port}/app
     );
 
     ws.eph_ok(&["down"]).await;
+}
+
+#[tokio::test]
+async fn env_unresolved_output_is_safe_in_every_format() {
+    let ws = TestWorkspace::new(
+        "[db]\nimage=postgres:16\nport=5432\n[env]\nDATABASE_URL=postgres://localhost:${db.port}/app\n",
+    );
+
+    for (format, expected) in [
+        ("export", "unset DATABASE_URL\nfalse\n"),
+        ("fish", "set -e DATABASE_URL\nfalse\n"),
+        (
+            "powershell",
+            "Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue\nthrow 'eph env: unresolved variables'\n",
+        ),
+    ] {
+        let output = ws.eph(&["env", "--format", format]).await;
+        assert!(!output.status.success(), "{format} must exit nonzero");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    }
+
+    let json = ws.eph(&["env", "--format", "json"]).await;
+    assert!(!json.status.success(), "json must exit nonzero");
+    assert_eq!(String::from_utf8_lossy(&json.stdout), "{}\n");
+}
+
+#[tokio::test]
+async fn relative_eph_state_root_is_rejected() {
+    let ws = TestWorkspace::new("[db]\nimage=postgres:16\n");
+
+    let output = ws
+        .eph_with_envs(&["check"], &[("EPH_STATE_ROOT", "relative/state")])
+        .await;
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must be an absolute path"));
 }
 
 /// `eph env --format powershell` emits `$env:NAME = 'value'` lines, doubling an
@@ -2658,17 +2738,17 @@ async fn up_nudges_about_stale_workspaces() {
     let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
     let root_str = state_root.path().to_string_lossy().into_owned();
 
-    // A fabricated stale workspace: an 8-hex-digit state dir with metadata
+    // A fabricated stale workspace: a 16-hex-digit state dir with metadata
     // (the exact shape `Workspace::save_metadata` writes) pointing at a path
     // that does not exist.
-    let stale_dir = state_root.path().join("deadbeef");
+    let stale_dir = state_root.path().join("deadbeefdeadbeef");
     std::fs::create_dir_all(&stale_dir).unwrap();
     let metadata = serde_json::json!({
         "schema": 1,
         "workspace_id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-        "short_id": "deadbeef",
+        "short_id": "deadbeefdeadbeef",
         "workspace_path": "/this/path/does/not/exist-eph-integration-test",
-        "container_prefix": "eph-deadbeef",
+        "container_prefix": "eph-deadbeefdeadbeef",
         "last_seen_unix_secs": 0
     });
     std::fs::write(

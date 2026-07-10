@@ -450,12 +450,10 @@ enum Direction {
 /// Turn a command's positional SERVICE names and `--role` values into the set of
 /// service names to act on.
 ///
-/// Positional names are validated against the file and taken as-is. Each `--role`
-/// expands to its services plus, in the requested direction, the services it
-/// depends on (`Up`) or that depend on it (`Down`). The two are unioned, order
-/// preserved and duplicates dropped, so `eph up web --role dep` starts `web` and
-/// the whole dependency tier. An empty result means "act on everything", matching
-/// a bare `eph up` / `eph down`.
+/// In roles mode, a positional name selects that one service from its own role
+/// plus every service in dependency roles (`Up`) or dependent roles (`Down`).
+/// `--role` selects whole roles. The two forms are unioned with duplicates
+/// dropped. Outside roles mode, positional names remain exact selections.
 fn resolve_service_selection(
     eph: &EphFile,
     services: Vec<String>,
@@ -467,7 +465,29 @@ fn resolve_service_selection(
             anyhow::bail!("unknown service: {}", name);
         }
     }
-    let mut names = services;
+    let mut names = services.clone();
+    if eph.roles_order.is_some() {
+        for name in &services {
+            let service = &eph.services[name];
+            let role = service
+                .role
+                .as_ref()
+                .expect("roles mode requires every service to have a role");
+            let expanded = match dir {
+                Direction::Up => eph.services_for_roles_up(std::slice::from_ref(role))?,
+                Direction::Down => eph.services_for_roles_down(std::slice::from_ref(role))?,
+            };
+            for expanded_name in expanded {
+                let expanded_role = eph.services[&expanded_name]
+                    .role
+                    .as_ref()
+                    .expect("roles mode requires every service to have a role");
+                if expanded_role != role && !names.contains(&expanded_name) {
+                    names.push(expanded_name);
+                }
+            }
+        }
+    }
     if !roles.is_empty() {
         let from_roles = match dir {
             Direction::Up => eph.services_for_roles_up(roles)?,
@@ -1303,13 +1323,9 @@ fn print_service_ports(name: &str, svc: &RunningService) {
 
 /// `eph env`: print the resolved top-level variables for `eval`.
 ///
-/// Unlike lifecycle hooks and `eph run` (which use [`eph::resolve_env_vars`]
-/// and leave an unresolved `${service.property}` reference verbatim), this
-/// command's output is handed straight to a shell's `eval`. A literal
-/// `${...}` there would be a syntax the shell cannot evaluate meaningfully, so
-/// a variable that still has one is dropped from stdout entirely and named in
-/// a warning on stderr instead; the command still exits 0; see
-/// [`eph::resolve_env_vars_for_eval`].
+/// Any unresolved variable is explicitly cleared in shell formats. The
+/// rendered program then fails, and this process returns an error too, so both
+/// direct use and the documented `eval "$(eph env)"` form fail closed.
 async fn cmd_env(format: &str) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
@@ -1317,24 +1333,24 @@ async fn cmd_env(format: &str) -> Result<()> {
     let manager = ServiceManager::new(workspace).await?;
     let running = manager.status().await?;
 
-    let (env_vars, omitted) = eph::resolve_env_vars_for_eval(&eph, &running);
-
-    for var in &omitted {
-        let not_running = if running.contains_key(&var.service) {
-            String::new()
-        } else {
-            format!(" while {} is not running", var.service)
-        };
-        eprintln!(
-            "warning: omitted {}: ${{{}.{}}} is not resolvable{not_running}",
-            var.name, var.service, var.property
-        );
+    match eph::resolve_env_vars_strict(&eph, &running) {
+        Ok(env_vars) => {
+            print!("{}", eph::render(&env_vars, format)?);
+            Ok(())
+        }
+        Err(error) => {
+            let names = error
+                .unresolved
+                .iter()
+                .map(|variable| variable.name.clone())
+                .collect::<Vec<_>>();
+            print!(
+                "{}",
+                eph::render_with_unsets(&error.resolved, &names, format)?
+            );
+            Err(error.into())
+        }
     }
-
-    // Render in the requested format
-    print!("{}", eph::render(&env_vars, format)?);
-
-    Ok(())
 }
 
 /// Run an arbitrary command with eph's resolved environment overlaid on the
@@ -1346,7 +1362,7 @@ async fn cmd_run(command: Vec<String>) -> Result<ExitCode> {
 
     let manager = ServiceManager::new(workspace).await?;
     let running = manager.status().await?;
-    let env = manager.command_env(&eph, &running);
+    let env = manager.command_env_strict(&eph, &running)?;
 
     // `required = true` on the arg guarantees a non-empty vector.
     let (program, rest) = command
@@ -1362,10 +1378,26 @@ async fn cmd_run(command: Vec<String>) -> Result<ExitCode> {
         .status()
         .with_context(|| format!("failed to run command: {}", program))?;
 
-    // Propagate the child's exit code. A process killed by a signal has no
-    // code; report the conventional 128 + signal-style failure as 1.
-    let code = status.code().unwrap_or(1);
-    Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
+    exit_with_child_status(status)
+}
+
+/// Terminate eph with the child's native status without narrowing it to the
+/// eight-bit [`ExitCode`] API. Windows preserves the full process status. Unix
+/// maps a signal termination to the shell convention `128 + signal`.
+fn exit_with_child_status(status: std::process::ExitStatus) -> ! {
+    if let Some(code) = status.code() {
+        std::process::exit(code);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            std::process::exit(128 + signal);
+        }
+    }
+
+    std::process::exit(1)
 }
 
 /// Show logs for one service (raw), or every service interleaved and tagged.
@@ -1808,6 +1840,42 @@ mod tests {
         let (global, command) = split_run_argv(&argv).expect("run should split");
         assert!(global.is_empty());
         assert_eq!(command, &args(&["make", "run"])[..]);
+    }
+
+    #[test]
+    fn positional_up_adds_dependency_roles_without_selecting_peer_services() {
+        let eph = parse_eph(
+            "roles_order=dep,app\n[db]\nimage=postgres:16\nrole=dep\n[cache]\nimage=redis:7\nrole=dep\n[web]\nrun=web\nrole=app\n[worker]\nrun=worker\nrole=app\n",
+        );
+
+        let selected = resolve_service_selection(&eph, args(&["web"]), &[], Direction::Up).unwrap();
+
+        assert_eq!(selected, args(&["web", "db", "cache"]));
+    }
+
+    #[test]
+    fn positional_down_adds_dependent_roles_without_selecting_peer_services() {
+        let eph = parse_eph(
+            "roles_order=dep,app\n[db]\nimage=postgres:16\nrole=dep\n[cache]\nimage=redis:7\nrole=dep\n[web]\nrun=web\nrole=app\n[worker]\nrun=worker\nrole=app\n",
+        );
+
+        let selected =
+            resolve_service_selection(&eph, args(&["db"]), &[], Direction::Down).unwrap();
+
+        assert_eq!(selected, args(&["db", "web", "worker"]));
+    }
+
+    #[test]
+    fn role_flag_still_selects_the_entire_requested_role() {
+        let eph = parse_eph(
+            "roles_order=dep,app\n[db]\nimage=postgres:16\nrole=dep\n[cache]\nimage=redis:7\nrole=dep\n[web]\nrun=web\nrole=app\n[worker]\nrun=worker\nrole=app\n",
+        );
+
+        let selected =
+            resolve_service_selection(&eph, args(&["web"]), &args(&["app"]), Direction::Up)
+                .unwrap();
+
+        assert_eq!(selected, args(&["web", "db", "cache", "worker"]));
     }
 
     #[test]

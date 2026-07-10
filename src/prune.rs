@@ -696,7 +696,7 @@ fn docker_name_has_prefix(name: &str, prefix: &str) -> bool {
 }
 
 fn is_workspace_short_id(value: &str) -> bool {
-    value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    matches!(value.len(), 8 | 16) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn ignore_not_found<T: Default>(err: BollardError) -> std::result::Result<T, BollardError> {
@@ -872,11 +872,13 @@ mod tests {
     }
 
     #[test]
-    fn workspace_short_id_is_eight_hex_digits() {
+    fn workspace_short_id_accepts_current_and_legacy_hex_lengths() {
         assert!(is_workspace_short_id("a1b2c3d4"));
         assert!(is_workspace_short_id("ABCDEF12"));
+        assert!(is_workspace_short_id("a1b2c3d4e5f60718"));
         assert!(!is_workspace_short_id("not-a-workspace"));
         assert!(!is_workspace_short_id("a1b2c3d"));
+        assert!(!is_workspace_short_id("a1b2c3d4e5f607182"));
     }
 
     #[test]
@@ -1008,20 +1010,28 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
 
         // Stale: recorded path no longer exists.
-        write_workspace_metadata(root.path(), "aaaaaaaa", "/does/not/exist-eph-test-aaaaaaaa");
+        write_workspace_metadata(
+            root.path(),
+            "aaaaaaaaaaaaaaaa",
+            "/does/not/exist-eph-test-aaaaaaaa",
+        );
         // Live: recorded path is a real, non-empty directory.
         let live = tempfile::tempdir().unwrap();
         std::fs::write(live.path().join(".eph"), "[db]\nimage=postgres:16\n").unwrap();
         write_workspace_metadata(
             root.path(),
-            "bbbbbbbb",
+            "bbbbbbbbbbbbbbbb",
             live.path().to_str().expect("temp path should be UTF-8"),
         );
         // Also stale by path, but this is the "current" workspace: excluded.
-        write_workspace_metadata(root.path(), "cccccccc", "/also/gone-eph-test-cccccccc");
+        write_workspace_metadata(
+            root.path(),
+            "cccccccccccccccc",
+            "/also/gone-eph-test-cccccccc",
+        );
 
         assert_eq!(
-            count_stale_workspaces(root.path(), "cccccccc").await,
+            count_stale_workspaces(root.path(), "cccccccccccccccc").await,
             1,
             "only the non-excluded stale workspace should be counted"
         );
