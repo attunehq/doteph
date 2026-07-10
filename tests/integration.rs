@@ -1064,20 +1064,28 @@ port=6379
         .expect("info should print the state directory");
     let state_path = std::path::Path::new(state_dir.trim()).join("state.json");
 
-    let before = std::fs::read_to_string(&state_path).expect("state.json should exist after up");
-    assert!(before.contains("redis") && before.contains("cache"));
+    let read_running_services = || {
+        let contents = std::fs::read_to_string(&state_path).expect("state.json should exist");
+        let state: serde_json::Value = serde_json::from_str(&contents).expect("valid state.json");
+        state["services"]
+            .as_object()
+            .expect("state services should be an object")
+            .clone()
+    };
+    let before = read_running_services();
+    assert!(before.contains_key("redis") && before.contains_key("cache"));
 
     // Stop just one service.
     ws.eph_ok(&["down", "redis"]).await;
 
-    let after = std::fs::read_to_string(&state_path).expect("state.json should still exist");
+    let after = read_running_services();
     assert!(
-        !after.contains("redis"),
-        "redis should be gone from state.json after a targeted down: {after}"
+        !after.contains_key("redis"),
+        "redis should be gone from running services after a targeted down: {after:?}"
     );
     assert!(
-        after.contains("cache"),
-        "cache should remain in state.json: {after}"
+        after.contains_key("cache"),
+        "cache should remain in running services: {after:?}"
     );
 
     ws.eph_ok(&["down"]).await;
@@ -1500,6 +1508,157 @@ async fn container_prefix_and_state_dir(ws: &TestWorkspace) -> (String, std::pat
     (prefix, std::path::PathBuf::from(state_dir))
 }
 
+async fn docker_container_id(name: &str) -> String {
+    let output = tokio::process::Command::new("docker")
+        .args(["inspect", "--format", "{{.Id}}", name])
+        .output()
+        .await
+        .expect("failed to run docker inspect");
+    assert!(
+        output.status.success(),
+        "docker inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+#[tokio::test]
+async fn changed_container_config_recreates_running_and_stopped_containers() {
+    let ws = TestWorkspace::new("[box]\nimage=alpine:3.21\ncommand=sleep 300\nenv.MARKER=one\n");
+    ws.eph_ok(&["up"]).await;
+    let (prefix, _) = container_prefix_and_state_dir(&ws).await;
+    let container = format!("{prefix}-box");
+    let first = docker_container_id(&container).await;
+
+    ws.write_file(
+        ".eph",
+        "[box]\nimage=alpine:3.21\ncommand=sleep 300\nenv.MARKER=two\n",
+    );
+    ws.eph_ok(&["up"]).await;
+    let second = docker_container_id(&container).await;
+    assert_ne!(first, second, "env drift should recreate a live container");
+
+    ws.eph_ok(&["down"]).await;
+    ws.write_file(
+        ".eph",
+        "[box]\nimage=alpine:3.21\ncommand=sleep 301\nenv.MARKER=two\n",
+    );
+    ws.eph_ok(&["up"]).await;
+    let third = docker_container_id(&container).await;
+    assert_ne!(
+        second, third,
+        "command drift should recreate a stopped container"
+    );
+
+    ws.clean().await;
+}
+
+#[tokio::test]
+async fn failed_container_healthcheck_removes_the_container_before_retry() {
+    let ws = TestWorkspace::new(
+        "[box]\nimage=alpine:3.21\ncommand=sleep 300\nhealthcheck=false\nready-timeout=0\n",
+    );
+    let (prefix, _) = container_prefix_and_state_dir(&ws).await;
+    let container = format!("{prefix}-box");
+
+    for attempt in 1..=2 {
+        let up = ws.eph(&["up"]).await;
+        assert!(
+            !up.status.success(),
+            "unhealthy startup attempt {attempt} should fail"
+        );
+        assert!(
+            common::docker_container_names(&container).await.is_empty(),
+            "failed attempt {attempt} left a container that a retry could adopt"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dockerfile_context_change_rebuilds_and_recreates_the_container() {
+    let ws = TestWorkspace::new("[box]\ndockerfile=Dockerfile\ncontext=.\ncommand=sleep 300\n");
+    ws.write_file(
+        "Dockerfile",
+        "FROM alpine:3.21\nCOPY marker /marker\nCMD [\"sleep\", \"300\"]\n",
+    );
+    ws.write_file("marker", "one\n");
+    ws.eph_ok(&["up"]).await;
+    let (prefix, _) = container_prefix_and_state_dir(&ws).await;
+    let container = format!("{prefix}-box");
+    let first = docker_container_id(&container).await;
+
+    ws.write_file("marker", "two\n");
+    ws.eph_ok(&["up"]).await;
+    let second = docker_container_id(&container).await;
+
+    assert_ne!(
+        first, second,
+        "a changed Docker build context should replace the container"
+    );
+    ws.clean().await;
+    common::docker_remove_image(&container).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dependency_port_change_restarts_a_run_service_with_resolved_env() {
+    let first_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let second_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let first_port = first_listener.local_addr().unwrap().port();
+    let second_port = second_listener.local_addr().unwrap().port();
+    drop((first_listener, second_listener));
+    let config = |port| {
+        format!(
+            "[db]\nrun=sleep 300\nport={port}\n\n[app]\nrun=echo \"$DATABASE_URL\" >> starts.log; sleep 300\nenv.DATABASE_URL=tcp://localhost:${{db.port}}\n"
+        )
+    };
+    let ws = TestWorkspace::new(&config(first_port));
+    ws.eph_ok(&["up"]).await;
+
+    ws.write_file(".eph", &config(second_port));
+    ws.eph_ok(&["up"]).await;
+
+    let starts = std::fs::read_to_string(ws.path().join("starts.log")).unwrap();
+    assert!(starts.contains(&format!("tcp://localhost:{first_port}")));
+    assert!(starts.contains(&format!("tcp://localhost:{second_port}")));
+    assert_eq!(
+        starts.lines().count(),
+        2,
+        "the dependent should restart exactly once after its resolved env changes"
+    );
+    ws.eph_ok(&["down"]).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn source_type_change_stops_the_recorded_backend_before_replacement() {
+    let ws = TestWorkspace::new("[worker]\nrun=echo $$ > worker.pid; sleep 300\n");
+    ws.eph_ok(&["up"]).await;
+    let pid: libc::pid_t = std::fs::read_to_string(ws.path().join("worker.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    ws.write_file(".eph", "[worker]\nimage=alpine:3.21\ncommand=sleep 300\n");
+    ws.eph_ok(&["up"]).await;
+
+    // SAFETY: signal 0 only probes whether this numeric PID exists.
+    let alive = unsafe { libc::kill(pid, 0) == 0 };
+    assert!(
+        !alive,
+        "the previous process backend must be stopped before the container starts"
+    );
+    let (prefix, _) = container_prefix_and_state_dir(&ws).await;
+    assert_eq!(
+        common::docker_container_names(&format!("{prefix}-worker"))
+            .await
+            .len(),
+        1
+    );
+    ws.clean().await;
+}
+
 /// Renaming (or deleting) a running service's section leaves its container
 /// recorded in state under the old name. `eph down` must still find and stop
 /// it via `stop_orphan`, and drop it from `state.json`, rather than leaking it
@@ -1915,8 +2074,17 @@ run=echo about-to-die && exit 1
 "#,
     );
 
-    // The process exits immediately; `eph up` still returns (no healthcheck).
-    ws.eph_ok(&["up"]).await;
+    // Startup must fail, while preserving the output that explains why.
+    let up = ws.eph(&["up"]).await;
+    assert!(
+        !up.status.success(),
+        "an immediately exiting run= service must fail startup"
+    );
+    assert!(
+        String::from_utf8_lossy(&up.stderr).contains("exited during startup"),
+        "startup should classify the early exit: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
 
     let logs = ws.eph_ok(&["logs", "doomed"]).await;
     assert!(
@@ -1926,6 +2094,36 @@ run=echo about-to-die && exit 1
     );
 
     ws.eph_ok(&["down"]).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn fixed_port_run_service_that_exits_during_startup_fails_up() {
+    let ws = TestWorkspace::new("[doomed]\nrun=exit 7\nport=43127\n");
+
+    let up = ws.eph(&["up"]).await;
+
+    assert!(!up.status.success(), "fixed-port early exit must fail up");
+    assert!(
+        String::from_utf8_lossy(&up.stderr).contains("exited during startup"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn fixed_port_run_service_that_exits_during_startup_fails_up() {
+    let ws = TestWorkspace::new("[doomed]\nrun=exit /b 7\nport=43127\n");
+
+    let up = ws.eph(&["up"]).await;
+
+    assert!(!up.status.success(), "fixed-port early exit must fail up");
+    assert!(
+        String::from_utf8_lossy(&up.stderr).contains("exited during startup"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&up.stderr)
+    );
 }
 
 // `port=auto` on a run= service: eph allocates a free host port, injects it into
@@ -2415,6 +2613,54 @@ async fn skills_install_and_check_round_trip() {
 /// Unix-only: it delivers `SIGTERM`, the signal a Claude Desktop preview server
 /// uses to stop the dev command. Windows has no equivalent a test harness can
 /// deliver, and that gap (a hard kill skips teardown) is documented behavior.
+#[cfg(unix)]
+#[tokio::test]
+async fn dev_retries_an_auto_port_app_that_exits_during_startup() {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let ws = TestWorkspace::new(
+        "[web]\nrun=if [ -f attempted ]; then sleep 600; else touch attempted; exit 1; fi\nport=auto\n",
+    );
+    let eph_binary = env!("CARGO_BIN_EXE_eph");
+    let mut child = Command::new(eph_binary)
+        .arg("dev")
+        .current_dir(ws.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn eph dev");
+
+    let mut running = false;
+    for _ in 0..50 {
+        sleep(Duration::from_millis(200)).await;
+        if child.try_wait().expect("poll eph dev").is_some() {
+            break;
+        }
+        let status = ws.eph(&["status"]).await;
+        if String::from_utf8_lossy(&status.stdout).contains("web") {
+            running = true;
+            break;
+        }
+    }
+    assert!(
+        running,
+        "eph dev should relaunch the app after its first auto-port startup exit"
+    );
+    assert!(ws.path().join("attempted").exists());
+
+    let pid = child.id().expect("dev child has a pid") as libc::pid_t;
+    // SAFETY: kill takes plain integers and has no memory-safety preconditions.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("eph dev should stop promptly")
+        .expect("wait for eph dev");
+    assert!(status.success());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn dev_gates_injected_port_and_tears_down_on_signal() {

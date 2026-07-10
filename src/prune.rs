@@ -1078,12 +1078,9 @@ mod tests {
     }
 
     fn state_with(name: &str, entry: crate::service::ServiceStateEntry) -> ServiceState {
-        let mut services = std::collections::HashMap::new();
-        services.insert(name.to_string(), entry);
-        ServiceState {
-            services,
-            auto_ports: std::collections::HashMap::new(),
-        }
+        let mut state = ServiceState::default();
+        state.services.insert(name.to_string(), entry);
+        state
     }
 
     #[test]
