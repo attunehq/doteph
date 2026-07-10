@@ -79,13 +79,30 @@ env.WORKER_THREADS=4
 
 - `context=` is the build context; if omitted, it defaults to the directory
   containing the Dockerfile.
-- The built image is tagged `eph-<short_id>-worker` and cached, so subsequent
-  `eph up` runs are fast.
+- The built image is tagged `eph-<short_id>-worker`. eph invokes the build on
+  every `up` and relies on Docker's layer cache, then fingerprints the resulting
+  image ID. An effective Dockerfile or context change therefore recreates the
+  service without making unchanged builds slow.
 - After building, the service behaves exactly like an `image=` service: ports,
   env, volumes, health check, hooks.
 
 > Building shells out to the `docker` CLI, so `docker build` must work in your
 > environment.
+
+## Configuration reconciliation
+
+Before reusing a service, eph compares a canonical fingerprint of the effective
+runtime configuration with the record that created the existing backend. The
+fingerprint covers the source, immutable image ID, ports, resolved environment,
+volumes, health settings, build context, and command override. A `run=` service
+also includes its final top-level and metadata environment, so a dependency's
+host-port change restarts dependents that consumed it.
+
+When the fingerprint differs, eph tears down the old resource through its
+recorded backend type and creates the new one. This applies to stopped resources
+too, and to source changes such as `run=` to `image=`. Legacy state without a
+fingerprint is reconciled once rather than trusted. Reused services rerun their
+declared health check, and a failed start is removed before `up` returns.
 
 ## `compose=`: delegate to Docker Compose
 
@@ -102,15 +119,17 @@ expose.zookeeper=2181
 
 - `eph` runs `docker compose -f <file> -p eph-<short_id>-kafka up -d`, so the
   whole project is namespaced per workspace.
-- `expose.<name>=<container_port>` makes a port available for interpolation as
-  `${kafka.port.kafka}` and so on. `eph` asks `docker compose port` for the
-  real mapped host port and falls back to the declared value if Compose does
-  not report one (with a warning, since the declared port is usually not the
-  actual mapped one).
+- `expose.<alias>=<container_port>` targets the Compose service named by the
+  alias. Use `expose.<alias>=<compose-service>:<container_port>` when the
+  interpolation alias and Compose service name differ. The result is available
+  as `${kafka.port.<alias>}`. `eph` asks `docker compose port` for that exact
+  service and mapping; a missing or malformed result fails startup instead of
+  inventing a host port.
 - `env.<KEY>=`, with `${service.property}` references resolved against
   running services first, is exported into the process environment `docker
-  compose up` and `docker compose down` themselves run with, so your compose
-  file's own `${VAR}` substitution can read it.
+  compose up` and port discovery run with, so your compose file's own `${VAR}`
+  substitution can read it. Teardown uses only the recorded project name and
+  does not reread the file or re-export service variables.
 - Compose services are tracked by `eph status` and `eph env`. Compose names its
   own containers, so `eph` finds the project by its
   `com.docker.compose.project` label rather than by container name.
@@ -127,9 +146,9 @@ sources are worth knowing:
 - **Teardown is coarser.** Both `eph down` and `eph down --rm` run
   `docker compose ... down`, which removes the compose containers either way.
   `--rm` makes no difference for compose.
-- **`eph clean` does not remove Compose-internal volumes.** It removes only
-  the named volumes you declare with `volume=` in the `.eph` file. Volumes
-  defined inside the Compose file belong to `docker compose`; run
+- **`eph clean` does not remove Compose-internal volumes.** Compose services
+  cannot declare `.eph` `volume=` entries. Volumes defined inside the Compose
+  file belong to `docker compose`; run
   `docker compose ... down -v` yourself if you need to drop them.
 - **A failed `docker compose down` is a real error.** If the compose file is
   broken or the `docker compose` plugin is missing, `eph down` and

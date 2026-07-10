@@ -596,13 +596,9 @@ async fn source_type_compose() {
     prepull_images(&[REDIS_IMAGE]).await;
 
     let ws = TestWorkspace::new(
-        // For compose services, the `expose.<name>` key names the compose
-        // service whose port to publish (it is passed to `docker compose port
-        // <name> <port>`) and doubles as the interpolation port name. So the
-        // key must match the compose service (`redis`), and the URL interpolates
-        // it explicitly as `${cache.port.redis}` rather than relying on it
-        // happening to be the sole (and thus default) port.
-        "[cache]\ncompose=docker-compose.yml\nexpose.redis=6379\n\n[env]\nREDIS_URL=redis://localhost:${cache.port.redis}\n",
+        // The alias (`cache`) is the interpolation name. The value explicitly
+        // targets the Compose service (`redis`) and its container port.
+        "[cache]\ncompose=docker-compose.yml\nexpose.cache=redis:6379\n\n[env]\nREDIS_URL=redis://localhost:${cache.port.cache}\n",
     );
     ws.write_file(
         "docker-compose.yml",

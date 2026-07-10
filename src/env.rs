@@ -32,10 +32,61 @@ use anyhow::{Result, bail};
 /// # }
 /// ```
 pub fn render(env_vars: &[(String, String)], format: &str) -> Result<String> {
+    render_with_unsets(env_vars, &[], format)
+}
+
+/// Render resolved assignments and clear variables that could not be resolved.
+///
+/// Shell formats have an explicit unset operation, preventing a previous
+/// workspace's value from surviving an `eval`. They end with a failing command
+/// so command substitution cannot hide eph's own failure status. JSON has no
+/// environment mutation semantics, so unresolved names are absent from the
+/// object; the caller still returns a failure status.
+pub fn render_with_unsets(
+    env_vars: &[(String, String)],
+    unset_names: &[String],
+    format: &str,
+) -> Result<String> {
     match format {
-        "export" => Ok(render_export(env_vars)),
-        "fish" => Ok(render_fish(env_vars)),
-        "powershell" => Ok(render_powershell(env_vars)),
+        "export" => Ok(format!(
+            "{}{}{}",
+            render_export(env_vars),
+            unset_names
+                .iter()
+                .map(|name| format!("unset {name}\n"))
+                .collect::<String>(),
+            if unset_names.is_empty() {
+                ""
+            } else {
+                "false\n"
+            }
+        )),
+        "fish" => Ok(format!(
+            "{}{}{}",
+            render_fish(env_vars),
+            unset_names
+                .iter()
+                .map(|name| format!("set -e {name}\n"))
+                .collect::<String>(),
+            if unset_names.is_empty() {
+                ""
+            } else {
+                "false\n"
+            }
+        )),
+        "powershell" => Ok(format!(
+            "{}{}{}",
+            render_powershell(env_vars),
+            unset_names
+                .iter()
+                .map(|name| format!("Remove-Item Env:{name} -ErrorAction SilentlyContinue\n"))
+                .collect::<String>(),
+            if unset_names.is_empty() {
+                ""
+            } else {
+                "throw 'eph env: unresolved variables'\n"
+            }
+        )),
         // The `export`/`fish`/`powershell` variants already terminate each
         // line; the JSON object does not, so add a trailing newline for a
         // clean terminal line.
@@ -257,5 +308,28 @@ mod tests {
         let vars = vec![("APP".to_string(), "myapp".to_string())];
         let err = render(&vars, "yaml").unwrap_err().to_string();
         assert!(err.contains("export, fish, powershell, json"), "got: {err}");
+    }
+
+    #[test]
+    fn unresolved_names_render_as_shell_unsets_and_stay_out_of_json() {
+        let vars = vec![("READY".to_string(), "yes".to_string())];
+        let unset = vec!["DATABASE_URL".to_string()];
+
+        assert_eq!(
+            render_with_unsets(&vars, &unset, "export").unwrap(),
+            "export READY=\"yes\"\nunset DATABASE_URL\nfalse\n"
+        );
+        assert_eq!(
+            render_with_unsets(&vars, &unset, "fish").unwrap(),
+            "set -gx READY \"yes\"\nset -e DATABASE_URL\nfalse\n"
+        );
+        assert_eq!(
+            render_with_unsets(&vars, &unset, "powershell").unwrap(),
+            "$env:READY = 'yes'\nRemove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue\nthrow 'eph env: unresolved variables'\n"
+        );
+        assert_eq!(
+            render_with_unsets(&vars, &unset, "json").unwrap(),
+            "{\n  \"READY\": \"yes\"\n}\n"
+        );
     }
 }

@@ -28,10 +28,11 @@ Output goes to **stdout** and all logs go to stderr, which keeps the output
 clean for `eval` and piping.
 
 > Run `eph up` before `eph env`. Interpolation only resolves for running
-> services; a variable whose value still has an unresolved reference (a
-> stopped service) is **omitted from the output** rather than printed with a
-> raw `${name.port}`, and a warning naming the variable and the reference goes
-> to stderr instead. The command still exits `0`.
+> services. If a variable still references a stopped service, shell formats
+> unset that variable and finish with a failing shell statement. This clears a
+> value left by another workspace and makes `eval "$(eph env)"` return nonzero.
+> JSON omits the unresolved variable. The `eph env` process also exits nonzero
+> in every format and reports the missing reference on stderr.
 
 ## Formats
 
@@ -87,11 +88,12 @@ $ eph env -f json
 Pipe it into `jq`, a `.env` writer, or your own tooling:
 
 ```sh
-# Pull a single value
-eph env -f json | jq -r .DATABASE_URL
+# Pull a single value without hiding eph's exit status in a pipeline
+eph_json="$(eph env -f json)" && jq -r .DATABASE_URL <<<"$eph_json"
 
 # Write a .env file for tools that read one
-eph env -f json | jq -r 'to_entries[] | "\(.key)=\(.value)"' > .env.local
+eph_json="$(eph env -f json)" &&
+  jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$eph_json" > .env.local
 ```
 
 ## Skipping the shell entirely
@@ -101,7 +103,8 @@ required:
 
 - [`eph run <cmd>`](command-reference.md#eph-run-cmd) runs any command with
   the resolved variables (plus `EPH_*` metadata) set:
-  `eph run ./scripts/seed.sh`.
+  `eph run ./scripts/seed.sh`. It refuses to start the command if any required
+  service reference is unresolved.
 - A [`run=` service](run-your-app.md#the-app-is-a-run-service) inherits the
   same environment at launch, because eph is the one launching it.
 

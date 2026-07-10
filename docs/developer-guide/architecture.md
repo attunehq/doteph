@@ -46,18 +46,23 @@ binary swap), and `semver` (version comparison).
 ### Workspace isolation
 
 Each directory containing a `.eph` file is a workspace, identified by the
-SHA-256 of its canonicalized absolute path. The first 8 hex characters (the
+SHA-256 of its canonicalized absolute path. The first 16 hex characters (the
 short ID) namespace everything `eph` creates:
 
 ```
-/Users/grace/projects/myapp   ->  eph-a1b2c3d4-postgres
-/Users/grace/projects/myapp2  ->  eph-e5f6g7h8-postgres
+/Users/grace/projects/myapp   ->  eph-a1b2c3d4e5f60718-postgres
+/Users/grace/projects/myapp2  ->  eph-e5f6a7b8c9d00112-postgres
 ```
 
 This guarantees that two checkouts of the same repo, or two developers on one
 machine, never collide on container names, volume names, or ports.
 Canonicalizing the path first makes the ID stable across symlinks and
 relative addressing.
+
+Verified workspaces created by older eph versions retain their 8-character
+namespace until `eph clean`, which prevents an upgrade from orphaning live
+resources. Unverifiable legacy state blocks a namespace switch and requires an
+explicit cleanup.
 
 ### Auto port assignment
 
@@ -74,7 +79,7 @@ environment, and relaunches on a fresh port when the process dies to an
 
 ### Service state
 
-Running-service information (container IDs, assigned ports, process PIDs) is
+Running-service information (backend handles, assigned ports, process PIDs) is
 persisted to the platform local-data directory under
 `eph/<short_id>/state.json`. Workspace metadata lives beside it in
 `eph/<short_id>/workspace.json`; system prune uses that file to decide whether
@@ -85,11 +90,16 @@ the recorded workspace path still exists.
 - Windows: `%LOCALAPPDATA%\eph\<short_id>\state.json`
 
 `EPH_STATE_ROOT` overrides the parent directory (the `eph` above `<short_id>`)
-in place of the platform default; `workspace::state_root()` checks it first.
+in place of the platform default; `workspace::state_root()` checks it first and
+rejects relative paths.
 
 State lets `eph status` and `eph env` work without re-deriving everything,
 lets assigned ports survive terminal restarts, and records which resources
-belong to a workspace. Writes are atomic (a temp file, renamed over the real
+belong to a workspace. It also retains a canonical runtime fingerprint and the
+backend type that created each service. This lets `up` detect effective config
+drift, including source-type and resolved dependency-port changes, and tear down
+the old resource through recorded backend truth before creating the new one.
+Writes are atomic (a temp file, renamed over the real
 one) so a crash mid-write cannot leave a truncated `state.json`; a file that
 still fails to parse (corruption predating atomic writes, or manual editing)
 is quarantined to `state.json.corrupt` rather than treated as fatal, and eph
@@ -148,8 +158,8 @@ variable can legally go (above the first section, or inside a reserved
 
 A service declares a source. The "no source" state is rejected at parse time,
 so by the time a `Service` value exists it always names a real way to start.
-(Multiple source keys are not validated; the parser keeps the last one, so
-"exactly one" is a convention, not an enforced rule.)
+Multiple source keys are also rejected, so exactly one source is an enforced
+boundary invariant.
 
 - **Docker image** (most common): pull if needed, create a workspace-named
   container, map ports with auto-assignment, create per-workspace named
@@ -213,17 +223,37 @@ detected by `DockerClient::compose_project_running`, which lists containers
 carrying the `com.docker.compose.project=<project>` label. This is what lets
 compose services appear in `status` and resolve their `expose` ports in
 `eph env`. A service's `env.X` values are resolved (`${service.property}`
-interpolation) and passed as `docker compose`'s process environment on every
-invocation (`up`, `port`, `down`), the same way they are resolved into an
+interpolation) and passed as `docker compose`'s process environment for `up`
+and port discovery, the same way they are resolved into an
 image/dockerfile container's own environment, so a compose file's `${VAR}`
 substitution sees the same connection details eph itself resolves. Teardown
-remains coarser than for direct containers: `stop_service` runs
+uses only the recorded project name, so it neither rereads a changed file nor
+requires its substitution environment. It remains coarser than for direct
+containers: `stop_service` runs
 `docker compose down` regardless of the `--rm` flag, but only when the
 project is known to be up (from `status` or recorded state); a service never
 brought up is a no-op, matching the container path, and a `docker compose
 down` that does run and fails is a real error that aborts teardown rather
-than being swallowed. `clean` removes only the named volumes declared in the
-`.eph` file (Compose-internal volumes are left to `docker compose`).
+than being swallowed. `clean` removes named volumes declared by image and
+Dockerfile services. Compose services cannot declare `.eph` volumes, and
+Compose-internal volumes remain owned by `docker compose`.
+
+### Runtime reconciliation
+
+`ServiceManager` prepares a canonical runtime specification before deciding
+whether an existing resource can be reused. Stable serialization of sorted
+environment maps feeds a SHA-256 fingerprint covering source, immutable image
+ID, declared ports, fully resolved environment, volumes, health settings, build
+context, and command argv. `run=` fingerprints include the final top-level,
+metadata, service environment, and assigned self port, so a dependency port
+change restarts consumers.
+
+Dockerfile sources build on every `up` through Docker's cache and fingerprint
+the resulting image ID. A matching live or stopped resource can be reused, but
+its declared health check is rerun. A mismatch, missing legacy fingerprint, or
+source-type change discards the recorded backend before creation. Failed starts
+are discarded and persisted immediately, preventing a later `up` from adopting
+an unhealthy container, Compose project, or process.
 
 ## Health checks
 
@@ -268,7 +298,10 @@ the workspace directory:
 
 All four receive eph's resolved environment (the `eph env` variables, `EPH_*`
 metadata, and the service's own `env.X`); `eph run` exposes the same
-environment to arbitrary commands.
+environment to arbitrary commands. Every execution boundary uses tracked,
+strict interpolation: an unresolved runtime reference is an error before a
+child starts. `eph env` renders explicit unsets and a shell failure for affected
+variables, while JSON omits them; both forms exit non-zero.
 
 ## Teardown levels
 
@@ -311,7 +344,6 @@ eph skills <install|check|list> # manage the bundled agent skills
 eph update [--check] [--force]  # self-update to the latest release
 ```
 
-`eph env` writes shell-ready output to stdout while all logs go to stderr, so
-it composes cleanly with `eval "$(eph env)"` and pipes. This integrates with
-existing shell workflows without requiring shell hooks or special
-integration.
+`eph env` writes shell-ready output to stdout while all logs go to stderr. A
+fully resolved result composes with `eval "$(eph env)"`; an unresolved result
+clears affected variables and fails, preventing stale shell state.

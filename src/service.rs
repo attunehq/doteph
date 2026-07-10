@@ -6,7 +6,7 @@ use crate::parser::{
 };
 use crate::proc;
 use crate::workspace::Workspace;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use bollard::Docker;
 use bollard::models::{ContainerCreateBody, ContainerSummaryStateEnum, HostConfig, PortBinding};
 use bollard::query_parameters::{
@@ -15,7 +15,8 @@ use bollard::query_parameters::{
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -27,6 +28,64 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
+
+/// One `${service.property}` reference that runtime state could not resolve.
+///
+/// Keeping the reference structured lets every execution boundary report the
+/// exact missing service property without searching a partially expanded
+/// string again.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct UnresolvedReference {
+    /// Service named by the interpolation.
+    pub service: String,
+    /// Property named by the interpolation.
+    pub property: String,
+}
+
+/// One environment variable that cannot be passed to a child safely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedEnvVar {
+    /// Environment variable name.
+    pub name: String,
+    /// Missing references in first-occurrence order, without duplicates.
+    pub references: Vec<UnresolvedReference>,
+}
+
+/// Failure to resolve a complete environment.
+///
+/// `resolved` is retained so `eph env` can still print safe assignments and
+/// explicit unsets before returning a failure status. Execution paths must use
+/// the `Ok` value and therefore cannot accidentally launch with partial data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedEnvironment {
+    /// Variables that were completely resolved, in declaration order.
+    pub resolved: Vec<(String, String)>,
+    /// Variables containing one or more unavailable references.
+    pub unresolved: Vec<UnresolvedEnvVar>,
+}
+
+impl std::fmt::Display for UnresolvedEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not resolve environment")?;
+        for (index, variable) in self.unresolved.iter().enumerate() {
+            if index == 0 {
+                write!(f, ": ")?;
+            } else {
+                write!(f, "; ")?;
+            }
+            write!(f, "{} requires ", variable.name)?;
+            for (reference_index, reference) in variable.references.iter().enumerate() {
+                if reference_index > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "${{{}.{}}}", reference.service, reference.property)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UnresolvedEnvironment {}
 
 // ============================================================================
 // Running Service Info
@@ -53,13 +112,21 @@ impl RunningService {
         "localhost"
     }
 
-    /// Get the primary port (first port or named "default")
+    /// Get the unambiguous primary port.
+    ///
+    /// An explicitly unnamed port is `default`; a single named port is also
+    /// unambiguous. Multiple named ports have no primary port, independent of
+    /// `HashMap` iteration order.
     #[must_use]
     pub fn port(&self) -> Option<u16> {
-        self.ports
-            .get("default")
-            .copied()
-            .or_else(|| self.ports.values().next().copied())
+        if let Some(port) = self.ports.get("default") {
+            return Some(*port);
+        }
+        if self.ports.len() == 1 {
+            self.ports.values().next().copied()
+        } else {
+            None
+        }
     }
 
     /// Get a named port
@@ -82,14 +149,13 @@ pub struct LogOptions {
 /// [`EphFile`] against the currently running services.
 ///
 /// This expands `${service.host}`, `${service.port}`, and `${service.port.NAME}`
-/// interpolations using the assigned host ports in `running`, and is exactly
-/// the set of pairs that `eph env` emits. A reference to a service that is not
-/// in `running` is left as the literal `${...}` placeholder, matching
-/// [`resolve_interpolations`].
+/// interpolations using the assigned host ports in `running`. A reference to a
+/// service that is not in `running` is left as the literal `${...}` placeholder,
+/// matching [`resolve_interpolations`]. Execution boundaries should use
+/// [`resolve_env_vars_strict`] so a partial environment cannot reach a child.
 ///
-/// It is shared by `eph env` and by the lifecycle-hook / `eph run` machinery so
-/// that a lifecycle hook (`pre-start`, `post-start`, `pre-stop`, `post-stop`)
-/// and a developer's shell all see the same resolved environment.
+/// This permissive form remains available to lifecycle planning code that may
+/// resolve again after another service starts.
 #[must_use]
 pub fn resolve_env_vars(
     eph: &EphFile,
@@ -106,9 +172,8 @@ pub fn resolve_env_vars(
 ///
 /// A reference to a service that is not in `running` (or a property it does not
 /// expose) is left as the literal `${...}` placeholder, matching
-/// [`resolve_interpolations`]. Shared by [`resolve_env_vars`] (top-level `eph
-/// env` variables) and by the managed-app environment so that a `run=` service
-/// can read its own assigned `${self.port}` the same way.
+/// [`resolve_interpolations`]. Use [`resolve_against_strict`] before passing the
+/// result to a process, container, or Compose invocation.
 #[must_use]
 pub fn resolve_against(value: &str, running: &HashMap<String, RunningService>) -> String {
     resolve_interpolations(value, |service, property| {
@@ -135,8 +200,7 @@ fn resolve_property(
 }
 
 /// Like [`resolve_against`], but also returns every unresolved
-/// `${service.property}` reference in `value`, for `eph env`'s omit-and-warn
-/// contract (see [`resolve_env_vars_for_eval`]).
+/// `${service.property}` reference in `value`.
 fn resolve_against_tracked(
     value: &str,
     running: &HashMap<String, RunningService>,
@@ -146,59 +210,98 @@ fn resolve_against_tracked(
     })
 }
 
-/// One `eph env` variable omitted from the resolved output because its value
-/// still contained an unresolved `${service.property}` reference (typically:
-/// the referenced service is not running).
+/// Resolve a value completely or return its unavailable references.
 ///
-/// Carries enough for a specific stderr warning naming both the omitted
-/// variable and the one reference that failed; see [`resolve_env_vars_for_eval`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OmittedVar {
-    /// The top-level variable name that was omitted.
-    pub name: String,
-    /// The `service` half of the reference that could not be resolved.
-    pub service: String,
-    /// The `property` half of the reference that could not be resolved.
-    pub property: String,
-}
-
-/// Resolve `eph env`'s top-level variables for direct `eval`, omitting any
-/// variable whose value still contains an unresolved `${service.property}`
-/// reference rather than handing the caller's shell a literal placeholder.
-///
-/// This is `eph env`'s own contract, distinct from [`resolve_env_vars`] (used
-/// by lifecycle hooks, `eph run`, and a service's own `env.` entries), which
-/// all still leave an unresolved reference verbatim: a hook may legitimately
-/// run before the service it references starts, and the placeholder is a
-/// recognizable, documented signal there. `eph env`'s output, by contrast, is
-/// meant to be `eval`'d directly, so a variable that cannot be fully resolved
-/// must not leak `${...}` syntax into the caller's shell.
-///
-/// Returns the resolvable pairs, in declaration order, plus one [`OmittedVar`]
-/// per variable left out (one entry per variable even if its value carries
-/// several unresolved references: only the first is reported, which is enough
-/// to point at the fix). The caller is expected to print a warning for each.
-#[must_use]
-pub fn resolve_env_vars_for_eval(
-    eph: &EphFile,
+/// References are reported in first-occurrence order and deduplicated. The
+/// returned `String` therefore proves that it contains no unresolved eph
+/// interpolation and is safe to pass across an execution boundary.
+pub fn resolve_against_strict(
+    value: &str,
     running: &HashMap<String, RunningService>,
-) -> (Vec<(String, String)>, Vec<OmittedVar>) {
-    let mut resolved = Vec::with_capacity(eph.env_vars.len());
-    let mut omitted = Vec::new();
-    for var in &eph.env_vars {
-        let (value, mut unresolved) = resolve_against_tracked(&var.value, running);
-        if unresolved.is_empty() {
-            resolved.push((var.name.clone(), value));
-        } else {
-            let (service, property) = unresolved.remove(0);
-            omitted.push(OmittedVar {
-                name: var.name.clone(),
-                service,
-                property,
-            });
+) -> std::result::Result<String, Vec<UnresolvedReference>> {
+    let (resolved, references) = resolve_against_tracked(value, running);
+    let mut unique = Vec::new();
+    for (service, property) in references {
+        let reference = UnresolvedReference { service, property };
+        if !unique.contains(&reference) {
+            unique.push(reference);
         }
     }
-    (resolved, omitted)
+    if unique.is_empty() {
+        Ok(resolved)
+    } else {
+        Err(unique)
+    }
+}
+
+/// Resolve every top-level environment variable before execution.
+///
+/// The `Ok` variant is the complete environment in declaration order. On
+/// failure, [`UnresolvedEnvironment`] retains the safe subset for shell output
+/// while making the structured misses available for diagnostics and unsets.
+pub fn resolve_env_vars_strict(
+    eph: &EphFile,
+    running: &HashMap<String, RunningService>,
+) -> std::result::Result<Vec<(String, String)>, UnresolvedEnvironment> {
+    resolve_env_pairs_strict(
+        eph.env_vars
+            .iter()
+            .map(|variable| (variable.name.as_str(), variable.value.as_str())),
+        running,
+    )
+}
+
+fn resolve_env_pairs_strict<'a>(
+    variables: impl IntoIterator<Item = (&'a str, &'a str)>,
+    running: &HashMap<String, RunningService>,
+) -> std::result::Result<Vec<(String, String)>, UnresolvedEnvironment> {
+    let mut resolved = Vec::new();
+    let mut unresolved = Vec::new();
+    for (name, raw_value) in variables {
+        match resolve_against_strict(raw_value, running) {
+            Ok(value) => resolved.push((name.to_string(), value)),
+            Err(references) => unresolved.push(UnresolvedEnvVar {
+                name: name.to_string(),
+                references,
+            }),
+        }
+    }
+    if unresolved.is_empty() {
+        Ok(resolved)
+    } else {
+        Err(UnresolvedEnvironment {
+            resolved,
+            unresolved,
+        })
+    }
+}
+
+fn resolve_service_env_strict(
+    service: &Service,
+    running: &HashMap<String, RunningService>,
+) -> std::result::Result<Vec<(String, String)>, UnresolvedEnvironment> {
+    resolve_env_pairs_strict(
+        service
+            .env
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+        running,
+    )
+}
+
+fn resolve_value_strict(
+    value: &str,
+    running: &HashMap<String, RunningService>,
+    context: &str,
+) -> Result<String> {
+    resolve_against_strict(value, running).map_err(|references| {
+        let required = references
+            .iter()
+            .map(|reference| format!("${{{}.{}}}", reference.service, reference.property))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::anyhow!("could not resolve {context}: requires {required}")
+    })
 }
 
 /// Build the `EPH_*` metadata variables describing the workspace and the
@@ -286,7 +389,8 @@ pub(crate) enum Backend {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         identity: Option<proc::ProcessIdentity>,
     },
-    /// A docker-compose project (`compose=`), by project name.
+    /// A docker-compose project (`compose=`), by project name. Compose v2 can
+    /// tear down a named project without re-reading its original config file.
     Compose { project: String },
 }
 
@@ -351,6 +455,26 @@ pub(crate) struct ServiceState {
     /// restarts and reboots. `eph clean` resets it along with the rest of state.
     #[serde(default)]
     pub(crate) auto_ports: HashMap<String, HashMap<String, u16>>,
+    /// The runtime configuration and backend most recently created for each
+    /// service. These records survive `eph down`: stopped containers still
+    /// exist, and accepting one without knowing which configuration created it
+    /// would make edits to `.eph` silently ineffective on the next `up`.
+    #[serde(default)]
+    service_configs: HashMap<String, ServiceConfigRecord>,
+}
+
+/// A canonical digest of the inputs that determine a service's runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct RuntimeConfigFingerprint(String);
+
+/// Durable reconciliation data for a service-managed resource.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ServiceConfigRecord {
+    fingerprint: RuntimeConfigFingerprint,
+    /// Backend truth is retained after `down` so a later source-type change can
+    /// remove the old resource using the backend that created it.
+    backend: Backend,
 }
 
 /// State entry for a single service
@@ -358,6 +482,43 @@ pub(crate) struct ServiceState {
 pub(crate) struct ServiceStateEntry {
     pub(crate) backend: Backend,
     pub(crate) ports: HashMap<String, u16>,
+}
+
+#[derive(Serialize)]
+struct RuntimeConfigSpec<'a> {
+    source: RuntimeSourceSpec<'a>,
+    ports: &'a [PortMapping],
+    effective_env: BTreeMap<String, String>,
+    volumes: &'a [String],
+    healthcheck: Option<&'a str>,
+    ready_timeout_secs: Option<u64>,
+    build_context: Option<&'a str>,
+    command_override: Option<&'a [String]>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum RuntimeSourceSpec<'a> {
+    Image {
+        reference: &'a str,
+        image_id: &'a str,
+    },
+    Dockerfile {
+        path: &'a str,
+        image_id: &'a str,
+    },
+    Compose(&'a str),
+    Command(&'a str),
+}
+
+struct PreparedService {
+    fingerprint: RuntimeConfigFingerprint,
+    /// Dockerfile services are built before reconciliation. Keeping the tag
+    /// here lets creation use the exact image whose ID was fingerprinted.
+    built_image: Option<String>,
+    /// A command's first launch uses the same ports whose resolved environment
+    /// was fingerprinted. Retries deliberately replace them after a conflict.
+    command_ports: Option<HashMap<String, u16>>,
 }
 
 /// Deserialize accepting either the current schema (`backend`) or the legacy
@@ -532,6 +693,57 @@ fn state_file_path(workspace: &Workspace) -> Result<PathBuf> {
     Ok(workspace.state_dir()?.join("state.json"))
 }
 
+fn runtime_fingerprint(
+    service: &Service,
+    source: RuntimeSourceSpec<'_>,
+    effective_env: BTreeMap<String, String>,
+) -> Result<RuntimeConfigFingerprint> {
+    let spec = RuntimeConfigSpec {
+        source,
+        ports: &service.ports,
+        effective_env,
+        volumes: &service.volumes,
+        healthcheck: service
+            .healthcheck
+            .as_ref()
+            .map(|healthcheck| healthcheck.command.as_str()),
+        ready_timeout_secs: service
+            .healthcheck
+            .as_ref()
+            .and_then(|healthcheck| healthcheck.timeout_secs)
+            .map(std::num::NonZeroU64::get),
+        build_context: service.build_context.as_deref(),
+        command_override: service
+            .command_override
+            .as_ref()
+            .map(|command| command.argv()),
+    };
+    let canonical = serde_json::to_vec(&spec).context("failed to fingerprint service config")?;
+    Ok(RuntimeConfigFingerprint(hex::encode(Sha256::digest(
+        canonical,
+    ))))
+}
+
+fn resolved_service_env(
+    service: &Service,
+    running: &HashMap<String, RunningService>,
+) -> Result<BTreeMap<String, String>> {
+    Ok(resolve_service_env_strict(service, running)?
+        .into_iter()
+        .collect())
+}
+
+fn backend_matches_source(backend: &Backend, source: &ServiceSource) -> bool {
+    matches!(
+        (backend, source),
+        (
+            Backend::Container { .. },
+            ServiceSource::Image(_) | ServiceSource::Dockerfile(_)
+        ) | (Backend::Process { .. }, ServiceSource::Command(_))
+            | (Backend::Compose { .. }, ServiceSource::Compose(_))
+    )
+}
+
 // ============================================================================
 // Docker Client
 // ============================================================================
@@ -557,12 +769,12 @@ pub(crate) struct ContainerInfo {
 fn map_named_ports(declared: &[PortMapping], raw: &HashMap<String, u16>) -> HashMap<String, u16> {
     let mut named = HashMap::new();
     for port_mapping in declared {
-        let key = port_mapping.container_port.to_string();
+        let Some(container_port) = port_mapping.container_port() else {
+            continue;
+        };
+        let key = container_port.to_string();
         if let Some(&host_port) = raw.get(&key) {
-            let name = port_mapping
-                .name
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
+            let name = port_mapping.runtime_name().to_string();
             named.insert(name, host_port);
         }
     }
@@ -624,14 +836,14 @@ fn allocate_ports(
     let mut assigned: HashMap<String, u16> = HashMap::new();
 
     for mapping in declared {
-        let name = mapping
-            .name
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
+        let name = mapping.runtime_name().to_string();
 
-        if !mapping.auto {
-            assigned.insert(name, mapping.container_port);
+        if let PortMapping::Fixed { port, .. } = mapping {
+            assigned.insert(name, port.get());
             continue;
+        }
+        if matches!(mapping, PortMapping::Compose { .. }) {
+            bail!("compose port mappings cannot be allocated for a run= service");
         }
 
         // Prefer the port this mapping had last time, if it is still bindable and
@@ -673,7 +885,7 @@ fn allocate_ports(
 /// Whether `declared` contains at least one auto-allocated port, i.e. the
 /// service is a managed app whose process eph may re-launch on a fresh port.
 fn has_auto_port(declared: &[PortMapping]) -> bool {
-    declared.iter().any(|p| p.auto)
+    declared.iter().any(PortMapping::is_auto)
 }
 
 fn process_backend(name: &str, pid: NonZeroU32) -> Backend {
@@ -685,27 +897,6 @@ fn process_backend(name: &str, pid: NonZeroU32) -> Backend {
         );
     }
     Backend::Process { pid, identity }
-}
-
-/// Split a `command=` override into an argv vector, or `None` when the service
-/// declares no override.
-///
-/// `command=` is freeform user input from the `.eph` file, so a malformed value
-/// (most commonly an unbalanced quote) is a parse error, surfaced here at
-/// startup with a message naming the service. The previous behavior fell back
-/// to passing the entire unparsed string as a single argument, which made the
-/// container fail later with a confusing error far from the real cause; failing
-/// closed matches the repo's parse-don't-validate posture.
-fn parse_command_override(
-    name: &str,
-    command_override: Option<&str>,
-) -> Result<Option<Vec<String>>> {
-    command_override
-        .map(|c| {
-            shell_words::split(c)
-                .map_err(|e| anyhow!("invalid command override for service '{}': {}", name, e))
-        })
-        .transpose()
 }
 
 /// The byte length of a leading Windows drive prefix in `spec`, or `None` when
@@ -1464,9 +1655,8 @@ impl DockerClient {
 
     /// Pull an image and run it as a container.
     ///
-    /// `cmd` is the already-parsed `command=` override (see
-    /// [`parse_command_override`]), validated by the caller before any
-    /// container reuse so a malformed value fails closed on every start path.
+    /// `cmd` is the already-parsed `command=` override produced by the `.eph`
+    /// parser, so container startup never reparses weak command text.
     ///
     /// Returns the [`RunningService`] connection info plus the created
     /// container's id, which the caller needs to probe health and to record the
@@ -1488,7 +1678,10 @@ impl DockerClient {
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
 
         for port_mapping in &service.ports {
-            let container_port = format!("{}/tcp", port_mapping.container_port);
+            let Some(container_port) = port_mapping.container_port() else {
+                bail!("image service '{}' contains an auto port", service.name);
+            };
+            let container_port = format!("{container_port}/tcp");
             exposed_ports.push(container_port.clone());
             // Empty host port = random assignment
             port_bindings.insert(
@@ -1510,10 +1703,9 @@ impl DockerClient {
         // documented syntax silently shipped a literal `${postgres.port}`
         // string. Note the resolved host/port are as seen FROM THE HOST;
         // container-to-container traffic may need `host.docker.internal`.
-        let env: Vec<String> = service
-            .env
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, resolve_against(v, running)))
+        let env: Vec<String> = resolve_service_env_strict(service, running)?
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
             .collect();
 
         // Build volume bindings
@@ -1579,16 +1771,17 @@ impl DockerClient {
         ))
     }
 
-    /// Build from Dockerfile and run
-    pub(crate) async fn build_and_run(
+    /// Build a Dockerfile service and return the tag and immutable image ID.
+    ///
+    /// This runs on every `up`. Docker's own cache makes unchanged contexts
+    /// cheap, while the resulting image ID gives reconciliation an exact answer
+    /// when any effective build-context input changes.
+    pub(crate) async fn build_image(
         &self,
-        container_name: &str,
         dockerfile_path: &std::path::Path,
         service: &Service,
         workspace: &Workspace,
-        cmd: Option<Vec<String>>,
-        running: &HashMap<String, RunningService>,
-    ) -> Result<(RunningService, String)> {
+    ) -> Result<(String, String)> {
         let image_tag = format!("eph-{}-{}", workspace.short_id, service.name);
 
         // Determine build context
@@ -1626,9 +1819,18 @@ impl DockerClient {
             bail!("docker build failed:\n{}", stderr);
         }
 
-        // Now run like a normal image
-        self.run_image(container_name, &image_tag, service, workspace, cmd, running)
+        let image_id = self.image_id(&image_tag).await?;
+        Ok((image_tag, image_id))
+    }
+
+    /// Resolve an image reference to the immutable local image ID.
+    async fn image_id(&self, image: &str) -> Result<String> {
+        self.client
+            .inspect_image(image)
             .await
+            .with_context(|| format!("failed to inspect image {image}"))?
+            .id
+            .with_context(|| format!("image {image} has no ID"))
     }
 
     /// Ensure an image is available locally
@@ -1873,7 +2075,7 @@ impl ServiceManager {
             return Ok(());
         }
         info!("Running pre-start hooks for {}", service.name);
-        let env = self.hook_env(eph, running, service);
+        let env = self.hook_env(eph, running, service)?;
         for cmd in &service.pre_start {
             self.run_hook(cmd, &env)
                 .await
@@ -1921,7 +2123,7 @@ impl ServiceManager {
             return Ok(());
         }
         info!("Running post-start hooks for {}", service.name);
-        let env = self.hook_env(eph, running, service);
+        let env = self.hook_env(eph, running, service)?;
         for cmd in &service.post_start {
             self.run_hook(cmd, &env).await.with_context(|| {
                 format!("post-start hook failed for service '{}'", service.name)
@@ -1956,6 +2158,224 @@ impl ServiceManager {
         Ok(())
     }
 
+    /// Materialize source inputs that must be known before deciding whether an
+    /// existing resource is reusable, then hash one canonical runtime spec.
+    async fn prepare_service(
+        &self,
+        service: &Service,
+        eph: &EphFile,
+        running: &HashMap<String, RunningService>,
+    ) -> Result<PreparedService> {
+        let service_env = || resolved_service_env(service, running);
+        match &service.source {
+            ServiceSource::Image(image) => {
+                self.docker.ensure_image(image).await?;
+                let image_id = self.docker.image_id(image).await?;
+                Ok(PreparedService {
+                    fingerprint: runtime_fingerprint(
+                        service,
+                        RuntimeSourceSpec::Image {
+                            reference: image,
+                            image_id: &image_id,
+                        },
+                        service_env()?,
+                    )?,
+                    built_image: None,
+                    command_ports: None,
+                })
+            }
+            ServiceSource::Dockerfile(path) => {
+                let dockerfile_path = self.workspace.path.join(path);
+                let (image, image_id) = self
+                    .docker
+                    .build_image(&dockerfile_path, service, &self.workspace)
+                    .await?;
+                Ok(PreparedService {
+                    fingerprint: runtime_fingerprint(
+                        service,
+                        RuntimeSourceSpec::Dockerfile {
+                            path,
+                            image_id: &image_id,
+                        },
+                        service_env()?,
+                    )?,
+                    built_image: Some(image),
+                    command_ports: None,
+                })
+            }
+            ServiceSource::Compose(path) => Ok(PreparedService {
+                fingerprint: runtime_fingerprint(
+                    service,
+                    RuntimeSourceSpec::Compose(path),
+                    service_env()?,
+                )?,
+                built_image: None,
+                command_ports: None,
+            }),
+            ServiceSource::Command(command) => {
+                let previous_ports = self
+                    .state
+                    .services
+                    .get(&service.name)
+                    .filter(|entry| entry.backend.process_is_alive())
+                    .map(|entry| &entry.ports)
+                    .or_else(|| self.state.auto_ports.get(&service.name));
+                let ports = allocate_ports(&service.ports, previous_ports)?;
+                let mut effective_running = running.clone();
+                effective_running.insert(
+                    service.name.clone(),
+                    RunningService {
+                        name: service.name.clone(),
+                        ports: ports.clone(),
+                    },
+                );
+                let effective_env = self
+                    .app_env(eph, &effective_running, service)?
+                    .into_iter()
+                    .collect();
+                Ok(PreparedService {
+                    fingerprint: runtime_fingerprint(
+                        service,
+                        RuntimeSourceSpec::Command(command),
+                        effective_env,
+                    )?,
+                    built_image: None,
+                    command_ports: Some(ports),
+                })
+            }
+        }
+    }
+
+    async fn compose_down(&self, name: &str, project: &str) -> Result<()> {
+        let output = TokioCommand::new("docker")
+            .args(["compose", "-p", project, "down"])
+            .output()
+            .await
+            .context("failed to run docker compose down")?;
+        if !output.status.success() {
+            bail!(
+                "`docker compose down` failed for service '{}':\n{}",
+                name,
+                String::from_utf8_lossy(&output.stderr).trim_end()
+            );
+        }
+        Ok(())
+    }
+
+    /// Remove a resource using the backend that actually created it.
+    async fn discard_backend(&self, name: &str, backend: &Backend) -> Result<()> {
+        match backend {
+            Backend::Process { pid, .. } => {
+                if backend.process_is_alive() {
+                    proc::terminate(*pid);
+                    sleep(Duration::from_secs(2)).await;
+                    proc::force_kill(*pid);
+                }
+            }
+            Backend::Compose { project } => {
+                self.compose_down(name, project).await?;
+            }
+            Backend::Container { .. } => {
+                let container_name = self.workspace.container_name(name);
+                self.docker.stop_container(&container_name).await?;
+                self.docker.remove_container(&container_name).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Stop a live resource through recorded backend truth. Containers may be
+    /// retained for a fast restart; compose and process backends have no
+    /// distinct stopped resource and are torn down normally.
+    async fn stop_recorded_backend(
+        &self,
+        name: &str,
+        backend: &Backend,
+        remove: bool,
+    ) -> Result<bool> {
+        match backend {
+            Backend::Process { pid, .. } => {
+                if !backend.process_is_alive() {
+                    return Ok(false);
+                }
+                info!("Stopping process {} (PID {})", name, pid);
+                proc::terminate(*pid);
+                sleep(Duration::from_secs(2)).await;
+                proc::force_kill(*pid);
+                Ok(true)
+            }
+            Backend::Compose { project } => {
+                self.compose_down(name, project).await?;
+                Ok(true)
+            }
+            Backend::Container { .. } => {
+                let container_name = self.workspace.container_name(name);
+                let stopped = self.docker.stop_container(&container_name).await?;
+                let removed = if remove {
+                    self.docker.remove_container(&container_name).await?
+                } else {
+                    false
+                };
+                Ok(stopped || removed)
+            }
+        }
+    }
+
+    /// Reconcile durable config state before any backend-specific reuse path.
+    async fn reconcile_service_config(
+        &mut self,
+        name: &str,
+        service: &Service,
+        desired: &RuntimeConfigFingerprint,
+    ) -> Result<()> {
+        let recorded = self.state.service_configs.get(name).cloned();
+        let running_backend = self
+            .state
+            .services
+            .get(name)
+            .map(|entry| entry.backend.clone());
+        let matches = recorded.as_ref().is_some_and(|record| {
+            record.fingerprint == *desired
+                && backend_matches_source(&record.backend, &service.source)
+        });
+        if matches {
+            return Ok(());
+        }
+
+        if recorded.is_some() || running_backend.is_some() {
+            info!(
+                "Recreating service {} because its runtime config changed",
+                name
+            );
+        }
+        if let Some(backend) = running_backend
+            .as_ref()
+            .or(recorded.as_ref().map(|r| &r.backend))
+        {
+            self.discard_backend(name, backend).await?;
+        } else {
+            // State written before fingerprints cannot identify a stopped
+            // source-type predecessor. Direct containers have deterministic
+            // names, so remove one if present before creating any backend.
+            let container_name = self.workspace.container_name(name);
+            self.docker.stop_container(&container_name).await?;
+            self.docker.remove_container(&container_name).await?;
+        }
+        self.state.services.remove(name);
+        self.state.service_configs.remove(name);
+        // Persist removal before creating the replacement. If creation fails,
+        // the next command must not rediscover an obsolete record and accept it.
+        self.state.save(&self.workspace).await
+    }
+
+    /// Remove a backend that failed readiness and make that cleanup durable.
+    async fn discard_failed_start(&mut self, name: &str, backend: &Backend) -> Result<()> {
+        self.discard_backend(name, backend).await?;
+        self.state.services.remove(name);
+        self.state.service_configs.remove(name);
+        self.state.save(&self.workspace).await
+    }
+
     /// Start a single service, reusing an already-running instance if present.
     ///
     /// Docker-backed services (`image`/`dockerfile`) are created or restarted and
@@ -1981,12 +2401,13 @@ impl ServiceManager {
     ) -> Result<RunningService> {
         let container_name = self.workspace.container_name(name);
 
-        // Validate (and parse) the command override up front, before any
-        // existing-container reuse/restart fast path below. Otherwise an edited
-        // `.eph` with a malformed `command=` could still "succeed" by reusing a
-        // stale container, defeating the fail-closed intent. Only image and
-        // dockerfile services use it; for the rest this is `None`.
-        let command = parse_command_override(name, service.command_override.as_deref())?;
+        let command = service
+            .command_override
+            .as_ref()
+            .map(|command| command.argv().to_vec());
+        let prepared = self.prepare_service(service, eph, running).await?;
+        self.reconcile_service_config(name, service, &prepared.fingerprint)
+            .await?;
 
         // Dedup run= (shell command) services: the Docker-based guard below
         // explicitly skips ServiceSource::Command, so without this check running
@@ -1994,14 +2415,37 @@ impl ServiceManager {
         // Probe the tracked PID the same way status() does.
         if matches!(service.source, ServiceSource::Command(_))
             && let Some(entry) = self.state.services.get(name)
-            && let Backend::Process { pid, .. } = &entry.backend
+            && let Backend::Process { pid, .. } = entry.backend.clone()
             && entry.backend.process_is_alive()
         {
             info!("Service {} already running (PID {})", name, pid);
-            return Ok(RunningService {
+            let reused = RunningService {
                 name: name.to_string(),
                 ports: entry.ports.clone(),
-            });
+            };
+            let backend = entry.backend.clone();
+            let mut resolved = running.clone();
+            resolved.insert(name.to_string(), reused.clone());
+            let env = self.app_env(eph, &resolved, service)?;
+            if let Some(healthcheck) = service
+                .healthcheck
+                .as_ref()
+                .map(|check| {
+                    resolve_value_strict(
+                        &check.command,
+                        &resolved,
+                        &format!("healthcheck of service '{name}'"),
+                    )
+                })
+                .transpose()?
+                && let Err(error) = self
+                    .wait_for_running_process(name, service, &backend, &healthcheck, &env)
+                    .await
+            {
+                self.discard_failed_start(name, &backend).await?;
+                return Err(error);
+            }
+            return Ok(reused);
         }
 
         // Check if already running (for Docker-based services)
@@ -2012,16 +2456,41 @@ impl ServiceManager {
         {
             if existing.is_running {
                 info!("Service {} already running", name);
+                let named_ports = map_named_ports(&service.ports, &existing.ports);
+                let mut health_running = running.clone();
+                health_running.insert(
+                    name.to_string(),
+                    RunningService {
+                        name: name.to_string(),
+                        ports: named_ports.clone(),
+                    },
+                );
+                if let Err(error) = self
+                    .wait_for_healthy(name, service, &existing.id, &health_running)
+                    .await
+                {
+                    let backend = Backend::Container {
+                        id: existing.id.clone(),
+                    };
+                    self.discard_failed_start(name, &backend).await?;
+                    return Err(error);
+                }
                 // Re-map declared port names onto the raw host ports, exactly as
                 // the fresh-create path does, so named-port interpolation keeps
                 // resolving across an `eph up` on an already-running container.
-                let named_ports = map_named_ports(&service.ports, &existing.ports);
                 // Record in state even for already-running containers
                 self.state.services.insert(
                     name.to_string(),
                     ServiceStateEntry {
                         backend: Backend::Container { id: existing.id },
                         ports: named_ports.clone(),
+                    },
+                );
+                self.state.service_configs.insert(
+                    name.to_string(),
+                    ServiceConfigRecord {
+                        fingerprint: prepared.fingerprint,
+                        backend: self.state.services[name].backend.clone(),
                     },
                 );
                 return Ok(RunningService {
@@ -2038,21 +2507,45 @@ impl ServiceManager {
                     .await?
                     .context("container disappeared after start")?;
 
+                let named_ports = map_named_ports(&service.ports, &refreshed.ports);
+                let mut health_running = running.clone();
+                health_running.insert(
+                    name.to_string(),
+                    RunningService {
+                        name: name.to_string(),
+                        ports: named_ports.clone(),
+                    },
+                );
+
                 // Wait for health check
-                self.wait_for_healthy(name, service, &refreshed.id).await?;
+                if let Err(error) = self
+                    .wait_for_healthy(name, service, &refreshed.id, &health_running)
+                    .await
+                {
+                    let backend = Backend::Container {
+                        id: refreshed.id.clone(),
+                    };
+                    self.discard_failed_start(name, &backend).await?;
+                    return Err(error);
+                }
 
                 // Re-map declared port names onto the refreshed host ports. The
                 // restart path otherwise records raw container-port-number keys
                 // (e.g. "9000"), which breaks `${svc.port.<name>}` after a
                 // down/up cycle. Mirrors the fresh-create path.
-                let named_ports = map_named_ports(&service.ports, &refreshed.ports);
-
                 // Record in state
                 self.state.services.insert(
                     name.to_string(),
                     ServiceStateEntry {
                         backend: Backend::Container { id: refreshed.id },
                         ports: named_ports.clone(),
+                    },
+                );
+                self.state.service_configs.insert(
+                    name.to_string(),
+                    ServiceConfigRecord {
+                        fingerprint: prepared.fingerprint,
+                        backend: self.state.services[name].backend.clone(),
                     },
                 );
 
@@ -2065,7 +2558,7 @@ impl ServiceManager {
 
         // Create and start new service
         info!("Creating service {}", name);
-        let (running, backend) = match &service.source {
+        let (running, backend, fingerprint) = match &service.source {
             ServiceSource::Image(image) => {
                 let (r, id) = self
                     .docker
@@ -2080,17 +2573,29 @@ impl ServiceManager {
                     .await?;
 
                 // Wait for health check
-                self.wait_for_healthy(name, service, &id).await?;
+                let mut health_running = running.clone();
+                health_running.insert(name.to_string(), r.clone());
+                if let Err(error) = self
+                    .wait_for_healthy(name, service, &id, &health_running)
+                    .await
+                {
+                    let backend = Backend::Container { id };
+                    self.discard_failed_start(name, &backend).await?;
+                    return Err(error);
+                }
 
-                (r, Backend::Container { id })
+                (r, Backend::Container { id }, prepared.fingerprint.clone())
             }
-            ServiceSource::Dockerfile(path) => {
-                let dockerfile_path = self.workspace.path.join(path);
+            ServiceSource::Dockerfile(_) => {
+                let image = prepared
+                    .built_image
+                    .as_deref()
+                    .context("dockerfile service was not built before creation")?;
                 let (r, id) = self
                     .docker
-                    .build_and_run(
+                    .run_image(
                         &container_name,
-                        &dockerfile_path,
+                        image,
                         service,
                         &self.workspace,
                         command,
@@ -2099,15 +2604,30 @@ impl ServiceManager {
                     .await?;
 
                 // Wait for health check
-                self.wait_for_healthy(name, service, &id).await?;
+                let mut health_running = running.clone();
+                health_running.insert(name.to_string(), r.clone());
+                if let Err(error) = self
+                    .wait_for_healthy(name, service, &id, &health_running)
+                    .await
+                {
+                    let backend = Backend::Container { id };
+                    self.discard_failed_start(name, &backend).await?;
+                    return Err(error);
+                }
 
-                (r, Backend::Container { id })
+                (r, Backend::Container { id }, prepared.fingerprint.clone())
             }
             ServiceSource::Command(cmd) => {
-                self.start_shell_command(name, cmd, service, eph).await?
+                let ports = prepared
+                    .command_ports
+                    .as_ref()
+                    .context("run service ports were not prepared")?;
+                self.start_shell_command(name, cmd, service, eph, ports, running)
+                    .await?
             }
             ServiceSource::Compose(path) => {
-                self.start_compose(name, path, service, running).await?
+                let (running, backend) = self.start_compose(name, path, service, running).await?;
+                (running, backend, prepared.fingerprint.clone())
             }
         };
 
@@ -2117,6 +2637,13 @@ impl ServiceManager {
             ServiceStateEntry {
                 backend,
                 ports: running.ports.clone(),
+            },
+        );
+        self.state.service_configs.insert(
+            name.to_string(),
+            ServiceConfigRecord {
+                fingerprint,
+                backend: self.state.services[name].backend.clone(),
             },
         );
 
@@ -2131,6 +2658,7 @@ impl ServiceManager {
         name: &str,
         service: &Service,
         container_id: &str,
+        running: &HashMap<String, RunningService>,
     ) -> Result<()> {
         let Some(ref healthcheck) = service.healthcheck else {
             // No health check defined, just wait a bit
@@ -2138,14 +2666,18 @@ impl ServiceManager {
             return Ok(());
         };
 
-        let timeout_dur = Duration::from_secs(service.ready_timeout_secs.unwrap_or(30));
+        let timeout_dur = Duration::from_secs(
+            healthcheck
+                .timeout_secs
+                .map_or(30, std::num::NonZeroU64::get),
+        );
+        let command = resolve_value_strict(
+            &healthcheck.command,
+            running,
+            &format!("healthcheck of service '{name}'"),
+        )?;
         wait_until_ready(name, timeout_dur, Duration::from_secs(1), async || {
-            // Parse healthcheck command. An empty command is treated as ready
-            // immediately (nothing to probe).
-            let parts: Vec<&str> = healthcheck.split_whitespace().collect();
-            if parts.is_empty() {
-                return Ok(Some(()));
-            }
+            let parts: Vec<&str> = command.split_whitespace().collect();
 
             let exit_code = self.docker.exec_in_container(container_id, &parts).await?;
             if exit_code == 0 {
@@ -2171,9 +2703,8 @@ impl ServiceManager {
     /// eph chose. Because eph owns launching the process, it closes the
     /// unavoidable gap between reserving a port and the process binding it: it
     /// watches for an early exit whose captured log names a port conflict and
-    /// re-launches on a fresh port, up to a few attempts. Fixed-port and
-    /// port-less commands keep the previous behavior -- spawned once, with an
-    /// early exit ignored -- so this is purely additive for them.
+    /// re-launches on a fresh port, up to a few attempts. Every other early exit
+    /// fails startup, including fixed-port and port-less commands.
     ///
     /// The process inherits eph's resolved environment (the variables `eph env`
     /// emits, plus `EPH_*` metadata and its own resolved `env.X`), so a managed
@@ -2185,35 +2716,34 @@ impl ServiceManager {
         cmd: &str,
         service: &Service,
         eph: &EphFile,
-    ) -> Result<(RunningService, Backend)> {
+        first_ports: &HashMap<String, u16>,
+        others: &HashMap<String, RunningService>,
+    ) -> Result<(RunningService, Backend, RuntimeConfigFingerprint)> {
         info!("Starting shell command for {}: {}", name, cmd);
 
         // The ports this service had on a previous `up`, reused for auto ports
-        // when still free so the assigned URL is stable across restarts. Read
-        // from `auto_ports`, which survives `eph down` (unlike `services`).
-        let prev_ports = self.state.auto_ports.get(name).cloned();
-
-        // Snapshot the other running services once so the app's environment can
-        // interpolate their connection details (e.g. ${postgres.port}). This
-        // service's own freshly-assigned ports are layered on per attempt below.
-        let others = self.status().await?;
+        // when still free so the assigned URL is stable across restarts. The
+        // candidate comes from live state or `auto_ports`, which survives
+        // `eph down`; fixed declarations always override that candidate.
+        // The caller's resolved snapshot includes each service brought up before
+        // this one. Re-querying persisted liveness here can transiently omit a
+        // process that was started moments ago, which would make strict
+        // interpolation reject an otherwise valid dependency.
 
         // Only auto-port services are re-launchable: a fixed-port or port-less
-        // command that dies did not lose a port race, so retrying would just mask
-        // a real failure and (for fixed ports) we keep the historical behavior of
-        // not treating an early exit as a startup failure at all.
+        // command that dies did not lose a port race, so retrying would mask the
+        // actual startup failure.
         let has_auto = has_auto_port(&service.ports);
         let max_attempts: u32 = if has_auto { 4 } else { 1 };
 
         for attempt in 1..=max_attempts {
             // Reuse the previous ports only on the first attempt; a retry exists
             // precisely because a port collided, so it allocates fresh ones.
-            let reuse = if attempt == 1 {
-                prev_ports.as_ref()
+            let ports = if attempt == 1 {
+                first_ports.clone()
             } else {
-                None
+                allocate_ports(&service.ports, None)?
             };
-            let ports = allocate_ports(&service.ports, reuse)?;
 
             // Build the environment with this service's assigned ports visible, so
             // it can read its own ${<name>.port} alongside other services'.
@@ -2225,15 +2755,27 @@ impl ServiceManager {
                     ports: ports.clone(),
                 },
             );
-            let env = self.app_env(eph, &running, service);
+            let env = self.app_env(eph, &running, service)?;
 
             // Resolve the healthcheck's ${...} against the same running set, so a
             // readiness check can name the app's assigned port as ${<name>.port}
             // (it also receives the env below, so `$PORT` works too).
             let healthcheck = service
                 .healthcheck
-                .as_deref()
-                .map(|hc| resolve_against(hc, &running));
+                .as_ref()
+                .map(|healthcheck| {
+                    resolve_value_strict(
+                        &healthcheck.command,
+                        &running,
+                        &format!("healthcheck of service '{name}'"),
+                    )
+                })
+                .transpose()?;
+            let ready_timeout_secs = service
+                .healthcheck
+                .as_ref()
+                .and_then(|hc| hc.timeout_secs)
+                .map(std::num::NonZeroU64::get);
 
             let (mut child, pid) = self.spawn_command(name, cmd, &env, false)?;
             let backend = process_backend(name, pid);
@@ -2252,17 +2794,24 @@ impl ServiceManager {
                 },
             );
 
-            match self
+            let readiness = self
                 .await_command_ready(
                     name,
                     healthcheck.as_deref(),
-                    service.ready_timeout_secs,
+                    ready_timeout_secs,
                     &env,
                     &mut child,
-                    has_auto,
+                    true,
                 )
-                .await?
-            {
+                .await;
+            let outcome = match readiness {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.discard_failed_start(name, &backend).await?;
+                    return Err(error);
+                }
+            };
+            match outcome {
                 ReadyOutcome::Ready => {
                     // Remember the auto ports so the next `up` reuses them for a
                     // stable URL, even across `eph down`.
@@ -2271,12 +2820,19 @@ impl ServiceManager {
                             .auto_ports
                             .insert(name.to_string(), ports.clone());
                     }
+                    let effective_env = env.into_iter().collect();
+                    let fingerprint = runtime_fingerprint(
+                        service,
+                        RuntimeSourceSpec::Command(cmd),
+                        effective_env,
+                    )?;
                     return Ok((
                         RunningService {
                             name: name.to_string(),
                             ports,
                         },
                         backend,
+                        fingerprint,
                     ));
                 }
                 ReadyOutcome::PortConflict if attempt < max_attempts => {
@@ -2400,11 +2956,9 @@ impl ServiceManager {
     ///
     /// With a healthcheck, polls it until it passes or the ready timeout elapses
     /// (the timeout is a hard failure, as before). Without one, gives the process
-    /// a brief grace period. When `detect_exit` is set (an auto-port service that
-    /// may be re-launched), an exit during startup is reported as
+    /// a brief grace period. When `detect_exit` is set, an exit during startup is reported as
     /// [`ReadyOutcome::PortConflict`] or [`ReadyOutcome::Exited`] depending on
-    /// whether its log names a port conflict; when it is clear (fixed-port
-    /// services), an early exit is ignored, preserving the historical behavior.
+    /// whether its log names a port conflict.
     ///
     /// `healthcheck` is already `${...}`-resolved, and `env` is the exact
     /// environment the app was spawned with, so a readiness check can reference
@@ -2458,6 +3012,46 @@ impl ServiceManager {
         .await
     }
 
+    /// Re-run a declared healthcheck before adopting an existing `run=`
+    /// process. Reuse is a startup path, so it has the same fail-closed health
+    /// contract as a freshly spawned process.
+    async fn wait_for_running_process(
+        &self,
+        name: &str,
+        service: &Service,
+        backend: &Backend,
+        healthcheck: &str,
+        env: &[(String, String)],
+    ) -> Result<()> {
+        let timeout_dur = Duration::from_secs(
+            service
+                .healthcheck
+                .as_ref()
+                .and_then(|healthcheck| healthcheck.timeout_secs)
+                .map_or(30, std::num::NonZeroU64::get),
+        );
+        wait_until_ready(name, timeout_dur, Duration::from_secs(1), async || {
+            if !backend.process_is_alive() {
+                bail!("service '{}' exited during startup", name);
+            }
+            let output = proc::shell_command(healthcheck)
+                .current_dir(&self.workspace.path)
+                .envs(
+                    env.iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str())),
+                )
+                .output()
+                .await?;
+            if output.status.success() {
+                info!("Service {} is healthy", name);
+                return Ok(Some(()));
+            }
+            debug!("Health check for {} failed, retrying...", name);
+            Ok(None)
+        })
+        .await
+    }
+
     /// Classify why a freshly-spawned `run=` process exited by scanning its
     /// captured log for a [port-conflict marker](PORT_CONFLICT_MARKERS). The log
     /// is small here (the process only just started), so reading it whole is
@@ -2485,12 +3079,10 @@ impl ServiceManager {
         eph: &EphFile,
         running: &HashMap<String, RunningService>,
         service: &Service,
-    ) -> Vec<(String, String)> {
-        let mut env = self.command_env(eph, running);
-        for (k, v) in &service.env {
-            env.push((k.clone(), resolve_against(v, running)));
-        }
-        env
+    ) -> Result<Vec<(String, String)>> {
+        let mut env = self.command_env_strict(eph, running)?;
+        env.extend(resolve_service_env_strict(service, running)?);
+        Ok(env)
     }
 
     /// Start a docker-compose service
@@ -2501,129 +3093,182 @@ impl ServiceManager {
         service: &Service,
         running: &HashMap<String, RunningService>,
     ) -> Result<(RunningService, Backend)> {
-        let compose_file = self.workspace.path.join(compose_path);
         let project_name = format!("eph-{}-{}", self.workspace.short_id, name);
+        let mut compose_was_invoked = false;
+        let attempt: Result<RunningService> = async {
+            let compose_file = self.workspace.path.join(compose_path);
 
-        info!(
-            "Starting docker-compose service {} from {}",
-            name,
-            compose_file.display()
-        );
+            info!(
+                "Starting docker-compose service {} from {}",
+                name,
+                compose_file.display()
+            );
 
-        // The service's env.X values, with ${service.property} references
-        // resolved, exported into `docker compose`'s process environment.
-        // Compose files consume them through their own `${VAR}` substitution.
-        // env.X on a compose service used to be dropped entirely (never even
-        // read), so the documented syntax silently did nothing here.
-        let compose_env: Vec<(String, String)> = service
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), resolve_against(v, running)))
-            .collect();
+            // The service's env.X values, with ${service.property} references
+            // resolved, exported into `docker compose`'s process environment.
+            // Compose files consume them through their own `${VAR}` substitution.
+            // env.X on a compose service used to be dropped entirely (never even
+            // read), so the documented syntax silently did nothing here.
+            let compose_env: BTreeMap<String, String> =
+                resolve_service_env_strict(service, running)?
+                    .into_iter()
+                    .collect();
 
-        // Start compose
-        let output = TokioCommand::new("docker")
-            .args([
-                "compose",
-                "-f",
-                &compose_file.to_string_lossy(),
-                "-p",
-                &project_name,
-                "up",
-                "-d",
-            ])
-            .envs(compose_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .current_dir(&self.workspace.path)
-            .output()
-            .await
-            .context("failed to run docker compose")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("docker compose failed:\n{}", stderr);
-        }
-
-        // Get port mappings from compose
-        let mut ports = HashMap::new();
-        for port_mapping in &service.ports {
-            let port_name = port_mapping
-                .name
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
-
-            // Try to get the actual mapped port from docker compose. Same
-            // environment as the `up` call, so a compose file whose structure
-            // depends on those variables parses identically.
-            let port_output = TokioCommand::new("docker")
+            // Start compose
+            compose_was_invoked = true;
+            let output = TokioCommand::new("docker")
                 .args([
                     "compose",
                     "-f",
                     &compose_file.to_string_lossy(),
                     "-p",
                     &project_name,
-                    "port",
-                    &port_name,
-                    &port_mapping.container_port.to_string(),
+                    "up",
+                    "-d",
                 ])
-                .envs(compose_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .envs(&compose_env)
+                .current_dir(&self.workspace.path)
                 .output()
-                .await;
+                .await
+                .context("failed to run docker compose")?;
 
-            if let Ok(output) = port_output
-                && output.status.success()
-            {
-                let port_str = String::from_utf8_lossy(&output.stdout);
-                // Output is like "0.0.0.0:12345" or ":::12345"
-                if let Some(port) = port_str.trim().rsplit(':').next()
-                    && let Ok(p) = port.parse::<u16>()
-                {
-                    ports.insert(port_name.clone(), p);
-                    continue;
-                }
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!("docker compose failed:\n{}", stderr);
             }
 
-            // `docker compose port` failed or did not parse. Fall back to the
-            // declared container port, but say so: compose normally maps to a
-            // random host port, so this fallback value is usually wrong and a
-            // connection string interpolating it will not reach the service.
-            warn!(
-                "could not resolve the host port for '{}' port '{}' via `docker \
-                 compose port`; using the declared container port {} (this is \
-                 probably not the mapped host port)",
-                name, port_name, port_mapping.container_port
-            );
-            ports.insert(port_name, port_mapping.container_port);
-        }
+            // Get port mappings from compose
+            let mut ports = HashMap::new();
+            for port_mapping in &service.ports {
+                let PortMapping::Compose {
+                    alias,
+                    service: compose_service,
+                    port: container_port,
+                } = port_mapping
+                else {
+                    bail!("compose service '{}' contains a non-Compose port", name);
+                };
 
-        // Wait for health check if specified
-        if let Some(ref healthcheck) = service.healthcheck {
-            let timeout_dur = Duration::from_secs(service.ready_timeout_secs.unwrap_or(60));
-            wait_until_ready(name, timeout_dur, Duration::from_secs(2), async || {
-                let output = proc::shell_command(healthcheck)
-                    .current_dir(&self.workspace.path)
+                // Try to get the actual mapped port from docker compose. Same
+                // environment as the `up` call, so a compose file whose structure
+                // depends on those variables parses identically.
+                let port_output = TokioCommand::new("docker")
+                    .args([
+                        "compose",
+                        "-f",
+                        &compose_file.to_string_lossy(),
+                        "-p",
+                        &project_name,
+                        "port",
+                        compose_service,
+                        &container_port.to_string(),
+                    ])
+                    .envs(&compose_env)
                     .output()
-                    .await?;
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to query Compose port '{}:{}' for service '{}'",
+                            compose_service, container_port, name
+                        )
+                    })?;
 
-                if output.status.success() {
-                    info!("Service {} is healthy", name);
-                    return Ok(Some(()));
+                if !port_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&port_output.stderr);
+                    bail!(
+                        "could not resolve Compose port '{}:{}' for service '{}': {}",
+                        compose_service,
+                        container_port,
+                        name,
+                        stderr.trim()
+                    );
                 }
 
-                debug!("Health check for {} failed, retrying...", name);
-                Ok(None)
-            })
-            .await?;
-        }
+                let port_text = String::from_utf8_lossy(&port_output.stdout);
+                let host_port = port_text
+                    .trim()
+                    .rsplit(':')
+                    .next()
+                    .and_then(|port| port.parse::<u16>().ok())
+                    .filter(|port| *port != 0)
+                    .with_context(|| {
+                        format!(
+                            "docker compose returned an invalid host port for '{}:{}': {}",
+                            compose_service,
+                            container_port,
+                            port_text.trim()
+                        )
+                    })?;
+                ports.insert(alias.clone(), host_port);
+            }
 
-        Ok((
-            RunningService {
+            // Wait for health check if specified
+            if let Some(ref healthcheck) = service.healthcheck {
+                let mut health_running = running.clone();
+                health_running.insert(
+                    name.to_string(),
+                    RunningService {
+                        name: name.to_string(),
+                        ports: ports.clone(),
+                    },
+                );
+                let command = resolve_value_strict(
+                    &healthcheck.command,
+                    &health_running,
+                    &format!("healthcheck of service '{name}'"),
+                )?;
+                let timeout_dur = Duration::from_secs(
+                    healthcheck
+                        .timeout_secs
+                        .map_or(60, std::num::NonZeroU64::get),
+                );
+                let readiness =
+                    wait_until_ready(name, timeout_dur, Duration::from_secs(2), async || {
+                        let output = proc::shell_command(&command)
+                            .current_dir(&self.workspace.path)
+                            .envs(&compose_env)
+                            .output()
+                            .await?;
+
+                        if output.status.success() {
+                            info!("Service {} is healthy", name);
+                            return Ok(Some(()));
+                        }
+
+                        debug!("Health check for {} failed, retrying...", name);
+                        Ok(None)
+                    })
+                    .await;
+                readiness?;
+            }
+
+            Ok(RunningService {
                 name: name.to_string(),
                 ports,
-            },
-            Backend::Compose {
-                project: project_name,
-            },
-        ))
+            })
+        }
+        .await;
+
+        match attempt {
+            Ok(running) => Ok((
+                running,
+                Backend::Compose {
+                    project: project_name,
+                },
+            )),
+            Err(error) if !compose_was_invoked => Err(error),
+            Err(error) => {
+                let backend = Backend::Compose {
+                    project: project_name.clone(),
+                };
+                if let Err(cleanup_error) = self.discard_failed_start(name, &backend).await {
+                    return Err(error.context(format!(
+                        "also failed to remove Compose project '{project_name}' after startup failure: {cleanup_error:#}"
+                    )));
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Stop all services (declared ones plus any recorded in state under a
@@ -2747,7 +3392,7 @@ impl ServiceManager {
         // (and, being fatal, could break `eph down` for an unrelated service).
         if !skip_hooks && running.contains_key(name) && !service.pre_stop.is_empty() {
             info!("Running pre-stop hooks for {}", name);
-            let env = self.hook_env(eph, running, service);
+            let env = self.hook_env(eph, running, service)?;
             for cmd in &service.pre_stop {
                 self.run_hook(cmd, &env)
                     .await
@@ -2755,92 +3400,29 @@ impl ServiceManager {
             }
         }
 
-        let stopped_something = match &service.source {
-            ServiceSource::Command(_) => {
-                // Kill the process, reading its PID from the recorded backend.
-                if let Some(entry) = self.state.services.get(name)
-                    && let Backend::Process { pid, .. } = &entry.backend
-                {
-                    let pid = *pid;
-                    if entry.backend.process_is_alive() {
-                        info!("Stopping process {} (PID {})", name, pid);
-                        // Ask it to terminate gracefully (SIGTERM on Unix,
-                        // TerminateProcess on Windows), then force-kill if it
-                        // ignored the request. Both are best-effort: a process
-                        // that exits in between is a no-op.
-                        proc::terminate(pid);
-                        sleep(Duration::from_secs(2)).await;
-                        proc::force_kill(pid);
-                        true
-                    } else {
-                        // Either already exited, or the PID now belongs to an
-                        // unrelated process (identity mismatch). Never signal
-                        // it; just drop the stale entry below.
-                        debug!(
-                            "process for {} (PID {}) is already gone or reused; \
-                             nothing to stop",
-                            name, pid
-                        );
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            ServiceSource::Compose(path) => {
-                // Only invoke `docker compose down` when eph has any record of
-                // the project being up; a never-started service is a no-op,
-                // matching the container path below. When it does run, a
-                // failure is a real error (a broken compose file, a missing
-                // compose plugin) and propagates: this used to be swallowed
-                // wholesale, so `eph down` reported success while the compose
-                // containers kept running.
-                if running.contains_key(name) || self.state.services.contains_key(name) {
-                    let compose_file = self.workspace.path.join(path);
-                    let project_name = format!("eph-{}-{}", self.workspace.short_id, name);
-                    info!("Stopping docker-compose service {}", name);
-                    // Same env the compose file was brought up with, so its
-                    // `${VAR}` substitutions parse the same way on the way down.
-                    let compose_env: Vec<(String, String)> = service
-                        .env
-                        .iter()
-                        .map(|(k, v)| (k.clone(), resolve_against(v, running)))
-                        .collect();
-                    let output = TokioCommand::new("docker")
-                        .args([
-                            "compose",
-                            "-f",
-                            &compose_file.to_string_lossy(),
-                            "-p",
-                            &project_name,
-                            "down",
-                        ])
-                        .envs(compose_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-                        .output()
-                        .await
-                        .context("failed to run docker compose down")?;
-                    if !output.status.success() {
-                        bail!(
-                            "`docker compose down` failed for service '{}':\n{}",
-                            name,
-                            String::from_utf8_lossy(&output.stderr).trim_end()
-                        );
-                    }
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => {
-                let container_name = self.workspace.container_name(name);
-                let stopped = self.docker.stop_container(&container_name).await?;
-                let removed = if remove {
-                    self.docker.remove_container(&container_name).await?
-                } else {
-                    false
-                };
-                stopped || removed
-            }
+        let stopped_something = if let Some(backend) = self
+            .state
+            .services
+            .get(name)
+            .map(|entry| entry.backend.clone())
+        {
+            self.stop_recorded_backend(name, &backend, remove).await?
+        } else if matches!(
+            service.source,
+            ServiceSource::Image(_) | ServiceSource::Dockerfile(_)
+        ) {
+            // Legacy state can be missing while a directly-managed container
+            // still exists. Its deterministic name is enough to stop it safely.
+            let container_name = self.workspace.container_name(name);
+            let stopped = self.docker.stop_container(&container_name).await?;
+            let removed = if remove {
+                self.docker.remove_container(&container_name).await?
+            } else {
+                false
+            };
+            stopped || removed
+        } else {
+            false
         };
 
         self.state.services.remove(name);
@@ -2858,7 +3440,7 @@ impl ServiceManager {
         // Fix the cleanup and run it by hand, or use `--skip-hooks` to bypass.
         if !skip_hooks && running.contains_key(name) && !service.post_stop.is_empty() {
             info!("Running post-stop hooks for {}", name);
-            let env = self.hook_env(eph, running, service);
+            let env = self.hook_env(eph, running, service)?;
             for cmd in &service.post_stop {
                 self.run_hook(cmd, &env)
                     .await
@@ -2887,47 +3469,13 @@ impl ServiceManager {
              as started by eph",
             name
         );
-        let stopped = match entry.backend.clone() {
-            Backend::Process { pid, .. } => {
-                if entry.backend.process_is_alive() {
-                    proc::terminate(pid);
-                    sleep(Duration::from_secs(2)).await;
-                    proc::force_kill(pid);
-                    true
-                } else {
-                    false
-                }
-            }
-            Backend::Compose { project } => {
-                // No compose file path is recorded, but `docker compose down`
-                // resolves the project's containers from their labels, so `-p`
-                // alone is enough to tear it down.
-                let output = TokioCommand::new("docker")
-                    .args(["compose", "-p", &project, "down"])
-                    .output()
-                    .await
-                    .context("failed to run docker compose down")?;
-                if !output.status.success() {
-                    bail!(
-                        "`docker compose down` failed for removed service '{}':\n{}",
-                        name,
-                        String::from_utf8_lossy(&output.stderr).trim_end()
-                    );
-                }
-                true
-            }
-            Backend::Container { .. } => {
-                let container_name = self.workspace.container_name(name);
-                let stopped = self.docker.stop_container(&container_name).await?;
-                let removed = if remove {
-                    self.docker.remove_container(&container_name).await?
-                } else {
-                    false
-                };
-                stopped || removed
-            }
-        };
+        let backend = entry.backend.clone();
+        let stopped = self.stop_recorded_backend(name, &backend, remove).await?;
         self.state.services.remove(name);
+        // The name no longer exists in `.eph`, so this record can never be a
+        // valid restart candidate. Keeping it would leave stale resource truth
+        // behind after the orphan has been removed.
+        self.state.service_configs.remove(name);
         Ok(stopped)
     }
 
@@ -3037,6 +3585,7 @@ impl ServiceManager {
         // pick fresh ports.
         self.state.services.clear();
         self.state.auto_ports.clear();
+        self.state.service_configs.clear();
 
         // Remove the persisted state file (and its directory).
         let state_dir = self.workspace.state_dir()?;
@@ -3072,12 +3621,9 @@ impl ServiceManager {
     /// wait on it (and reap it) to notice when the app exits, rather than polling
     /// a PID that a zombie would keep reading as alive.
     ///
-    /// There is no port-conflict re-launch here (`detect_exit` is off): a
-    /// foreground app owns its streams, so a bind failure should surface on the
-    /// inherited stderr rather than silently retry on a different port (which
-    /// would leave the app unreachable at the port `eph dev` expects to gate).
-    /// Call it after the backing services are up so the app's environment can
-    /// already interpolate their ports.
+    /// An auto-port app that exits during the startup grace period is retried on
+    /// a fresh port. Its inherited stderr remains visible for every attempt, and
+    /// any non-auto early exit fails immediately.
     ///
     /// # Errors
     ///
@@ -3096,73 +3642,122 @@ impl ServiceManager {
             bail!("service '{name}' is not a run= service, so `eph dev` cannot foreground it");
         };
 
-        // Reuse the remembered auto port so the app's URL stays stable across
-        // restarts. Snapshot the other running services so the app's env can
-        // interpolate their ports.
-        let prev_ports = self.state.auto_ports.get(name).cloned();
         let others = self.status().await?;
-        let ports = allocate_ports(&service.ports, prev_ports.as_ref())?;
+        let prepared = self.prepare_service(service, eph, &others).await?;
+        self.reconcile_service_config(name, service, &prepared.fingerprint)
+            .await?;
+        let first_ports = prepared
+            .command_ports
+            .context("run service ports were not prepared")?;
+        let has_auto = has_auto_port(&service.ports);
+        let max_attempts = if has_auto { 4 } else { 1 };
 
-        let mut running = others;
-        running.insert(
-            name.to_string(),
-            RunningService {
-                name: name.to_string(),
-                ports: ports.clone(),
-            },
-        );
-        let env = self.app_env(eph, &running, service);
-        let healthcheck = service
-            .healthcheck
-            .as_deref()
-            .map(|hc| resolve_against(hc, &running));
+        for attempt in 1..=max_attempts {
+            let ports = if attempt == 1 {
+                first_ports.clone()
+            } else {
+                allocate_ports(&service.ports, None)?
+            };
+            let mut running = others.clone();
+            running.insert(
+                name.to_string(),
+                RunningService {
+                    name: name.to_string(),
+                    ports: ports.clone(),
+                },
+            );
+            let env = self.app_env(eph, &running, service)?;
+            let healthcheck = service
+                .healthcheck
+                .as_ref()
+                .map(|check| {
+                    resolve_value_strict(
+                        &check.command,
+                        &running,
+                        &format!("healthcheck of service '{name}'"),
+                    )
+                })
+                .transpose()?;
+            let (mut child, pid) = self.spawn_command(name, cmd, &env, true)?;
+            let backend = process_backend(name, pid);
+            info!(
+                "Started {} (foreground) with PID {} (attempt {}/{})",
+                name, pid, attempt, max_attempts
+            );
+            self.state.services.insert(
+                name.to_string(),
+                ServiceStateEntry {
+                    backend: backend.clone(),
+                    ports: ports.clone(),
+                },
+            );
 
-        let (mut child, pid) = self.spawn_command(name, cmd, &env, true)?;
-        let backend = process_backend(name, pid);
-        info!("Started {} (foreground) with PID {}", name, pid);
-
-        // Record before waiting so `eph status` and any teardown see the process
-        // even while it is still coming up.
-        self.state.services.insert(
-            name.to_string(),
-            ServiceStateEntry {
-                backend,
-                ports: ports.clone(),
-            },
-        );
-        if has_auto_port(&service.ports) {
-            self.state
-                .auto_ports
-                .insert(name.to_string(), ports.clone());
+            let readiness = self
+                .await_command_ready(
+                    name,
+                    healthcheck.as_deref(),
+                    service
+                        .healthcheck
+                        .as_ref()
+                        .and_then(|check| check.timeout_secs)
+                        .map(std::num::NonZeroU64::get),
+                    &env,
+                    &mut child,
+                    true,
+                )
+                .await;
+            match readiness {
+                Ok(ReadyOutcome::Ready) => {
+                    if has_auto {
+                        self.state
+                            .auto_ports
+                            .insert(name.to_string(), ports.clone());
+                    }
+                    let fingerprint = runtime_fingerprint(
+                        service,
+                        RuntimeSourceSpec::Command(cmd),
+                        env.into_iter().collect(),
+                    )?;
+                    self.state.service_configs.insert(
+                        name.to_string(),
+                        ServiceConfigRecord {
+                            fingerprint,
+                            backend,
+                        },
+                    );
+                    self.state.save(&self.workspace).await?;
+                    return Ok((
+                        RunningService {
+                            name: name.to_string(),
+                            ports,
+                        },
+                        child,
+                    ));
+                }
+                Ok(ReadyOutcome::PortConflict | ReadyOutcome::Exited)
+                    if has_auto && attempt < max_attempts =>
+                {
+                    warn!(
+                        "Service {} exited during startup; re-launching on a fresh port \
+                         (attempt {}/{})",
+                        name,
+                        attempt + 1,
+                        max_attempts
+                    );
+                    self.state.services.remove(name);
+                }
+                Ok(ReadyOutcome::PortConflict | ReadyOutcome::Exited) => {
+                    self.state.services.remove(name);
+                    self.state.save(&self.workspace).await?;
+                    bail!("service '{}' exited during startup", name);
+                }
+                Err(error) => {
+                    self.discard_failed_start(name, &backend).await?;
+                    return Err(error);
+                }
+            }
         }
-
-        // Wait for readiness with no early-exit classification (`detect_exit =
-        // false`): there is no captured log to scan, and the foreground app does
-        // not get the port-conflict retry. A failed start drops the recorded PID
-        // so no stale entry is left behind.
-        if let Err(e) = self
-            .await_command_ready(
-                name,
-                healthcheck.as_deref(),
-                service.ready_timeout_secs,
-                &env,
-                &mut child,
-                false,
-            )
-            .await
-        {
-            self.state.services.remove(name);
-            return Err(e);
-        }
-        self.state.save(&self.workspace).await?;
-
-        Ok((
-            RunningService {
-                name: name.to_string(),
-                ports,
-            },
-            child,
-        ))
+        bail!("service '{}' could not be started", name)
     }
 
     /// Return the services that are currently running.
@@ -3186,7 +3781,7 @@ impl ServiceManager {
                 // checked by their project's label rather than by container
                 // name. Without this they would never appear in `status` and
                 // their ports could not be interpolated into `eph env`.
-                Backend::Compose { project } => {
+                Backend::Compose { project, .. } => {
                     self.docker.compose_project_running(project).await?
                 }
                 // run= services are tracked by PID; probe it the same way
@@ -3579,12 +4174,9 @@ impl ServiceManager {
         Ok(())
     }
 
-    /// The environment a non-service command (`eph run`) inherits from eph: the
-    /// resolved top-level `.eph` variables plus the `EPH_*` metadata variables.
-    ///
-    /// This is the same connection environment `eph env` emits, augmented with
-    /// metadata, so an arbitrary command can reach the running services exactly
-    /// as a developer's shell would after `eval "$(eph env)"`.
+    /// Build the partially resolved environment used while lifecycle work is in
+    /// progress. Execution boundaries must use [`Self::command_env_strict`] or
+    /// resolve their final values with [`resolve_against_strict`].
     #[must_use]
     pub fn command_env(
         &self,
@@ -3594,6 +4186,18 @@ impl ServiceManager {
         let mut env = resolve_env_vars(eph, running);
         env.extend(eph_metadata_env(&self.workspace, running));
         env
+    }
+
+    /// Build the complete environment for `eph run`, rejecting unavailable
+    /// top-level service references before a child process is created.
+    pub fn command_env_strict(
+        &self,
+        eph: &EphFile,
+        running: &HashMap<String, RunningService>,
+    ) -> std::result::Result<Vec<(String, String)>, UnresolvedEnvironment> {
+        let mut env = resolve_env_vars_strict(eph, running)?;
+        env.extend(eph_metadata_env(&self.workspace, running));
+        Ok(env)
     }
 
     /// The environment overlaid on a lifecycle hook (`pre-start`, `post-start`,
@@ -3608,19 +4212,8 @@ impl ServiceManager {
         eph: &EphFile,
         running: &HashMap<String, RunningService>,
         service: &Service,
-    ) -> Vec<(String, String)> {
-        let mut env = self.command_env(eph, running);
-        // Resolve ${service.property} in the service's own env values, exactly
-        // as the values the service itself received were resolved. A hook used
-        // to get them raw, so `env.PORT=${web.port}` read as the literal
-        // placeholder inside the very service's own post-start hook.
-        env.extend(
-            service
-                .env
-                .iter()
-                .map(|(k, v)| (k.clone(), resolve_against(v, running))),
-        );
-        env
+    ) -> Result<Vec<(String, String)>> {
+        self.app_env(eph, running, service)
     }
 
     /// Run a hook command in the workspace directory with `env` overlaid on
@@ -3664,6 +4257,10 @@ mod tests {
     use super::*;
     use crate::parser::EnvVar;
 
+    /// These tests release and reclaim OS-assigned ports. Serializing them keeps
+    /// one test from occupying another test's candidate between those operations.
+    static PORT_ALLOCATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn running_with(name: &str, port: u16) -> HashMap<String, RunningService> {
         HashMap::from([(
             name.to_string(),
@@ -3689,88 +4286,132 @@ mod tests {
     }
 
     #[test]
-    fn eval_resolution_omits_a_variable_with_an_unresolved_reference() {
-        let eph = eph_with_env(&[("DATABASE_URL", "postgres://localhost:${db.port}/app")]);
-        let running = HashMap::new(); // db is not running
+    fn strict_resolution_reports_ordered_deduplicated_references() {
+        let eph = eph_with_env(&[
+            (
+                "DATABASE_URL",
+                "${db.port}/${cache.port}/${db.port}/${db.host}",
+            ),
+            ("READY", "yes"),
+        ]);
 
-        let (resolved, omitted) = resolve_env_vars_for_eval(&eph, &running);
-        assert!(resolved.is_empty(), "got: {resolved:?}");
-        assert_eq!(omitted.len(), 1);
-        assert_eq!(omitted[0].name, "DATABASE_URL");
-        assert_eq!(omitted[0].service, "db");
-        assert_eq!(omitted[0].property, "port");
+        let error = resolve_env_vars_strict(&eph, &HashMap::new()).unwrap_err();
+
+        assert_eq!(
+            error.resolved,
+            vec![("READY".to_string(), "yes".to_string())]
+        );
+        assert_eq!(error.unresolved.len(), 1);
+        assert_eq!(error.unresolved[0].name, "DATABASE_URL");
+        assert_eq!(
+            error.unresolved[0].references,
+            vec![
+                UnresolvedReference {
+                    service: "db".to_string(),
+                    property: "port".to_string(),
+                },
+                UnresolvedReference {
+                    service: "cache".to_string(),
+                    property: "port".to_string(),
+                },
+                UnresolvedReference {
+                    service: "db".to_string(),
+                    property: "host".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
-    fn eval_resolution_keeps_a_fully_resolvable_variable() {
-        let eph = eph_with_env(&[("DATABASE_URL", "postgres://localhost:${db.port}/app")]);
-        let running = running_with("db", 5432);
+    fn strict_resolution_returns_only_complete_values() {
+        let eph = eph_with_env(&[("DATABASE_URL", "redis://${db.host}:${db.port}")]);
 
-        let (resolved, omitted) = resolve_env_vars_for_eval(&eph, &running);
-        assert!(omitted.is_empty(), "got: {omitted:?}");
+        let resolved = resolve_env_vars_strict(&eph, &running_with("db", 6379)).unwrap();
+
         assert_eq!(
             resolved,
             vec![(
                 "DATABASE_URL".to_string(),
-                "postgres://localhost:5432/app".to_string()
+                "redis://localhost:6379".to_string(),
             )]
         );
     }
 
     #[test]
-    fn eval_resolution_treats_the_escaped_form_as_resolved() {
-        // `$${` is a literal `${`, never a reference, so it must not be omitted.
+    fn strict_resolution_treats_escaped_interpolation_as_literal_text() {
         let eph = eph_with_env(&[("LITERAL", "cost is $${db.port} dollars")]);
-        let running = HashMap::new();
 
-        let (resolved, omitted) = resolve_env_vars_for_eval(&eph, &running);
-        assert!(omitted.is_empty(), "got: {omitted:?}");
+        let resolved = resolve_env_vars_strict(&eph, &HashMap::new()).unwrap();
+
         assert_eq!(
             resolved,
             vec![(
                 "LITERAL".to_string(),
-                "cost is ${db.port} dollars".to_string()
+                "cost is ${db.port} dollars".to_string(),
             )]
         );
     }
 
     #[test]
-    fn eval_resolution_only_omits_the_variable_that_actually_missed() {
-        let eph = eph_with_env(&[
-            ("OK", "${db.port}"),
-            ("MISSING", "${ghost.port}"),
-            ("ALSO_OK", "static"),
-        ]);
-        let running = running_with("db", 5432);
+    fn strict_service_environment_rejects_a_stopped_dependency() {
+        let eph = crate::parser::parse(
+            "[db]\nrun=sleep 300\nport=5432\n\n[web]\nrun=sleep 300\nenv.DATABASE_URL=postgres://localhost:${db.port}/app\n",
+        )
+        .unwrap();
 
-        let (resolved, omitted) = resolve_env_vars_for_eval(&eph, &running);
+        let error = resolve_service_env_strict(&eph.services["web"], &HashMap::new()).unwrap_err();
+
+        assert_eq!(error.unresolved[0].name, "DATABASE_URL");
         assert_eq!(
-            resolved,
-            vec![
-                ("OK".to_string(), "5432".to_string()),
-                ("ALSO_OK".to_string(), "static".to_string()),
-            ]
+            error.unresolved[0].references,
+            vec![UnresolvedReference {
+                service: "db".to_string(),
+                property: "port".to_string(),
+            }]
         );
-        assert_eq!(omitted.len(), 1);
-        assert_eq!(omitted[0].name, "MISSING");
-        assert_eq!(omitted[0].service, "ghost");
-        assert_eq!(omitted[0].property, "port");
+    }
+
+    #[test]
+    fn strict_healthcheck_resolution_preserves_shell_variables() {
+        let command = resolve_value_strict(
+            "curl http://localhost:${api.port}/health -H ${TOKEN}",
+            &running_with("api", 4100),
+            "healthcheck",
+        )
+        .unwrap();
+
+        assert_eq!(command, "curl http://localhost:4100/health -H ${TOKEN}");
     }
 
     fn port(name: Option<&str>, container_port: u16) -> PortMapping {
-        PortMapping {
+        PortMapping::Fixed {
             name: name.map(str::to_string),
-            container_port,
-            auto: false,
+            port: std::num::NonZeroU16::new(container_port).unwrap(),
         }
     }
 
     fn auto_port(name: Option<&str>) -> PortMapping {
-        PortMapping {
+        PortMapping::Auto {
             name: name.map(str::to_string),
-            container_port: 0,
-            auto: true,
         }
+    }
+
+    #[test]
+    fn running_service_has_no_primary_port_when_multiple_ports_are_named() {
+        let service = RunningService {
+            name: "web".to_string(),
+            ports: HashMap::from([("api".to_string(), 3000), ("admin".to_string(), 3001)]),
+        };
+        assert_eq!(service.port(), None);
+    }
+
+    #[test]
+    fn running_service_uses_its_only_named_port_as_primary() {
+        let service = RunningService {
+            name: "web".to_string(),
+            ports: HashMap::from([("api".to_string(), 3000)]),
+        };
+        assert_eq!(service.port(), Some(3000));
     }
 
     #[test]
@@ -3783,6 +4424,7 @@ mod tests {
 
     #[test]
     fn allocate_ports_assigns_distinct_free_ports_for_auto() {
+        let _guard = PORT_ALLOCATION_TEST_LOCK.lock().unwrap();
         let declared = vec![
             auto_port(None),
             auto_port(Some("hmr")),
@@ -3801,6 +4443,7 @@ mod tests {
 
     #[test]
     fn allocate_ports_reuses_previous_free_port() {
+        let _guard = PORT_ALLOCATION_TEST_LOCK.lock().unwrap();
         // Pick a port the OS just told us is free, then ask for an auto port with
         // that as the previous assignment: it should be reused for a stable URL.
         let free = std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -3816,6 +4459,7 @@ mod tests {
 
     #[test]
     fn allocate_ports_skips_busy_previous_port() {
+        let _guard = PORT_ALLOCATION_TEST_LOCK.lock().unwrap();
         // Hold a port so it is not bindable, then offer it as the previous
         // assignment: allocation must fall back to a different, free port.
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -3832,41 +4476,6 @@ mod tests {
         assert!(has_auto_port(&[port(None, 3000), auto_port(Some("api"))]));
         assert!(!has_auto_port(&[port(None, 3000), port(Some("api"), 4000)]));
         assert!(!has_auto_port(&[]));
-    }
-
-    #[test]
-    fn parse_command_override_splits_and_passes_through_none() {
-        // No override declared.
-        assert_eq!(parse_command_override("web", None).unwrap(), None);
-
-        // A well-formed override is split into argv, honoring quoting.
-        assert_eq!(
-            parse_command_override("web", Some(r#"sh -c "echo hi""#)).unwrap(),
-            Some(vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "echo hi".to_string()
-            ])
-        );
-
-        // An empty override parses to an empty argv (no tokens), not an error.
-        assert_eq!(
-            parse_command_override("web", Some("")).unwrap(),
-            Some(vec![])
-        );
-    }
-
-    #[test]
-    fn parse_command_override_fails_closed_on_unbalanced_quote() {
-        // Regression for #15: an unbalanced quote must error at startup, naming
-        // the service, rather than being smuggled through as one argv element.
-        let err = parse_command_override("web", Some(r#"sh -c "echo hi"#))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.starts_with("invalid command override for service 'web':"),
-            "got: {err}"
-        );
     }
 
     /// A `Workspace` with fixed ids, built without touching the filesystem, so
@@ -4306,6 +4915,119 @@ mod tests {
         assert_eq!(back.ports, entry.ports);
     }
 
+    #[test]
+    fn runtime_fingerprint_is_independent_of_hashmap_iteration_order() {
+        let first = crate::parser::parse("[web]\nrun=sleep 300\nenv.B=two\nenv.A=one\nport=4100\n")
+            .unwrap();
+        let second =
+            crate::parser::parse("[web]\nrun=sleep 300\nenv.A=one\nenv.B=two\nport=4100\n")
+                .unwrap();
+        let running = HashMap::new();
+        let first_service = &first.services["web"];
+        let second_service = &second.services["web"];
+
+        let first = runtime_fingerprint(
+            first_service,
+            RuntimeSourceSpec::Command("sleep 300"),
+            resolved_service_env(first_service, &running).unwrap(),
+        )
+        .unwrap();
+        let second = runtime_fingerprint(
+            second_service,
+            RuntimeSourceSpec::Command("sleep 300"),
+            resolved_service_env(second_service, &running).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn runtime_fingerprint_changes_with_resolved_environment_and_runtime_fields() {
+        let base = crate::parser::parse(
+            "[db]\nrun=sleep 300\nport=5000\n\n[web]\nrun=sleep 300\nenv.URL=http://${db.port}\nport=4100\n",
+        )
+        .unwrap();
+        let changed = crate::parser::parse(
+            "[db]\nrun=sleep 300\nport=5000\n\n[web]\nrun=sleep 300\nenv.URL=http://${db.port}\nport=4200\n",
+        )
+        .unwrap();
+        let running = |port| {
+            HashMap::from([(
+                "db".to_string(),
+                RunningService {
+                    name: "db".to_string(),
+                    ports: HashMap::from([("default".to_string(), port)]),
+                },
+            )])
+        };
+        let base_service = &base.services["web"];
+        let base_fingerprint = runtime_fingerprint(
+            base_service,
+            RuntimeSourceSpec::Command("sleep 300"),
+            resolved_service_env(base_service, &running(5000)).unwrap(),
+        )
+        .unwrap();
+        let dependency_changed = runtime_fingerprint(
+            base_service,
+            RuntimeSourceSpec::Command("sleep 300"),
+            resolved_service_env(base_service, &running(5001)).unwrap(),
+        )
+        .unwrap();
+        let runtime_changed = runtime_fingerprint(
+            &changed.services["web"],
+            RuntimeSourceSpec::Command("sleep 300"),
+            resolved_service_env(&changed.services["web"], &running(5000)).unwrap(),
+        )
+        .unwrap();
+
+        assert_ne!(base_fingerprint, dependency_changed);
+        assert_ne!(base_fingerprint, runtime_changed);
+    }
+
+    #[test]
+    fn runtime_fingerprint_covers_container_command_env_ports_and_volumes() {
+        let parsed = crate::parser::parse(
+            "[box]\nimage=alpine:3.21\ncommand=sleep 300\nport=8080\nenv.MARKER=one\nvolume=data:/data\n",
+        )
+        .unwrap();
+        let service = &parsed.services["box"];
+        let fingerprint = |candidate: &Service| {
+            runtime_fingerprint(
+                candidate,
+                RuntimeSourceSpec::Image {
+                    reference: "alpine:3.21",
+                    image_id: "sha256:fixed",
+                },
+                resolved_service_env(candidate, &HashMap::new()).unwrap(),
+            )
+            .unwrap()
+        };
+        let baseline = fingerprint(service);
+
+        let command = crate::parser::parse(
+            "[box]\nimage=alpine:3.21\ncommand=sleep 301\nport=8080\nenv.MARKER=one\nvolume=data:/data\n",
+        )
+        .unwrap();
+        let mut env = service.clone();
+        env.env.insert("MARKER".to_string(), "two".to_string());
+        let ports = crate::parser::parse(
+            "[box]\nimage=alpine:3.21\ncommand=sleep 300\nport=8081\nenv.MARKER=one\nvolume=data:/data\n",
+        )
+        .unwrap();
+        let mut volumes = service.clone();
+        volumes.volumes[0] = "other:/data".to_string();
+
+        for changed in [
+            &command.services["box"],
+            &env,
+            &ports.services["box"],
+            &volumes,
+        ] {
+            assert_ne!(baseline, fingerprint(changed));
+        }
+    }
+
     /// Regression: a state file written before the `Backend` enum landed (the
     /// stringly-typed `container_id` plus a top-level `processes` map) must
     /// still load, so an in-place upgrade does not orphan running services or
@@ -4341,7 +5063,7 @@ mod tests {
         assert_eq!(
             state.services["stack"].backend,
             Backend::Compose {
-                project: "eph-ab12-stack".to_string()
+                project: "eph-ab12-stack".to_string(),
             }
         );
         // The legacy `processes` map is dropped; its PID survives via the

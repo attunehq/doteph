@@ -39,8 +39,10 @@ eph down                 # stop services, keep containers + data for a fast rest
 ```
 
 - `eph up [SERVICE...]` starts all services, or just the named ones. It is
-  idempotent: a running service is reused, a stopped container is restarted, and
-  an absent one is created fresh.
+  idempotent when the effective runtime configuration is unchanged. A running
+  service is reused, a stopped container is restarted, and an absent one is
+  created. A source, port, environment, volume, health, build, or command change
+  reconciles the old backend and creates the requested configuration.
 - `eph up` blocks until each service passes its health check, so when it returns
   the services are ready (one exception below for services with no health check).
 - An unknown service name is an error.
@@ -55,20 +57,20 @@ the `.eph` file: that is the *container* port, not the published host port.
 eval "$(eph env)"                        # bash / zsh / sh
 eph env -f fish | source                 # fish
 eph env --format powershell | Out-String | Invoke-Expression   # PowerShell
-eph env -f json | jq -r .DATABASE_URL    # machine-readable, best for scripts
+env_json=$(eph env -f json) || exit $?
+printf '%s' "$env_json" | jq -r .DATABASE_URL   # machine-readable
 ```
 
 `eph env` prints only the top-level `KEY=VALUE` variables from the `.eph` file,
 with `${service.port}` style interpolations filled in from **running**
-services. A variable whose reference cannot resolve (its service is not
-running) is dropped from the output and named in a warning on stderr instead,
-so `eph env`'s stdout never contains a raw `${...}` placeholder; the command
-still exits `0`. Run `eph up` first so everything resolves. (Hooks and
-`eph run`, by contrast, leave an unresolved reference verbatim; see below.)
+services. When a reference cannot resolve, shell formats explicitly unset the
+affected variable and append a failing statement; JSON omits it. Every format
+warns on stderr and exits non-zero, so stale shell values and partial machine
+configuration cannot pass unnoticed. Run `eph up` first so everything resolves.
 
 ## Tearing down
 
-Three deliberately distinct levels, from lightest to heaviest:
+Three teardown levels, from lightest to heaviest:
 
 | Command | Effect |
 | --- | --- |
@@ -77,8 +79,9 @@ Three deliberately distinct levels, from lightest to heaviest:
 | `eph clean` | Full reset: remove containers, remove per-workspace named volumes (**deletes that data**), and delete saved state. |
 
 `compose` services are always fully torn down (`--rm` is a no-op for them);
-`clean` removes only the named volumes declared in the `.eph` file, not
-Compose-internal ones.
+`clean` removes named volumes declared by `image=` and `dockerfile=` services.
+Compose services cannot declare `.eph` volumes, and Compose-internal volumes
+remain owned by the Compose project.
 
 ## Reading the `.eph` file
 
@@ -100,12 +103,17 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 ```
 
 - A service names exactly one source: `image=`, `dockerfile=` (+ `context=`),
-  `compose=` (+ `expose.<name>=`), or `run=` (a host process via `sh -c`). A
+  `compose=` (+ `expose.<alias>=`), or `run=` (a host process via the platform
+  shell). A
   section with none, or with two, is a parse error.
 - `port=` is a *container* port published on a random host port; `${svc.port}`
   in a top-level variable resolves to the assigned host port at `eph env` time.
   `port=`/`port.<name>=` are illegal on `compose=` services (use
   `expose.<name>=` there instead).
+- Compose mappings use `expose.<alias>=<compose-service>:<container-port>` and
+  resolve as `${svc.port.<alias>}`. The short form
+  `expose.<alias>=<container-port>` targets the Compose service named by the
+  alias. Missing Compose port output fails startup.
 - For a `run=` service (a first-party app eph launches), `port=auto` /
   `port.<name>=auto` make eph allocate a free host port and inject it into the
   process; reference the service's own assigned port as `${svc.port}` in its
@@ -123,6 +131,8 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
   variable. If you generate a `.eph` file and want a variable to reach the
   container instead of the shell, use `env.KEY=` inside the section, not a
   bare `KEY=` after it.
+- Environment variable names beginning with `EPH_`, in any letter case, are
+  reserved for eph metadata and rejected in every environment scope.
 - `volume=name:/path` is a per-workspace named volume; `healthcheck` for an image
   service runs with no shell (whitespace-split, `docker exec`); the lifecycle
   hooks run on the host via `sh -c` with eph's resolved environment injected (see
@@ -171,6 +181,9 @@ role=app
   nothing else. Repeatable, and it unions with any positional service names.
   `eph up --role dep` starts just the dependency tier. `eph down --role <ROLE>`
   tears down that role and everything that depends on it.
+- In roles mode, a positional service selects only that service from its own
+  role, plus whole dependency roles for `up` or whole dependent roles for
+  `down`. Peer services in the selected service's own role are not implied.
 
 ## Prewarm dependency services at session start
 
@@ -281,7 +294,8 @@ eph run sh -c 'psql "$DATABASE_URL" < dump.sql'   # use sh -c for shell features
 The command is executed directly, not through a shell, so eph does not expand
 `$VAR` in the arguments; wrap it in `sh -c '...'` when you need shell expansion
 of eph's injected variables, piping, or globbing. `eph run` exits with the
-command's own exit code. Use it for repeatable operations (seeding, resets,
+command's native exit status and refuses to launch when any top-level reference
+is unresolved. Use it for repeatable operations (seeding, resets,
 ad-hoc queries): unlike `post-start`, it runs every time you invoke it.
 
 Every token after `run` belongs to the command, flag-shaped or not: `eph run
@@ -385,6 +399,11 @@ return, so they run as normal commands.
 - **Ports are random and change per create.** Never hardcode a host port; always
   go through `eph env`.
 - **Idempotent up.** A running service is reused and a stopped one restarted, but
+  only when its canonical runtime fingerprint still matches. Effective config
+  drift removes the old backend and recreates it; Dockerfile sources build on
+  every `up` through Docker's cache so context changes are included. Reused
+  services rerun declared health checks. Failed starts are removed before eph
+  returns, so retries cannot adopt an unhealthy leftover.
   `pre-start` and `post-start` hooks run on **every** `eph up` regardless. Write
   them to be idempotent (migrations that no-op when applied, codegen that
   overwrites in place), or move one-off work to `eph run`. A failing `pre-start`
@@ -396,6 +415,9 @@ return, so they run as normal commands.
   moment to accept connections after `eph up` returns; retry your first connect.
 - **Isolation by path**: two checkouts are different containers, volumes, and
   ports. There is no `eph init` (author `.eph` by hand).
+- **Execution fails closed on unresolved references.** Hooks, service startup,
+  health checks, and `eph run` stop before launching a child with a raw eph
+  placeholder.
 - **Output is on stdout; logs go to stderr.** `eph env` output is clean for
   `eval` and piping. Add `-v` / `--verbose` for debug logging on stderr.
 

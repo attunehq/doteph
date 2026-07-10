@@ -72,11 +72,10 @@ How it behaves:
 - **Stable across restarts.** eph reuses the previously assigned port on the
   next `eph up` when it is still free, so bookmarks and OAuth callback URLs
   keep working. It only moves when the old port is taken.
-- **Self-healing on conflict.** There is an unavoidable instant between eph
-  reserving a port and your process binding it. Because eph owns the launch,
-  it watches for an early exit that looks like a port conflict ("address
-  already in use") and relaunches on a fresh port automatically, a few times
-  before giving up.
+- **Self-healing on startup exit.** There is an unavoidable instant between
+  eph reserving a port and your process binding it. An auto-port process that
+  exits during startup is relaunched on a fresh port, up to four attempts.
+  Fixed-port and portless processes fail immediately on an early exit.
 - **Use your framework's strict-port mode.** The self-heal works only if your
   dev server *exits* on a busy port. A framework that silently picks the next
   port instead (Vite without `--strictPort`, for example) sidesteps both the
@@ -119,6 +118,8 @@ What it does, in order:
    and stderr are wired straight through, so the app is fully interactive and
    its output streams to your terminal. eph's own startup chrome goes to
    stderr, out of the app's stdout.
+   An auto-port app that exits during startup is retried on a fresh port, up
+   to four attempts, while preserving its inherited output.
 4. Runs **every** service's `post-start` hooks (migrations, seeds), the
    foregrounded app included, once everything is up, so a `post-start` hook
    may reference any service's port.

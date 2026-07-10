@@ -26,8 +26,10 @@ Logging always goes to **stderr**; command output goes to **stdout**.
 
 ## `eph up [SERVICE...]`
 
-Start services. With no arguments, starts every service in the `.eph` file;
-with names, starts only those. An unknown service name is an error.
+Start services. With no arguments, starts every service in the `.eph` file.
+Outside roles mode, names select exactly those services. In roles mode, a name
+also pulls in every service from the roles it depends on, but not peer services
+from the named service's own role. An unknown service name is an error.
 
 | Flag | Description |
 |------|-------------|
@@ -44,9 +46,11 @@ eph up --skip-hooks    # skip codegen/migrations this once
 
 Behavior:
 
-- **Idempotent.** A running service is reused, a stopped-but-present container
-  is restarted, and anything else is created fresh (pulling or building images
-  as needed). See [Core Concepts](concepts.md#the-service-lifecycle).
+- **Idempotent with reconciliation.** A matching running service is reused and
+  a matching stopped resource is restarted. Effective source, image, port,
+  resolved environment, volume, health, build, or command drift removes the old
+  backend and creates the requested one. Reused services rerun declared health
+  checks. See [Core Concepts](concepts.md#the-service-lifecycle).
 - **Hooks bracket it.** Each service's `pre-start` hooks run just before it is
   created; once every targeted service is healthy, all `post-start` hooks run
   in a second phase. Both run on **every** `eph up`, with eph's resolved
@@ -57,6 +61,10 @@ Behavior:
   With `roles_order=dep,app`, `--role app` starts both tiers and `--role dep`
   starts only `dep`. Using `--role` without a `roles_order` in the file is an
   error. See [Roles and ordering](eph-file.md#roles-and-ordering).
+- **A positional service also respects the graph.** With a `web` service in
+  `app`, `eph up web` starts `web` plus every service in the roles below
+  `app`. Other `app` services remain stopped. Use `--role app` to select the
+  whole role.
 - Prints each started service and its assigned host port.
 - `eph up`, `eph down`, and `eph clean` on the same workspace serialize
   against each other; a second command started while one is still running
@@ -71,7 +79,10 @@ Behavior:
 
 ## `eph down [--rm] [SERVICE...]`
 
-Stop services. With no arguments, stops all; with names, only those.
+Stop services. With no arguments, stops all. Outside roles mode, names stop
+exactly those services. In roles mode, a name also stops every service in
+roles that depend on its role, but not peer services from the named service's
+own role.
 
 | Flag | Description |
 |------|-------------|
@@ -100,13 +111,16 @@ Behavior:
   transitively depends on it, because a dependency cannot go away while the
   roles that need it are up. With `roles_order=dep,app`,
   `eph down --role dep` stops both `app` and `dep`. Otherwise `eph down` is
-  absolute: it stops exactly what it targets, with no ownership logic.
+  absolute outside roles mode: it stops exactly what it targets.
+- **A positional service also protects dependents.** If `db` belongs to `dep`,
+  `eph down db` stops `db` and every service in roles above `dep`. Another
+  service in `dep` remains running. Use `--role dep` to stop the whole role.
 - Two per-source exceptions: **compose** services are always torn down with
   `docker compose down`, so `--rm` makes no difference for them, and **run**
   services are always killed (there is no container to keep). A targeted
   `eph down <service>` persists the updated state immediately. A failed
-  `docker compose down` (a broken compose file, a missing `docker compose`
-  plugin) is a real error and aborts the rest of the teardown, rather than
+  `docker compose down` (for example, a missing `docker compose` plugin) is a
+  real error and aborts the rest of the teardown, rather than
   being silently swallowed.
 - **A bare `eph down` (no service names) also tears down recorded state that
   no longer matches the `.eph` file.** Teardown works from what
@@ -190,7 +204,7 @@ eph system prune --force-live --yes
 
 ```text
 System prune dry run:
-  a1b2c3d4 (missing workspace) - C:\Users\me\.codex\worktrees\1234\app
+  a1b2c3d4e5f60718 (missing workspace) - C:\Users\me\.codex\worktrees\1234\app
     containers: 2, volumes: 1, networks: 1, images: 1, run processes: 0, state dirs: 1
 
 Totals:
@@ -203,7 +217,7 @@ Totals:
 
 Remove these resources? [y/N] y
 System prune complete:
-  a1b2c3d4 (missing workspace) - C:\Users\me\.codex\worktrees\1234\app
+  a1b2c3d4e5f60718 (missing workspace) - C:\Users\me\.codex\worktrees\1234\app
     containers: 2, volumes: 1, networks: 1, images: 1, run processes: 0, state dirs: 1
 
 Totals:
@@ -317,7 +331,7 @@ eph status
 
 ```
 Workspace: /home/you/projects/myapp
-ID: a1b2c3d4
+ID: a1b2c3d4e5f60718
 
 Running services:
   postgres -> localhost:54321
@@ -346,17 +360,15 @@ for shell `eval`; see [Shell Integration](shell-integration.md).
 eval "$(eph env)"                                  # bash / zsh / sh
 eph env -f fish | source                           # fish
 eph env --format powershell | Out-String | Invoke-Expression   # PowerShell
-eph env -f json | jq -r .DATABASE_URL
+env_json="$(eph env -f json)" && jq -r .DATABASE_URL <<<"$env_json"
 ```
 
 - Only top-level variables are printed; service `env.*` values are not.
-- A variable whose value still contains an unresolved `${service.property}`
-  reference (its service is not running) is **omitted from the output**, and a
-  warning naming the variable and the reference is printed to stderr; the
-  command still exits `0`. Run `eph up` first so everything resolves. This
-  omit-and-warn behavior is specific to `eph env`: hooks, `eph run`, and a
-  service's own `env.*` values still leave an unresolved reference verbatim
-  (see [The `.eph` File](eph-file.md#interpolation)).
+- If a value still contains an unresolved `${service.property}`, shell formats
+  unset that variable and then execute a failing statement. JSON omits the
+  variable. `eph env` reports the missing reference on stderr and exits
+  nonzero in every format. This clears stale values while making the incomplete
+  environment observable to both shell evaluation and scripts.
 - All running services resolve, including `compose` services (their
   `expose.<name>` ports resolve as `${service.port.<name>}`).
 - `--format json` keys appear in the `.eph` file's declaration order.
@@ -379,10 +391,11 @@ eph run sh -c 'psql "$DATABASE_URL" < dump.sql'   # sh -c for shell features
   expand `$VAR`, globs, or pipes in the arguments. Wrap the command in
   `sh -c '...'` when you need shell features driven by eph's injected
   variables.
-- Resolution follows the same rule as lifecycle hooks, not `eph env`:
-  placeholders for stopped services stay unresolved verbatim, never omitted,
-  so run `eph up` first.
-- Exits with the command's own exit code.
+- The command is not started if any top-level variable still references a
+  stopped service. Run `eph up` first.
+- Exits with the command's native process status. Windows exit codes are not
+  narrowed to eight bits; Unix signal exits use the shell convention
+  `128 + signal`.
 - Unlike a `post-start` hook, `eph run` executes only when you invoke it. Use
   it for repeatable operations: seeding, resets, ad-hoc queries.
 - **Every token after `run` belongs to the command**, including ones shaped
@@ -455,16 +468,17 @@ eph info
 
 ```
 Workspace path: /home/you/projects/myapp
-Workspace ID: a1b2c3d4e5f6...        (full SHA-256)
-Short ID: a1b2c3d4
-Container prefix: eph-a1b2c3d4
+Workspace ID: a1b2c3d4e5f60718293a...  (full SHA-256)
+Short ID: a1b2c3d4e5f60718
+Container prefix: eph-a1b2c3d4e5f60718
 .eph file: /home/you/projects/myapp/.eph
-State directory: /home/you/.local/share/eph/a1b2c3d4
+State directory: /home/you/.local/share/eph/a1b2c3d4e5f60718
 ```
 
 Use the container prefix and short ID to find this workspace's resources with
 the `docker` CLI. The state directory's parent (the `eph` above the short ID)
-honors `EPH_STATE_ROOT`; see [Persisted state](concepts.md#persisted-state).
+honors an absolute `EPH_STATE_ROOT`; relative overrides are rejected. See
+[Persisted state](concepts.md#persisted-state).
 
 ## `eph skills install [--dir DIR] [--force]`
 

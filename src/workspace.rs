@@ -12,6 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const WORKSPACE_METADATA_FILE: &str = "workspace.json";
 const WORKSPACE_METADATA_SCHEMA: u32 = 1;
+const RESOURCE_ID_LEN: usize = 16;
+const LEGACY_RESOURCE_ID_LEN: usize = 8;
 
 /// Cross-workspace state that lets `eph system prune` decide whether a state
 /// directory still points at a real workspace.
@@ -60,7 +62,9 @@ pub struct Workspace {
     pub path: PathBuf,
     /// Unique identifier for this workspace (hex SHA-256 of [`path`](Self::path)).
     pub id: String,
-    /// First 8 hex characters of [`id`](Self::id), used for display and naming.
+    /// Hex prefix of [`id`](Self::id), used for display and resource naming.
+    /// New workspaces use 16 characters. A workspace with verified legacy state
+    /// keeps its existing 8-character namespace until `eph clean` removes it.
     pub short_id: String,
 }
 
@@ -75,8 +79,8 @@ impl Workspace {
     ///
     /// # Errors
     ///
-    /// Returns an error if `path` cannot be canonicalized, for example because
-    /// the directory does not exist or is not accessible.
+    /// Returns an error if `path` cannot be canonicalized, `EPH_STATE_ROOT` is
+    /// invalid, or legacy workspace state cannot be verified safely.
     ///
     /// # Examples
     ///
@@ -102,7 +106,7 @@ impl Workspace {
         })?;
 
         let id = compute_workspace_id(&path);
-        let short_id = id[..8].to_string();
+        let short_id = resource_id(&id)?;
 
         Ok(Workspace { path, id, short_id })
     }
@@ -253,6 +257,51 @@ fn compute_workspace_id(path: &Path) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Select a collision-resistant resource namespace without orphaning resources
+/// created by an earlier eight-character eph release.
+///
+/// Existing legacy state is reused only when its full workspace ID proves that
+/// it belongs to this path. An unreadable legacy directory is an error because
+/// silently switching namespaces could duplicate running services and strand
+/// named volumes. After `eph clean` removes the legacy state, the next command
+/// adopts the 16-character namespace.
+fn resource_id(workspace_id: &str) -> Result<String> {
+    let current = workspace_id[..RESOURCE_ID_LEN].to_string();
+    let legacy = workspace_id[..LEGACY_RESOURCE_ID_LEN].to_string();
+    let root = state_root()?;
+    let legacy_dir = root.join(&legacy);
+    if !legacy_dir.exists() {
+        return Ok(current);
+    }
+
+    let metadata_path = legacy_dir.join(WORKSPACE_METADATA_FILE);
+    let contents = std::fs::read_to_string(&metadata_path).with_context(|| {
+        format!(
+            "legacy eph state at {} cannot be verified; use the eph version that created it to run `eph clean`",
+            legacy_dir.display()
+        )
+    })?;
+    let metadata: WorkspaceMetadata = serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "legacy eph state at {} cannot be verified; use the eph version that created it to run `eph clean`",
+            legacy_dir.display()
+        )
+    })?;
+    if metadata.workspace_id != workspace_id {
+        return Ok(current);
+    }
+
+    let current_dir = root.join(&current);
+    if current_dir.exists() {
+        anyhow::bail!(
+            "workspace has state in both legacy namespace '{}' and current namespace '{}'; use the eph version that created the legacy state to run `eph clean`, then retry",
+            legacy,
+            current
+        );
+    }
+    Ok(legacy)
+}
+
 /// The root directory holding every workspace's persisted state: one
 /// `<short_id>` subdirectory per workspace, each with its `state.json` and
 /// `workspace.json`.
@@ -265,11 +314,18 @@ fn compute_workspace_id(path: &Path) -> String {
 ///
 /// # Errors
 ///
-/// Returns an error if `EPH_STATE_ROOT` is unset (or empty) and the
-/// platform's local data directory cannot be determined.
+/// Returns an error if `EPH_STATE_ROOT` is relative, or if it is unset (or
+/// empty) and the platform's local data directory cannot be determined.
 pub fn state_root() -> Result<PathBuf> {
     if let Some(root) = env_nonempty("EPH_STATE_ROOT") {
-        return Ok(PathBuf::from(root));
+        let root = PathBuf::from(root);
+        if !root.is_absolute() {
+            anyhow::bail!(
+                "EPH_STATE_ROOT must be an absolute path: {}",
+                root.display()
+            );
+        }
+        return Ok(root);
     }
     Ok(dirs::data_local_dir()
         .context("failed to determine local data directory")?
@@ -334,6 +390,20 @@ mod tests {
     }
 
     #[test]
+    fn state_root_rejects_a_relative_override() {
+        let _guard = ENV_STATE_ROOT_LOCK.lock().unwrap();
+        // SAFETY: see state_root_honors_the_eph_state_root_override.
+        unsafe {
+            std::env::set_var("EPH_STATE_ROOT", "relative/eph-state");
+        }
+        let error = state_root().expect_err("relative state root must be rejected");
+        unsafe {
+            std::env::remove_var("EPH_STATE_ROOT");
+        }
+        assert!(error.to_string().contains("must be an absolute path"));
+    }
+
+    #[test]
     fn test_workspace_id_is_deterministic() {
         let path = Path::new("/home/user/projects/myapp");
         let id1 = compute_workspace_id(path);
@@ -349,11 +419,106 @@ mod tests {
     }
 
     #[test]
+    fn new_workspace_resource_ids_use_sixteen_hex_characters() {
+        let _guard = ENV_STATE_ROOT_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        // SAFETY: serialized with every EPH_STATE_ROOT test in this module.
+        unsafe {
+            std::env::set_var("EPH_STATE_ROOT", root.path());
+        }
+        let id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let resource = resource_id(id);
+        unsafe {
+            std::env::remove_var("EPH_STATE_ROOT");
+        }
+        assert_eq!(resource.unwrap(), "abcdef0123456789");
+    }
+
+    #[test]
+    fn verified_legacy_state_keeps_its_namespace() {
+        let _guard = ENV_STATE_ROOT_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let legacy_dir = root.path().join("abcdef01");
+        std::fs::create_dir(&legacy_dir).unwrap();
+        let metadata = WorkspaceMetadata {
+            schema: WORKSPACE_METADATA_SCHEMA,
+            workspace_id: id.to_string(),
+            short_id: "abcdef01".to_string(),
+            workspace_path: PathBuf::from("/workspace"),
+            container_prefix: "eph-abcdef01".to_string(),
+            last_seen_unix_secs: 0,
+        };
+        std::fs::write(
+            legacy_dir.join(WORKSPACE_METADATA_FILE),
+            serde_json::to_string(&metadata).unwrap(),
+        )
+        .unwrap();
+        // SAFETY: serialized with every EPH_STATE_ROOT test in this module.
+        unsafe {
+            std::env::set_var("EPH_STATE_ROOT", root.path());
+        }
+        let resource = resource_id(id);
+        unsafe {
+            std::env::remove_var("EPH_STATE_ROOT");
+        }
+        assert_eq!(resource.unwrap(), "abcdef01");
+    }
+
+    #[test]
+    fn unverifiable_legacy_state_blocks_a_namespace_switch() {
+        let _guard = ENV_STATE_ROOT_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        std::fs::create_dir(root.path().join("abcdef01")).unwrap();
+        // SAFETY: serialized with every EPH_STATE_ROOT test in this module.
+        unsafe {
+            std::env::set_var("EPH_STATE_ROOT", root.path());
+        }
+        let error = resource_id(id).expect_err("unverifiable legacy state must block");
+        unsafe {
+            std::env::remove_var("EPH_STATE_ROOT");
+        }
+        assert!(error.to_string().contains("cannot be verified"));
+    }
+
+    #[test]
+    fn another_workspaces_legacy_prefix_does_not_block_the_current_namespace() {
+        let _guard = ENV_STATE_ROOT_LOCK.lock().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let id = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let legacy_dir = root.path().join("abcdef01");
+        std::fs::create_dir(&legacy_dir).unwrap();
+        let metadata = WorkspaceMetadata {
+            schema: WORKSPACE_METADATA_SCHEMA,
+            workspace_id: format!("abcdef01{}", "0".repeat(56)),
+            short_id: "abcdef01".to_string(),
+            workspace_path: PathBuf::from("/different-workspace"),
+            container_prefix: "eph-abcdef01".to_string(),
+            last_seen_unix_secs: 0,
+        };
+        std::fs::write(
+            legacy_dir.join(WORKSPACE_METADATA_FILE),
+            serde_json::to_string(&metadata).unwrap(),
+        )
+        .unwrap();
+        // SAFETY: serialized with every EPH_STATE_ROOT test in this module.
+        unsafe {
+            std::env::set_var("EPH_STATE_ROOT", root.path());
+        }
+        let resource = resource_id(id);
+        unsafe {
+            std::env::remove_var("EPH_STATE_ROOT");
+        }
+        assert_eq!(resource.unwrap(), "abcdef0123456789");
+    }
+
+    #[test]
     fn workspace_metadata_records_prune_lookup_fields() {
         let workspace = Workspace {
             path: PathBuf::from("/home/user/projects/app"),
             id: "abcdef0123456789".to_string(),
-            short_id: "abcdef01".to_string(),
+            short_id: "abcdef0123456789".to_string(),
         };
 
         let metadata = WorkspaceMetadata::for_workspace(&workspace);
@@ -362,6 +527,6 @@ mod tests {
         assert_eq!(metadata.workspace_id, workspace.id);
         assert_eq!(metadata.short_id, workspace.short_id);
         assert_eq!(metadata.workspace_path, workspace.path);
-        assert_eq!(metadata.container_prefix, "eph-abcdef01");
+        assert_eq!(metadata.container_prefix, "eph-abcdef0123456789");
     }
 }

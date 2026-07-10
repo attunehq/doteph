@@ -77,8 +77,8 @@ impl ProcessIdentity {
         }
     }
 
-    fn has_distinguishing_fields(&self) -> bool {
-        self.cwd.is_some() || self.exe.is_some() || !self.cmd.is_empty()
+    fn is_recordable(&self) -> bool {
+        self.start_time != 0 && (self.cwd.is_some() || self.exe.is_some() || !self.cmd.is_empty())
     }
 
     /// Whether `other` plausibly describes the same process, tolerating the
@@ -187,11 +187,28 @@ fn raw_identity(pid: NonZeroU32) -> Option<ProcessIdentity> {
 /// process metadata to distinguish the entry from a later PID reuse.
 ///
 /// This is the *recording* side, used when eph launches a `run=` service: an
-/// identity with no cwd, no exe, and no command line could never distinguish
-/// anything, so recording it would only manufacture false confidence, and
-/// `None` tells the caller to store no identity at all.
+/// A just-spawned process can briefly expose metadata that conflicts with every
+/// later snapshot. Persisting that transient view makes eph treat its own live
+/// service as a reused PID forever. Recording therefore requires two consecutive
+/// compatible snapshots with a real start time and at least one distinguishing
+/// field. `None` tells the caller to store no identity rather than false proof.
 pub(crate) fn identity(pid: NonZeroU32) -> Option<ProcessIdentity> {
-    raw_identity(pid).filter(ProcessIdentity::has_distinguishing_fields)
+    let mut previous: Option<ProcessIdentity> = None;
+
+    for attempt in 0..5 {
+        let current = raw_identity(pid).filter(ProcessIdentity::is_recordable);
+        if let (Some(previous), Some(current)) = (&previous, &current)
+            && current.matches(previous)
+        {
+            return Some(current.clone());
+        }
+        previous = current;
+        if attempt < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    None
 }
 
 /// Whether `pid` still names the process represented by `expected` (see
@@ -288,9 +305,9 @@ fn process_tree(system: &System, root: Pid) -> Vec<Pid> {
 /// fall back to a hard kill. Best-effort throughout: a process that has already
 /// exited is a no-op.
 ///
-/// A child spawned after the snapshot can still escape this walk, the accepted
-/// limitation of snapshot-based teardown (the Unix process-group path does not
-/// have it).
+/// Descendants are stopped before their parents. Keeping the ancestry intact
+/// until each child has been addressed prevents Windows from reparenting a live
+/// child out of the captured tree during teardown.
 fn signal_tree(pid: NonZeroU32, signal: Signal) {
     // A full snapshot is needed (not just `pid`): the parent links of every
     // process are what let us find the descendants to signal. Only the bare
@@ -301,7 +318,10 @@ fn signal_tree(pid: NonZeroU32, signal: Signal) {
     let mut system = System::new();
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
 
-    for target in process_tree(&system, Pid::from_u32(pid.get())) {
+    for target in process_tree(&system, Pid::from_u32(pid.get()))
+        .into_iter()
+        .rev()
+    {
         if let Some(process) = system.process(target)
             && process.kill_with(signal).is_none()
         {
@@ -444,6 +464,21 @@ mod tests {
             exe: Some(PathBuf::from("/bin/sleep")),
             cmd: vec!["sleep".to_string(), "30".to_string()],
         }
+    }
+
+    #[test]
+    fn recordable_identity_requires_a_start_time_and_process_metadata() {
+        let mut identity = sample_identity();
+        assert!(identity.is_recordable());
+
+        identity.start_time = 0;
+        assert!(!identity.is_recordable());
+
+        identity.start_time = 1000;
+        identity.cwd = None;
+        identity.exe = None;
+        identity.cmd.clear();
+        assert!(!identity.is_recordable());
     }
 
     #[test]
