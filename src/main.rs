@@ -840,8 +840,23 @@ async fn cmd_dev(
     // dev` behavior.
     let mut first = true;
     loop {
-        let (mut child, gate) =
-            dev_bring_up(&mut manager, &eph, &foreground, gate_port, skip_hooks).await?;
+        // Register the shutdown listener while bring-up is still running. A
+        // preview server can stop eph as soon as `status` exposes the foreground
+        // service, which is just before this loop would otherwise begin waiting
+        // for signals. Closing that window prevents SIGTERM from taking the
+        // process's default non-zero exit path after a successful startup.
+        let started = {
+            let bring_up = dev_bring_up(&mut manager, &eph, &foreground, gate_port, skip_hooks);
+            tokio::pin!(bring_up);
+            tokio::select! {
+                result = &mut bring_up => Some(result?),
+                () = wait_for_shutdown() => None,
+            }
+        };
+        let Some((mut child, gate)) = started else {
+            final_teardown(&mut manager, &eph, clean, &brought_up, skip_hooks).await?;
+            return Ok(ExitCode::SUCCESS);
+        };
 
         announce_serving(&manager, &foreground, clean, &watch, first, gate_port).await;
         first = false;

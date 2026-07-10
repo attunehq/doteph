@@ -2213,16 +2213,14 @@ impl ServiceManager {
                 command_ports: None,
             }),
             ServiceSource::Command(command) => {
-                let ports = self
+                let previous_ports = self
                     .state
                     .services
                     .get(&service.name)
                     .filter(|entry| entry.backend.process_is_alive())
-                    .map(|entry| entry.ports.clone())
-                    .map_or_else(
-                        || allocate_ports(&service.ports, self.state.auto_ports.get(&service.name)),
-                        Ok,
-                    )?;
+                    .map(|entry| &entry.ports)
+                    .or_else(|| self.state.auto_ports.get(&service.name));
+                let ports = allocate_ports(&service.ports, previous_ports)?;
                 let mut effective_running = running.clone();
                 effective_running.insert(
                     service.name.clone(),
@@ -2624,7 +2622,7 @@ impl ServiceManager {
                     .command_ports
                     .as_ref()
                     .context("run service ports were not prepared")?;
-                self.start_shell_command(name, cmd, service, eph, ports)
+                self.start_shell_command(name, cmd, service, eph, ports, running)
                     .await?
             }
             ServiceSource::Compose(path) => {
@@ -2719,16 +2717,18 @@ impl ServiceManager {
         service: &Service,
         eph: &EphFile,
         first_ports: &HashMap<String, u16>,
+        others: &HashMap<String, RunningService>,
     ) -> Result<(RunningService, Backend, RuntimeConfigFingerprint)> {
         info!("Starting shell command for {}: {}", name, cmd);
 
         // The ports this service had on a previous `up`, reused for auto ports
-        // when still free so the assigned URL is stable across restarts. Read
-        // from `auto_ports`, which survives `eph down` (unlike `services`).
-        // Snapshot the other running services once so the app's environment can
-        // interpolate their connection details (e.g. ${postgres.port}). This
-        // service's own freshly-assigned ports are layered on per attempt below.
-        let others = self.status().await?;
+        // when still free so the assigned URL is stable across restarts. The
+        // candidate comes from live state or `auto_ports`, which survives
+        // `eph down`; fixed declarations always override that candidate.
+        // The caller's resolved snapshot includes each service brought up before
+        // this one. Re-querying persisted liveness here can transiently omit a
+        // process that was started moments ago, which would make strict
+        // interpolation reject an otherwise valid dependency.
 
         // Only auto-port services are re-launchable: a fixed-port or port-less
         // command that dies did not lose a port race, so retrying would mask the

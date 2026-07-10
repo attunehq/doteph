@@ -1619,8 +1619,14 @@ async fn dependency_port_change_restarts_a_run_service_with_resolved_env() {
     ws.eph_ok(&["up"]).await;
 
     let starts = std::fs::read_to_string(ws.path().join("starts.log")).unwrap();
-    assert!(starts.contains(&format!("tcp://localhost:{first_port}")));
-    assert!(starts.contains(&format!("tcp://localhost:{second_port}")));
+    assert!(
+        starts.contains(&format!("tcp://localhost:{first_port}")),
+        "first={first_port}, second={second_port}, starts={starts:?}"
+    );
+    assert!(
+        starts.contains(&format!("tcp://localhost:{second_port}")),
+        "first={first_port}, second={second_port}, starts={starts:?}"
+    );
     assert_eq!(
         starts.lines().count(),
         2,
