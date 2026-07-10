@@ -84,6 +84,9 @@ the recorded workspace path still exists.
 - macOS: `~/Library/Application Support/eph/<short_id>/state.json`
 - Windows: `%LOCALAPPDATA%\eph\<short_id>\state.json`
 
+`EPH_STATE_ROOT` overrides the parent directory (the `eph` above `<short_id>`)
+in place of the platform default; `workspace::state_root()` checks it first.
+
 State lets `eph status` and `eph env` work without re-deriving everything,
 lets assigned ports survive terminal restarts, and records which resources
 belong to a workspace. Writes are atomic (a temp file, renamed over the real

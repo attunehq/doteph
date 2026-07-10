@@ -62,6 +62,12 @@ Behavior:
   against each other; a second command started while one is still running
   waits and prints a notice rather than racing it. See
   [Persisted state](concepts.md#persisted-state).
+- After a successful `up`, a filesystem-only scan checks whether any *other*
+  workspace's recorded path has been deleted (a removed worktree or clone),
+  and prints a one-line note on stderr pointing at
+  [`eph system prune`](#eph-system-prune---dry-run---compatibility-v042---force-live--y---yes)
+  when it finds one. It never touches Docker, never fails the `up` itself, and
+  never counts the current workspace.
 
 ## `eph down [--rm] [SERVICE...]`
 
@@ -161,9 +167,11 @@ Behavior beyond the declared services:
 ## `eph system prune [--dry-run] [--compatibility-v042] [--force-live] [-y] [--yes]`
 
 Cross-workspace prune for resources left behind after workspace directories
-are deleted (finished worktrees, removed clones). It scans the eph state root,
-reads each workspace's recorded path, and removes resources for workspaces
-whose path is gone or is now an empty directory.
+are deleted (finished worktrees, removed clones). It scans the eph state root
+(the platform default, or `EPH_STATE_ROOT` when set; see
+[Persisted state](concepts.md#persisted-state)), reads each workspace's
+recorded path, and removes resources for workspaces whose path is gone or is
+now an empty directory.
 
 | Flag | Description |
 |------|-------------|
@@ -332,20 +340,28 @@ for shell `eval`; see [Shell Integration](shell-integration.md).
 
 | Flag | Values | Default |
 |------|--------|---------|
-| `-f`, `--format` | `export`, `fish`, `json` | `export` |
+| `-f`, `--format` | `export`, `fish`, `powershell`, `json` | `export` |
 
 ```sh
-eval "$(eph env)"                # bash / zsh / sh
-eph env -f fish | source         # fish
+eval "$(eph env)"                                  # bash / zsh / sh
+eph env -f fish | source                           # fish
+eph env --format powershell | Out-String | Invoke-Expression   # PowerShell
 eph env -f json | jq -r .DATABASE_URL
 ```
 
 - Only top-level variables are printed; service `env.*` values are not.
-- Placeholders for stopped services are left unresolved. Run `eph up` first.
+- A variable whose value still contains an unresolved `${service.property}`
+  reference (its service is not running) is **omitted from the output**, and a
+  warning naming the variable and the reference is printed to stderr; the
+  command still exits `0`. Run `eph up` first so everything resolves. This
+  omit-and-warn behavior is specific to `eph env`: hooks, `eph run`, and a
+  service's own `env.*` values still leave an unresolved reference verbatim
+  (see [The `.eph` File](eph-file.md#interpolation)).
 - All running services resolve, including `compose` services (their
   `expose.<name>` ports resolve as `${service.port.<name>}`).
+- `--format json` keys appear in the `.eph` file's declaration order.
 - An unknown format is an error
-  (`unknown format: ..., use: export, fish, json`).
+  (`unknown format: ..., use: export, fish, powershell, json`).
 
 ## `eph run <CMD>...`
 
@@ -363,11 +379,18 @@ eph run sh -c 'psql "$DATABASE_URL" < dump.sql'   # sh -c for shell features
   expand `$VAR`, globs, or pipes in the arguments. Wrap the command in
   `sh -c '...'` when you need shell features driven by eph's injected
   variables.
-- Resolution works exactly like `eph env`: placeholders for stopped services
-  stay unresolved, so run `eph up` first.
+- Resolution follows the same rule as lifecycle hooks, not `eph env`:
+  placeholders for stopped services stay unresolved verbatim, never omitted,
+  so run `eph up` first.
 - Exits with the command's own exit code.
 - Unlike a `post-start` hook, `eph run` executes only when you invoke it. Use
   it for repeatable operations: seeding, resets, ad-hoc queries.
+- **Every token after `run` belongs to the command**, including ones shaped
+  like eph's own flags: `eph run -v ./script.sh`, `eph run -h`, and
+  `eph run --foo` all pass `-v`/`-h`/`--foo` straight through as the command's
+  own arguments, with no `--` separator needed. A flag placed *before* `run`
+  (`eph -v run ...`) is still eph's own: only the tokens before `run` on the
+  command line are eph's flags today (just `-v`/`--verbose`).
 
 ## `eph logs [SERVICE] [-f] [-n N]`
 
@@ -440,7 +463,8 @@ State directory: /home/you/.local/share/eph/a1b2c3d4
 ```
 
 Use the container prefix and short ID to find this workspace's resources with
-the `docker` CLI.
+the `docker` CLI. The state directory's parent (the `eph` above the short ID)
+honors `EPH_STATE_ROOT`; see [Persisted state](concepts.md#persisted-state).
 
 ## `eph skills install [--dir DIR] [--force]`
 
@@ -467,7 +491,16 @@ Commit these files so your agents discover them on checkout.
 
 - The target is the **git repository root** containing the current directory,
   so the skills land at the top of the repo regardless of where you run it. It
-  falls back to the current directory outside a git repo.
+  falls back to the current directory outside a git repo, printing a warning
+  on stderr that names the directory it installed into, since that fallback is
+  easy to trigger by accident (running from the wrong place) and easy to miss
+  otherwise.
+- A `--dir` value must be a plain relative path: an absolute path, a `..`
+  component, or a Windows drive-relative path like `C:foo` (no separator after
+  the colon) are all rejected, naming the offending directory. `C:foo` is
+  rejected alongside the others because, despite not being absolute, joining
+  it onto the repo root replaces the root outright instead of nesting inside
+  it, the same escape an absolute path or a `..` gets.
 - A file that already matches what the binary would write is reported as
   `unchanged`. One that differs is left untouched and reported as `skipped`
   unless you pass `--force`, so a local edit is never clobbered silently.
@@ -553,16 +586,19 @@ Behavior:
   after the process exits. Either way, restart any long-running `eph dev` or
   watch session to pick up the new version.
 - `EPH_REPO` and `EPH_BASE_URL` override the GitHub repository and download
-  base URL, matching the install script's environment variables (useful for a
-  mirror or an internal fork).
+  base URL, matching the install scripts' environment variables (see
+  [Getting Started](getting-started.md#install); useful for a mirror or an
+  internal fork).
 - **Passive out-of-date nag.** Every other command checks at startup whether a
   newer release exists and prints a one-line reminder on stderr when one does.
   The check reads a cached latest-release lookup (it never blocks the command)
   and refreshes that cache at most once a day in a detached background
-  process, so a failed lookup never affects the command you ran. It stays
-  silent for source builds, when stderr is not a terminal (scripts, pipes,
-  CI), and when `EPH_NO_UPDATE_CHECK` is set, so it never disturbs
-  `eval "$(eph env)"` or machine-readable output.
+  process, so a failed lookup never affects the command you ran. The cache is
+  namespaced per `EPH_REPO`, so pointing `EPH_REPO` at a fork to test a build
+  cannot poison (or borrow) the default repo's cached nag. It stays silent for
+  source builds, when stderr is not a terminal (scripts, pipes, CI), and when
+  `EPH_NO_UPDATE_CHECK` is set, so it never disturbs `eval "$(eph env)"` or
+  machine-readable output.
 
 ## Commands that do not exist (by design)
 

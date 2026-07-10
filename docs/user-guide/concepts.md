@@ -105,9 +105,13 @@ running** services:
 | `${service.port.name}` | A named port (multi-port services) |
 | `${service.host}` | Always `localhost` |
 
-If a service is not running, its placeholders are left **untouched**, so the
-unresolved reference stays visible instead of silently becoming empty. Run
-`eph up` before `eph env`.
+If a service is not running, `eph env` **omits** the affected variable
+entirely and warns on stderr instead, since its output is `eval`'d directly
+and a raw `${...}` would break the shell. The command still exits `0`. (Hooks,
+`eph run`, and a service's own `env.*` values keep the older behavior of
+leaving an unresolved reference untouched; see
+[The `.eph` File](eph-file.md#interpolation).) Run `eph up` before `eph env`
+so everything resolves.
 
 All four service types resolve once running: `eph` finds `image` and
 `dockerfile` services by container name, `run` services by their tracked
@@ -125,6 +129,11 @@ beside it:
 | Linux | `~/.local/share/eph/<short_id>/state.json` |
 | macOS | `~/Library/Application Support/eph/<short_id>/state.json` |
 | Windows | `%LOCALAPPDATA%\eph\<short_id>\state.json` |
+
+Set `EPH_STATE_ROOT` to override the parent directory (the `eph` above
+`<short_id>`) for every workspace, in place of the platform default: useful
+for relocating eph's state off the default disk, or for a test harness that
+wants a throwaway state root instead of touching your real one.
 
 State is why `eph status` and `eph env` answer instantly, why assigned ports
 survive a terminal restart, and why `eph` knows which containers and volumes
@@ -154,7 +163,11 @@ Two commands manage state directories in bulk: `eph clean` deletes the state
 directory for the current workspace along with its services and data, and
 [`eph system prune`](command-reference.md#eph-system-prune---dry-run---compatibility-v042---force-live--y---yes)
 scans **all** state directories and removes leftovers for workspaces whose
-directory has since been deleted (a worktree you removed, for example).
+directory has since been deleted (a worktree you removed, for example). A
+successful `eph up` checks for exactly that situation in other workspaces (a
+cheap filesystem scan, never Docker) and prints a one-line note on stderr
+pointing at `eph system prune` when it finds any, so stale state does not sit
+unnoticed until you happen to run prune yourself.
 
 ## The service lifecycle
 

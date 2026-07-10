@@ -27,8 +27,14 @@ pub mod skills;
 pub mod update;
 pub mod workspace;
 
-pub use env::{escape_bash, escape_fish, render, render_export, render_fish, render_json};
+pub use env::{
+    escape_bash, escape_fish, escape_powershell, render, render_export, render_fish, render_json,
+    render_powershell,
+};
 pub use parser::{EphFile, Service, ServiceSource, parse, resolve_interpolations};
 pub use prune::{ConfirmationOutcome, PruneOptions, PruneReport, confirmation_outcome, prune};
-pub use service::{Hooks, LogOptions, RunningService, ServiceManager, resolve_env_vars};
+pub use service::{
+    Hooks, LogOptions, OmittedVar, RunningService, ServiceManager, resolve_env_vars,
+    resolve_env_vars_for_eval,
+};
 pub use workspace::Workspace;

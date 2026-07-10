@@ -708,6 +708,48 @@ fn ignore_not_found<T: Default>(err: BollardError) -> std::result::Result<T, Bol
     }
 }
 
+/// Count metadata-backed workspaces under `root` whose recorded path no longer
+/// resolves to a real, non-empty directory, not counting `exclude_short_id`.
+///
+/// This is the passive nudge `eph up` prints toward `eph system prune`: a
+/// filesystem-only scan that mirrors the classification `prune` itself does
+/// (reusing [`state_dirs`], [`WorkspaceMetadata::load_from_state_dir`], and
+/// [`classify_workspace_path`]) but never touches Docker, so it is cheap
+/// enough to run on every `up`. A directory whose name is not an eph workspace
+/// short ID, that carries no metadata, or whose metadata cannot be read is
+/// skipped silently, exactly as `prune` skips it. `exclude_short_id` is the
+/// current workspace's own short ID, so `up` never nudges about itself.
+///
+/// Never errors: a stale-workspace count must never turn a successful `up`
+/// into a failure, so an unreadable state root reads as zero rather than
+/// propagating.
+pub async fn count_stale_workspaces(root: &Path, exclude_short_id: &str) -> usize {
+    let Ok(dirs) = state_dirs(root).await else {
+        return 0;
+    };
+
+    let mut count = 0;
+    for dir in dirs {
+        let Some(short_id) = dir.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if !is_workspace_short_id(&short_id) || short_id == exclude_short_id {
+            continue;
+        }
+        let Ok(metadata) = WorkspaceMetadata::load_from_state_dir(&dir).await else {
+            continue;
+        };
+        let is_stale = classify_workspace_path(&metadata.workspace_path)
+            .ok()
+            .flatten()
+            .is_some();
+        if is_stale {
+            count += 1;
+        }
+    }
+    count
+}
+
 async fn state_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     if !root.exists() {
         return Ok(Vec::new());
@@ -937,6 +979,82 @@ mod tests {
     #[test]
     fn count_running_containers_is_zero_for_an_empty_list() {
         assert_eq!(count_running_containers(&[]), 0);
+    }
+
+    /// Fabricate a workspace's on-disk metadata directly under a temp state
+    /// root, the same shape `Workspace::save_metadata` writes, so
+    /// `count_stale_workspaces` can be exercised without a real workspace or
+    /// Docker.
+    fn write_workspace_metadata(root: &Path, short_id: &str, workspace_path: &str) {
+        let dir = root.join(short_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let metadata = WorkspaceMetadata {
+            schema: 1,
+            workspace_id: short_id.to_string(),
+            short_id: short_id.to_string(),
+            workspace_path: PathBuf::from(workspace_path),
+            container_prefix: format!("eph-{short_id}"),
+            last_seen_unix_secs: 0,
+        };
+        std::fs::write(
+            dir.join(WORKSPACE_METADATA_FILE),
+            serde_json::to_string_pretty(&metadata).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn count_stale_workspaces_counts_gone_paths_excluding_the_current_one() {
+        let root = tempfile::tempdir().unwrap();
+
+        // Stale: recorded path no longer exists.
+        write_workspace_metadata(root.path(), "aaaaaaaa", "/does/not/exist-eph-test-aaaaaaaa");
+        // Live: recorded path is a real, non-empty directory.
+        let live = tempfile::tempdir().unwrap();
+        std::fs::write(live.path().join(".eph"), "[db]\nimage=postgres:16\n").unwrap();
+        write_workspace_metadata(
+            root.path(),
+            "bbbbbbbb",
+            live.path().to_str().expect("temp path should be UTF-8"),
+        );
+        // Also stale by path, but this is the "current" workspace: excluded.
+        write_workspace_metadata(root.path(), "cccccccc", "/also/gone-eph-test-cccccccc");
+
+        assert_eq!(
+            count_stale_workspaces(root.path(), "cccccccc").await,
+            1,
+            "only the non-excluded stale workspace should be counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_stale_workspaces_is_zero_when_nothing_is_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let live = tempfile::tempdir().unwrap();
+        std::fs::write(live.path().join(".eph"), "[db]\nimage=postgres:16\n").unwrap();
+        write_workspace_metadata(
+            root.path(),
+            "dddddddd",
+            live.path().to_str().expect("temp path should be UTF-8"),
+        );
+
+        assert_eq!(count_stale_workspaces(root.path(), "").await, 0);
+    }
+
+    #[tokio::test]
+    async fn count_stale_workspaces_skips_non_short_id_and_metadata_less_dirs_silently() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("not-a-short-id")).unwrap();
+        std::fs::create_dir_all(root.path().join("eeeeeeee")).unwrap(); // no workspace.json
+
+        assert_eq!(count_stale_workspaces(root.path(), "").await, 0);
+    }
+
+    #[tokio::test]
+    async fn count_stale_workspaces_is_zero_for_a_missing_root() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("does-not-exist");
+        assert_eq!(count_stale_workspaces(&missing, "").await, 0);
     }
 
     fn process_entry(

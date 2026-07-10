@@ -253,10 +253,36 @@ fn compute_workspace_id(path: &Path) -> String {
     hex::encode(hasher.finalize())
 }
 
-pub(crate) fn state_root() -> Result<PathBuf> {
+/// The root directory holding every workspace's persisted state: one
+/// `<short_id>` subdirectory per workspace, each with its `state.json` and
+/// `workspace.json`.
+///
+/// Honors `EPH_STATE_ROOT` as an absolute-path override, checked first; unset
+/// or empty, this is `<local data dir>/eph`. The override is what lets an
+/// integration test point a whole `eph` invocation at a throwaway directory
+/// instead of the real per-user data directory, and lets a user relocate
+/// eph's state entirely (a non-default disk, a synced folder, and so on).
+///
+/// # Errors
+///
+/// Returns an error if `EPH_STATE_ROOT` is unset (or empty) and the
+/// platform's local data directory cannot be determined.
+pub fn state_root() -> Result<PathBuf> {
+    if let Some(root) = env_nonempty("EPH_STATE_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
     Ok(dirs::data_local_dir()
         .context("failed to determine local data directory")?
         .join("eph"))
+}
+
+/// Read an environment variable, treating unset or all-whitespace as absent so
+/// an empty override never shadows the default.
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn current_unix_secs() -> u64 {
@@ -268,6 +294,44 @@ fn current_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the `EPH_STATE_ROOT` tests below: `std::env::set_var` mutates
+    /// process-wide state, and `cargo test` runs tests concurrently, so two of
+    /// these could otherwise race each other's view of the environment.
+    static ENV_STATE_ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn state_root_honors_the_eph_state_root_override() {
+        let _guard = ENV_STATE_ROOT_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by ENV_STATE_ROOT_LOCK against the other test in
+        // this module that touches EPH_STATE_ROOT; no other test reads it.
+        unsafe {
+            std::env::set_var("EPH_STATE_ROOT", dir.path());
+        }
+        let root = state_root();
+        unsafe {
+            std::env::remove_var("EPH_STATE_ROOT");
+        }
+        assert_eq!(root.unwrap(), dir.path());
+    }
+
+    #[test]
+    fn state_root_ignores_an_empty_override() {
+        let _guard = ENV_STATE_ROOT_LOCK.lock().unwrap();
+        // SAFETY: see state_root_honors_the_eph_state_root_override.
+        unsafe {
+            std::env::set_var("EPH_STATE_ROOT", "   ");
+        }
+        let root = state_root();
+        unsafe {
+            std::env::remove_var("EPH_STATE_ROOT");
+        }
+        // An all-whitespace override must fall back to the real default rather
+        // than resolving to a bogus path built from blank text.
+        assert!(root.is_ok());
+        assert_ne!(root.unwrap(), PathBuf::from("   "));
+    }
 
     #[test]
     fn test_workspace_id_is_deterministic() {

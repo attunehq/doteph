@@ -149,7 +149,7 @@ enum Commands {
     /// Print environment variables for shell eval
     /// Usage: eval "$(eph env)"
     Env {
-        /// Output format: export (default), fish, json
+        /// Output format: export (default), fish, powershell, json
         #[arg(short, long, default_value = "export")]
         format: String,
     },
@@ -161,6 +161,17 @@ enum Commands {
     /// `eph run psql "$DATABASE_URL"` or `eph run ./scripts/seed.sh` without
     /// `eval`-ing anything first. The command is executed directly, not through
     /// a shell; use `eph run sh -c '...'` if you need shell features.
+    ///
+    /// Every token after `run` belongs to the command, including ones that look
+    /// like eph's own flags: `eph run -v ./script.sh`, `eph run -h`, and
+    /// `eph run --foo` all pass `-v`/`-h`/`--foo` straight through as the
+    /// command's own argument, with no `--` separator needed. A flag placed
+    /// *before* `run` (`eph -v run ...`) is still eph's own: `main` splits the
+    /// two apart before clap ever sees the command's tokens (see
+    /// `split_run_argv`), since clap's `global = true` verbose flag, and its
+    /// auto `-h`/`--help`/`-V`/`--version`, would otherwise be recognized
+    /// anywhere on the line and steal them from the command.
+    #[command(disable_help_flag = true, disable_version_flag = true)]
     Run {
         /// The command and its arguments.
         #[arg(
@@ -287,23 +298,26 @@ enum SkillsCommand {
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
-    let cli = Cli::parse();
+    // `eph run`'s own argv must never be intercepted by eph's global `-v`, nor
+    // its auto `-h`/`--help`/`-V`/`--version`: split it out of clap's view
+    // entirely before parsing, rather than trying to fight clap's `global =
+    // true` propagation after the fact. Falls through to ordinary clap parsing
+    // when the invocation is not `run` at all (including `eph help run`) or
+    // `run` was given no command (clap's own "required argument" error is
+    // clearer than anything hand-rolled here).
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some((global_args, command_args)) = split_run_argv(&argv[1..])
+        && !command_args.is_empty()
+    {
+        init_tracing(global_args.iter().any(|a| a == "-v" || a == "--verbose"));
+        // `eph run` is never the updater or its internal worker, so the nag
+        // always applies here; see `maybe_nag_about_update`.
+        eph::update::warn_if_outdated(env!("EPH_VERSION"));
+        return cmd_run(command_args.to_vec()).await;
+    }
 
-    // Initialize logging
-    let filter = if cli.verbose {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::new("info")
-    };
-    // Log to stderr, never stdout. stdout carries the command's real output
-    // (e.g. `eph env` emits shell/JSON meant for `eval "$(eph env)"` or piping
-    // into a parser); mixing log lines into it corrupts that machine-readable
-    // output.
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
+    let cli = Cli::parse();
+    init_tracing(cli.verbose);
 
     // Passively nudge a user on an old release to upgrade, before running the
     // command they asked for. This reads a small on-disk cache and refreshes it
@@ -380,6 +394,50 @@ async fn main() -> Result<ExitCode> {
     }
 }
 
+/// Initialize the tracing subscriber eph logs through.
+///
+/// Log to stderr, never stdout: stdout carries the command's real output (e.g.
+/// `eph env` emits shell/JSON meant for `eval "$(eph env)"` or piping into a
+/// parser); mixing log lines into it corrupts that machine-readable output.
+fn init_tracing(verbose: bool) {
+    let filter = if verbose {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::new("info")
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+/// Split `eph`'s raw argv (everything after the program name) into
+/// (`global_args`, `run_command`) when the invocation is `eph [-v] run
+/// <cmd...>`, so every token from `run`'s first argument onward can be handed
+/// to the child process verbatim.
+///
+/// clap's `global = true` verbose flag (and its auto `-h`/`--help` and
+/// `-V`/`--version`) are otherwise recognized anywhere on the command line
+/// (that is what `global = true` means, and clap has no per-subcommand
+/// opt-out for it), so without this split `eph run -v echo hi` would silently steal
+/// `-v` as eph's own verbosity flag rather than passing it to `echo`. Only the
+/// tokens *before* `run` are still eph's own flags (today, only
+/// `-v`/`--verbose`), so `eph -v run ...` keeps enabling verbose logging.
+///
+/// Returns `None` when `run` is not the subcommand being invoked at all: no
+/// `run` token is present, or a non-flag token precedes it (meaning `run`, if
+/// present, is an argument to something else, not eph's own subcommand). This
+/// also correctly falls through for `eph help run`, whose first token is
+/// `help`, so clap's generated help still works.
+fn split_run_argv(args: &[String]) -> Option<(&[String], &[String])> {
+    let idx = args.iter().position(|a| a == "run")?;
+    if args[..idx].iter().any(|a| a != "-v" && a != "--verbose") {
+        return None;
+    }
+    Some((&args[..idx], &args[idx + 1..]))
+}
+
 /// Which direction a `--role` selection resolves in: `Up` pulls in each role's
 /// dependencies, `Down` pulls in each role's dependents. See
 /// [`resolve_service_selection`].
@@ -426,6 +484,7 @@ fn resolve_service_selection(
 
 async fn cmd_up(services: Vec<String>, roles: Vec<String>, skip_hooks: bool) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
+    let short_id = workspace.short_id.clone();
     let eph = load_eph_file(&workspace)?;
 
     let service_filter = resolve_service_selection(&eph, services, &roles, Direction::Up)?;
@@ -450,7 +509,31 @@ async fn cmd_up(services: Vec<String>, roles: Vec<String>, skip_hooks: bool) -> 
     println!();
     println!("Run `eval \"$(eph env)\"` to set environment variables");
 
+    print_stale_workspace_nudge(&short_id).await;
+
     Ok(())
+}
+
+/// Print a one-line note to stderr when `eph up` notices other workspaces'
+/// state pointing at deleted checkouts, nudging toward `eph system prune`.
+///
+/// A pure filesystem scan (see [`eph::prune::count_stale_workspaces`]), so it
+/// is cheap enough to run after every `up`; any error resolving the state root
+/// is swallowed rather than surfaced, since this decorates a command that
+/// already succeeded and must never turn that success into a failure.
+async fn print_stale_workspace_nudge(current_short_id: &str) {
+    let Ok(root) = eph::workspace::state_root() else {
+        return;
+    };
+    let count = eph::prune::count_stale_workspaces(&root, current_short_id).await;
+    if count == 0 {
+        return;
+    }
+    let plural = if count == 1 { "" } else { "s" };
+    eprintln!(
+        "note: {count} stale eph workspace{plural} from deleted checkouts; \
+         run 'eph system prune' to review them."
+    );
 }
 
 async fn cmd_down(
@@ -1218,6 +1301,15 @@ fn print_service_ports(name: &str, svc: &RunningService) {
     }
 }
 
+/// `eph env`: print the resolved top-level variables for `eval`.
+///
+/// Unlike lifecycle hooks and `eph run` (which use [`eph::resolve_env_vars`]
+/// and leave an unresolved `${service.property}` reference verbatim), this
+/// command's output is handed straight to a shell's `eval`. A literal
+/// `${...}` there would be a syntax the shell cannot evaluate meaningfully, so
+/// a variable that still has one is dropped from stdout entirely and named in
+/// a warning on stderr instead; the command still exits 0; see
+/// [`eph::resolve_env_vars_for_eval`].
 async fn cmd_env(format: &str) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
@@ -1225,9 +1317,19 @@ async fn cmd_env(format: &str) -> Result<()> {
     let manager = ServiceManager::new(workspace).await?;
     let running = manager.status().await?;
 
-    // The resolved KEY=VALUE pairs, shared with the lifecycle-hook and `eph run`
-    // machinery so a developer's shell and a post-start hook see the same env.
-    let env_vars = eph::resolve_env_vars(&eph, &running);
+    let (env_vars, omitted) = eph::resolve_env_vars_for_eval(&eph, &running);
+
+    for var in &omitted {
+        let not_running = if running.contains_key(&var.service) {
+            String::new()
+        } else {
+            format!(" while {} is not running", var.service)
+        };
+        eprintln!(
+            "warning: omitted {}: ${{{}.{}}} is not resolvable{not_running}",
+            var.name, var.service, var.property
+        );
+    }
 
     // Render in the requested format
     print!("{}", eph::render(&env_vars, format)?);
@@ -1492,9 +1594,23 @@ fn cmd_skills_list() -> Result<()> {
 /// The repository root to install skills into: the git toplevel containing the
 /// current directory, or the current directory itself when it is not inside a
 /// repo, so first-time setup still works.
+///
+/// The fallback prints a warning naming the directory it installs into: a user
+/// who ran `eph skills install` from the wrong place (outside the repo they
+/// meant to target) would otherwise get no signal that eph silently picked the
+/// current directory instead of failing.
 fn skills_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("determining the current directory")?;
-    Ok(git_repo_root(&cwd).unwrap_or(cwd))
+    match git_repo_root(&cwd) {
+        Some(root) => Ok(root),
+        None => {
+            eprintln!(
+                "warning: not inside a git repository; installing skills into {}",
+                cwd.display()
+            );
+            Ok(cwd)
+        }
+    }
 }
 
 /// The git toplevel containing `cwd`, or `None` when `cwd` is not inside a git
@@ -1647,6 +1763,51 @@ mod tests {
 
     fn parse_eph(input: &str) -> EphFile {
         parser::parse(input).expect("test .eph should parse")
+    }
+
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn split_run_argv_hands_every_token_after_run_to_the_command() {
+        let argv = args(&["run", "-v", "-h", "-V", "--foo", "cmd"]);
+        let (global, command) = split_run_argv(&argv).expect("run should split");
+        assert!(global.is_empty());
+        assert_eq!(command, &args(&["-v", "-h", "-V", "--foo", "cmd"])[..]);
+    }
+
+    #[test]
+    fn split_run_argv_keeps_a_leading_verbose_flag_as_ephs_own() {
+        let argv = args(&["-v", "run", "cmd", "-x"]);
+        let (global, command) = split_run_argv(&argv).expect("run should split");
+        assert_eq!(global, &args(&["-v"])[..]);
+        assert_eq!(command, &args(&["cmd", "-x"])[..]);
+
+        let argv = args(&["--verbose", "run", "cmd"]);
+        let (global, command) = split_run_argv(&argv).expect("run should split");
+        assert_eq!(global, &args(&["--verbose"])[..]);
+        assert_eq!(command, &args(&["cmd"])[..]);
+    }
+
+    #[test]
+    fn split_run_argv_is_none_when_run_is_not_the_subcommand() {
+        // "help" precedes "run": this is `eph help run`, not `eph run`.
+        assert!(split_run_argv(&args(&["help", "run"])).is_none());
+        // A flag other than -v/--verbose precedes "run": not eph's own subcommand.
+        assert!(split_run_argv(&args(&["--foo", "run", "cmd"])).is_none());
+        // No "run" token at all.
+        assert!(split_run_argv(&args(&["up", "web"])).is_none());
+    }
+
+    #[test]
+    fn split_run_argv_finds_the_first_run_token_even_if_the_command_repeats_it() {
+        // The user's own command happens to contain the literal word "run"
+        // again; only the first occurrence is eph's subcommand marker.
+        let argv = args(&["run", "make", "run"]);
+        let (global, command) = split_run_argv(&argv).expect("run should split");
+        assert!(global.is_empty());
+        assert_eq!(command, &args(&["make", "run"])[..]);
     }
 
     #[test]

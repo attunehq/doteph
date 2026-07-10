@@ -281,6 +281,8 @@ builtins). Two ways to handle it:
 Under WSL, `eph` is a Linux process, so its state directory is the **Linux**
 path (`~/.local/share/eph/<short_id>/`), not the Windows `%LOCALAPPDATA%`
 path. The `%LOCALAPPDATA%` location applies only to a native Windows build.
+(`EPH_STATE_ROOT` overrides either default; see
+[Core Concepts](concepts.md#persisted-state).)
 
 ### Relative bind mounts on Windows
 
