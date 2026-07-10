@@ -6,7 +6,7 @@ use crate::parser::{
 };
 use crate::proc;
 use crate::workspace::Workspace;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use bollard::Docker;
 use bollard::models::{ContainerCreateBody, ContainerSummaryStateEnum, HostConfig, PortBinding};
 use bollard::query_parameters::{
@@ -111,13 +111,21 @@ impl RunningService {
         "localhost"
     }
 
-    /// Get the primary port (first port or named "default")
+    /// Get the unambiguous primary port.
+    ///
+    /// An explicitly unnamed port is `default`; a single named port is also
+    /// unambiguous. Multiple named ports have no primary port, independent of
+    /// `HashMap` iteration order.
     #[must_use]
     pub fn port(&self) -> Option<u16> {
-        self.ports
-            .get("default")
-            .copied()
-            .or_else(|| self.ports.values().next().copied())
+        if let Some(port) = self.ports.get("default") {
+            return Some(*port);
+        }
+        if self.ports.len() == 1 {
+            self.ports.values().next().copied()
+        } else {
+            None
+        }
     }
 
     /// Get a named port
@@ -611,12 +619,12 @@ pub(crate) struct ContainerInfo {
 fn map_named_ports(declared: &[PortMapping], raw: &HashMap<String, u16>) -> HashMap<String, u16> {
     let mut named = HashMap::new();
     for port_mapping in declared {
-        let key = port_mapping.container_port.to_string();
+        let Some(container_port) = port_mapping.container_port() else {
+            continue;
+        };
+        let key = container_port.to_string();
         if let Some(&host_port) = raw.get(&key) {
-            let name = port_mapping
-                .name
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
+            let name = port_mapping.runtime_name().to_string();
             named.insert(name, host_port);
         }
     }
@@ -678,14 +686,14 @@ fn allocate_ports(
     let mut assigned: HashMap<String, u16> = HashMap::new();
 
     for mapping in declared {
-        let name = mapping
-            .name
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
+        let name = mapping.runtime_name().to_string();
 
-        if !mapping.auto {
-            assigned.insert(name, mapping.container_port);
+        if let PortMapping::Fixed { port, .. } = mapping {
+            assigned.insert(name, port.get());
             continue;
+        }
+        if matches!(mapping, PortMapping::Compose { .. }) {
+            bail!("compose port mappings cannot be allocated for a run= service");
         }
 
         // Prefer the port this mapping had last time, if it is still bindable and
@@ -727,7 +735,7 @@ fn allocate_ports(
 /// Whether `declared` contains at least one auto-allocated port, i.e. the
 /// service is a managed app whose process eph may re-launch on a fresh port.
 fn has_auto_port(declared: &[PortMapping]) -> bool {
-    declared.iter().any(|p| p.auto)
+    declared.iter().any(PortMapping::is_auto)
 }
 
 fn process_backend(name: &str, pid: NonZeroU32) -> Backend {
@@ -739,27 +747,6 @@ fn process_backend(name: &str, pid: NonZeroU32) -> Backend {
         );
     }
     Backend::Process { pid, identity }
-}
-
-/// Split a `command=` override into an argv vector, or `None` when the service
-/// declares no override.
-///
-/// `command=` is freeform user input from the `.eph` file, so a malformed value
-/// (most commonly an unbalanced quote) is a parse error, surfaced here at
-/// startup with a message naming the service. The previous behavior fell back
-/// to passing the entire unparsed string as a single argument, which made the
-/// container fail later with a confusing error far from the real cause; failing
-/// closed matches the repo's parse-don't-validate posture.
-fn parse_command_override(
-    name: &str,
-    command_override: Option<&str>,
-) -> Result<Option<Vec<String>>> {
-    command_override
-        .map(|c| {
-            shell_words::split(c)
-                .map_err(|e| anyhow!("invalid command override for service '{}': {}", name, e))
-        })
-        .transpose()
 }
 
 /// The byte length of a leading Windows drive prefix in `spec`, or `None` when
@@ -1518,9 +1505,8 @@ impl DockerClient {
 
     /// Pull an image and run it as a container.
     ///
-    /// `cmd` is the already-parsed `command=` override (see
-    /// [`parse_command_override`]), validated by the caller before any
-    /// container reuse so a malformed value fails closed on every start path.
+    /// `cmd` is the already-parsed `command=` override produced by the `.eph`
+    /// parser, so container startup never reparses weak command text.
     ///
     /// Returns the [`RunningService`] connection info plus the created
     /// container's id, which the caller needs to probe health and to record the
@@ -1542,7 +1528,10 @@ impl DockerClient {
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
 
         for port_mapping in &service.ports {
-            let container_port = format!("{}/tcp", port_mapping.container_port);
+            let Some(container_port) = port_mapping.container_port() else {
+                bail!("image service '{}' contains an auto port", service.name);
+            };
+            let container_port = format!("{container_port}/tcp");
             exposed_ports.push(container_port.clone());
             // Empty host port = random assignment
             port_bindings.insert(
@@ -2035,12 +2024,10 @@ impl ServiceManager {
     ) -> Result<RunningService> {
         let container_name = self.workspace.container_name(name);
 
-        // Validate (and parse) the command override up front, before any
-        // existing-container reuse/restart fast path below. Otherwise an edited
-        // `.eph` with a malformed `command=` could still "succeed" by reusing a
-        // stale container, defeating the fail-closed intent. Only image and
-        // dockerfile services use it; for the rest this is `None`.
-        let command = parse_command_override(name, service.command_override.as_deref())?;
+        let command = service
+            .command_override
+            .as_ref()
+            .map(|command| command.argv().to_vec());
 
         // Dedup run= (shell command) services: the Docker-based guard below
         // explicitly skips ServiceSource::Command, so without this check running
@@ -2192,14 +2179,13 @@ impl ServiceManager {
             return Ok(());
         };
 
-        let timeout_dur = Duration::from_secs(service.ready_timeout_secs.unwrap_or(30));
+        let timeout_dur = Duration::from_secs(
+            healthcheck
+                .timeout_secs
+                .map_or(30, std::num::NonZeroU64::get),
+        );
         wait_until_ready(name, timeout_dur, Duration::from_secs(1), async || {
-            // Parse healthcheck command. An empty command is treated as ready
-            // immediately (nothing to probe).
-            let parts: Vec<&str> = healthcheck.split_whitespace().collect();
-            if parts.is_empty() {
-                return Ok(Some(()));
-            }
+            let parts: Vec<&str> = healthcheck.command.split_whitespace().collect();
 
             let exit_code = self.docker.exec_in_container(container_id, &parts).await?;
             if exit_code == 0 {
@@ -2286,8 +2272,13 @@ impl ServiceManager {
             // (it also receives the env below, so `$PORT` works too).
             let healthcheck = service
                 .healthcheck
-                .as_deref()
-                .map(|hc| resolve_against(hc, &running));
+                .as_ref()
+                .map(|hc| resolve_against(&hc.command, &running));
+            let ready_timeout_secs = service
+                .healthcheck
+                .as_ref()
+                .and_then(|hc| hc.timeout_secs)
+                .map(std::num::NonZeroU64::get);
 
             let (mut child, pid) = self.spawn_command(name, cmd, &env, false)?;
             let backend = process_backend(name, pid);
@@ -2310,7 +2301,7 @@ impl ServiceManager {
                 .await_command_ready(
                     name,
                     healthcheck.as_deref(),
-                    service.ready_timeout_secs,
+                    ready_timeout_secs,
                     &env,
                     &mut child,
                     has_auto,
@@ -2600,10 +2591,14 @@ impl ServiceManager {
         // Get port mappings from compose
         let mut ports = HashMap::new();
         for port_mapping in &service.ports {
-            let port_name = port_mapping
-                .name
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
+            let PortMapping::Compose {
+                alias,
+                service: compose_service,
+                port: container_port,
+            } = port_mapping
+            else {
+                bail!("compose service '{}' contains a non-Compose port", name);
+            };
 
             // Try to get the actual mapped port from docker compose. Same
             // environment as the `up` call, so a compose file whose structure
@@ -2616,44 +2611,57 @@ impl ServiceManager {
                     "-p",
                     &project_name,
                     "port",
-                    &port_name,
-                    &port_mapping.container_port.to_string(),
+                    compose_service,
+                    &container_port.to_string(),
                 ])
                 .envs(compose_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .output()
-                .await;
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to query Compose port '{}:{}' for service '{}'",
+                        compose_service, container_port, name
+                    )
+                })?;
 
-            if let Ok(output) = port_output
-                && output.status.success()
-            {
-                let port_str = String::from_utf8_lossy(&output.stdout);
-                // Output is like "0.0.0.0:12345" or ":::12345"
-                if let Some(port) = port_str.trim().rsplit(':').next()
-                    && let Ok(p) = port.parse::<u16>()
-                {
-                    ports.insert(port_name.clone(), p);
-                    continue;
-                }
+            if !port_output.status.success() {
+                let stderr = String::from_utf8_lossy(&port_output.stderr);
+                bail!(
+                    "could not resolve Compose port '{}:{}' for service '{}': {}",
+                    compose_service,
+                    container_port,
+                    name,
+                    stderr.trim()
+                );
             }
 
-            // `docker compose port` failed or did not parse. Fall back to the
-            // declared container port, but say so: compose normally maps to a
-            // random host port, so this fallback value is usually wrong and a
-            // connection string interpolating it will not reach the service.
-            warn!(
-                "could not resolve the host port for '{}' port '{}' via `docker \
-                 compose port`; using the declared container port {} (this is \
-                 probably not the mapped host port)",
-                name, port_name, port_mapping.container_port
-            );
-            ports.insert(port_name, port_mapping.container_port);
+            let port_text = String::from_utf8_lossy(&port_output.stdout);
+            let host_port = port_text
+                .trim()
+                .rsplit(':')
+                .next()
+                .and_then(|port| port.parse::<u16>().ok())
+                .filter(|port| *port != 0)
+                .with_context(|| {
+                    format!(
+                        "docker compose returned an invalid host port for '{}:{}': {}",
+                        compose_service,
+                        container_port,
+                        port_text.trim()
+                    )
+                })?;
+            ports.insert(alias.clone(), host_port);
         }
 
         // Wait for health check if specified
         if let Some(ref healthcheck) = service.healthcheck {
-            let timeout_dur = Duration::from_secs(service.ready_timeout_secs.unwrap_or(60));
+            let timeout_dur = Duration::from_secs(
+                healthcheck
+                    .timeout_secs
+                    .map_or(60, std::num::NonZeroU64::get),
+            );
             wait_until_ready(name, timeout_dur, Duration::from_secs(2), async || {
-                let output = proc::shell_command(healthcheck)
+                let output = proc::shell_command(&healthcheck.command)
                     .current_dir(&self.workspace.path)
                     .output()
                     .await?;
@@ -3168,8 +3176,13 @@ impl ServiceManager {
         let env = self.app_env(eph, &running, service);
         let healthcheck = service
             .healthcheck
-            .as_deref()
-            .map(|hc| resolve_against(hc, &running));
+            .as_ref()
+            .map(|hc| resolve_against(&hc.command, &running));
+        let ready_timeout_secs = service
+            .healthcheck
+            .as_ref()
+            .and_then(|hc| hc.timeout_secs)
+            .map(std::num::NonZeroU64::get);
 
         let (mut child, pid) = self.spawn_command(name, cmd, &env, true)?;
         let backend = process_backend(name, pid);
@@ -3198,7 +3211,7 @@ impl ServiceManager {
             .await_command_ready(
                 name,
                 healthcheck.as_deref(),
-                service.ready_timeout_secs,
+                ready_timeout_secs,
                 &env,
                 &mut child,
                 false,
@@ -3819,19 +3832,34 @@ mod tests {
     }
 
     fn port(name: Option<&str>, container_port: u16) -> PortMapping {
-        PortMapping {
+        PortMapping::Fixed {
             name: name.map(str::to_string),
-            container_port,
-            auto: false,
+            port: std::num::NonZeroU16::new(container_port).unwrap(),
         }
     }
 
     fn auto_port(name: Option<&str>) -> PortMapping {
-        PortMapping {
+        PortMapping::Auto {
             name: name.map(str::to_string),
-            container_port: 0,
-            auto: true,
         }
+    }
+
+    #[test]
+    fn running_service_has_no_primary_port_when_multiple_ports_are_named() {
+        let service = RunningService {
+            name: "web".to_string(),
+            ports: HashMap::from([("api".to_string(), 3000), ("admin".to_string(), 3001)]),
+        };
+        assert_eq!(service.port(), None);
+    }
+
+    #[test]
+    fn running_service_uses_its_only_named_port_as_primary() {
+        let service = RunningService {
+            name: "web".to_string(),
+            ports: HashMap::from([("api".to_string(), 3000)]),
+        };
+        assert_eq!(service.port(), Some(3000));
     }
 
     #[test]
@@ -3893,41 +3921,6 @@ mod tests {
         assert!(has_auto_port(&[port(None, 3000), auto_port(Some("api"))]));
         assert!(!has_auto_port(&[port(None, 3000), port(Some("api"), 4000)]));
         assert!(!has_auto_port(&[]));
-    }
-
-    #[test]
-    fn parse_command_override_splits_and_passes_through_none() {
-        // No override declared.
-        assert_eq!(parse_command_override("web", None).unwrap(), None);
-
-        // A well-formed override is split into argv, honoring quoting.
-        assert_eq!(
-            parse_command_override("web", Some(r#"sh -c "echo hi""#)).unwrap(),
-            Some(vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "echo hi".to_string()
-            ])
-        );
-
-        // An empty override parses to an empty argv (no tokens), not an error.
-        assert_eq!(
-            parse_command_override("web", Some("")).unwrap(),
-            Some(vec![])
-        );
-    }
-
-    #[test]
-    fn parse_command_override_fails_closed_on_unbalanced_quote() {
-        // Regression for #15: an unbalanced quote must error at startup, naming
-        // the service, rather than being smuggled through as one argv element.
-        let err = parse_command_override("web", Some(r#"sh -c "echo hi"#))
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.starts_with("invalid command override for service 'web':"),
-            "got: {err}"
-        );
     }
 
     /// A `Workspace` with fixed ids, built without touching the filesystem, so

@@ -35,8 +35,9 @@
 
 use anyhow::{Context as _, Result, bail};
 use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
+use std::num::{NonZeroU16, NonZeroU64};
 
 // ============================================================================
 // AST Types
@@ -46,7 +47,7 @@ use std::collections::HashMap;
 ///
 /// Produced by [`parse`]. Holds the top-level [`EnvVar`]s and the named
 /// [`Service`] definitions extracted from the file.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct EphFile {
     /// Top-level environment variables, in declaration order. Declared above
     /// the first section or inside `[env]` sections; both spellings land here.
@@ -76,7 +77,7 @@ pub struct EphFile {
 /// desugar to this adjacency list. "Depends on" means "must come up first": an
 /// edge `app -> dep` orders `dep` before `app` and pulls `dep` in whenever `app`
 /// is requested.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct RolesOrder {
     /// Each role mapped to the roles it depends on. Keys are every role in the
     /// graph (roots included, with an empty dependency list), kept in declaration
@@ -277,7 +278,7 @@ impl EphFile {
 /// The [`value`](Self::value) is stored verbatim, including any
 /// `${service.property}` interpolation placeholders; those are only resolved
 /// later by [`resolve_interpolations`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EnvVar {
     /// Variable name (the part before `=`).
     pub name: String,
@@ -290,7 +291,7 @@ pub struct EnvVar {
 /// Every `Service` is guaranteed to have a concrete [`ServiceSource`]: the
 /// parser rejects any section that declares no source, so by the time a
 /// `Service` exists this invariant holds.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Service {
     /// Service name (matches section header)
     pub name: String,
@@ -321,14 +322,56 @@ pub struct Service {
     pub pre_stop: Vec<String>,
     /// Commands to run after the service has stopped
     pub post_stop: Vec<String>,
-    /// Health check command
-    pub healthcheck: Option<String>,
-    /// Timeout in seconds to wait for service to be ready
-    pub ready_timeout_secs: Option<u64>,
+    /// Readiness probe and its optional timeout.
+    ///
+    /// Keeping the timeout with the probe prevents a parsed service from
+    /// carrying a timeout that no startup path could use.
+    pub healthcheck: Option<Healthcheck>,
     /// Build context for Dockerfile builds
     pub build_context: Option<String>,
-    /// Command override (replaces the default CMD in the image)
-    pub command_override: Option<String>,
+    /// Parsed command override (replaces the default CMD in the image).
+    pub command_override: Option<CommandOverride>,
+}
+
+/// A healthcheck command with an optional non-zero readiness timeout.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Healthcheck {
+    /// Shell command polled until it succeeds.
+    pub command: String,
+    /// Explicit timeout. Backends use their existing default when absent.
+    pub timeout_secs: Option<NonZeroU64>,
+}
+
+/// A `command=` override that has already been split into a non-empty argv.
+///
+/// The field is private so malformed shell quoting and empty commands can only
+/// enter through the `.eph` parser.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CommandOverride(Vec<String>);
+
+impl CommandOverride {
+    fn parse(value: &str, service: &str) -> Result<Self> {
+        let argv = shell_words::split(value).map_err(|error| {
+            anyhow::anyhow!(
+                "invalid command override for service '{}': {}",
+                service,
+                error
+            )
+        })?;
+        if argv.first().is_none_or(String::is_empty) {
+            bail!(
+                "invalid command override for service '{}': command must name an executable",
+                service
+            );
+        }
+        Ok(Self(argv))
+    }
+
+    /// Return the parsed argv without reparsing user input at startup.
+    #[must_use]
+    pub fn argv(&self) -> &[String] {
+        &self.0
+    }
 }
 
 /// How a service is started.
@@ -336,7 +379,7 @@ pub struct Service {
 /// Exactly one source per service. There is intentionally no "unset" variant:
 /// a section that declares no source is rejected at parse time, so a value of
 /// this type always names a real way to start the service.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum ServiceSource {
     /// Docker image to pull and run
     Image(String),
@@ -348,25 +391,71 @@ pub enum ServiceSource {
     Command(String),
 }
 
-/// A port mapping
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PortMapping {
-    /// Optional name for this port (e.g., "api", "admin")
-    pub name: Option<String>,
-    /// Container port to expose.
-    ///
-    /// For an auto-allocated port ([`auto`](Self::auto) is `true`) there is no
-    /// container port; this is `0` and eph assigns a free host port at start
-    /// time.
-    pub container_port: u16,
-    /// When `true`, eph allocates a free host port for this mapping at start
-    /// time instead of using a fixed number, and tells the spawned process the
-    /// assigned port through its environment. Written as `port=auto` /
-    /// `port.<name>=auto` in the `.eph` file. Only valid for `run=` services
-    /// (the parser rejects it elsewhere), since those are processes eph launches
-    /// and can re-launch on a fresh port if they hit a port conflict.
-    #[serde(default)]
-    pub auto: bool,
+/// A port declaration whose shape records how eph resolves it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum PortMapping {
+    /// A fixed port for an image, Dockerfile, or `run=` service.
+    Fixed {
+        /// Optional interpolation name such as `api`.
+        name: Option<String>,
+        /// Non-zero container or host-process port.
+        port: NonZeroU16,
+    },
+    /// A host port eph allocates before launching a `run=` service.
+    Auto {
+        /// Optional interpolation name such as `hmr`.
+        name: Option<String>,
+    },
+    /// A published port belonging to one service in a Compose project.
+    Compose {
+        /// User-facing interpolation alias.
+        alias: String,
+        /// Service name passed to `docker compose port`.
+        service: String,
+        /// Non-zero container port passed to `docker compose port`.
+        port: NonZeroU16,
+    },
+}
+
+impl PortMapping {
+    /// User-facing name, or `None` for an unnamed direct mapping.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Fixed { name, .. } | Self::Auto { name } => name.as_deref(),
+            Self::Compose { alias, .. } => Some(alias),
+        }
+    }
+
+    /// Runtime/interpolation key, using `default` for an unnamed direct port.
+    #[must_use]
+    pub fn runtime_name(&self) -> &str {
+        self.name().unwrap_or("default")
+    }
+
+    /// Fixed container port. Auto mappings have no fixed port.
+    #[must_use]
+    pub fn container_port(&self) -> Option<u16> {
+        match self {
+            Self::Fixed { port, .. } | Self::Compose { port, .. } => Some(port.get()),
+            Self::Auto { .. } => None,
+        }
+    }
+
+    /// Whether eph must allocate this mapping at process startup.
+    #[must_use]
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto { .. })
+    }
+
+    /// Compose service name, when this is a Compose mapping.
+    #[must_use]
+    pub fn compose_service(&self) -> Option<&str> {
+        match self {
+            Self::Compose { service, .. } => Some(service),
+            Self::Fixed { .. } | Self::Auto { .. } => None,
+        }
+    }
 }
 
 // ============================================================================
@@ -396,6 +485,7 @@ enum Context {
 /// once every section has been read (so forward references work).
 struct PlaceholderRef {
     service: String,
+    property: String,
     line: usize,
     /// Where the reference appeared, for the error message (e.g. "value of
     /// DATABASE_URL" or "env.PORT of service 'web'").
@@ -427,9 +517,9 @@ struct ServiceBuilder {
     pre_stop: Vec<String>,
     post_stop: Vec<String>,
     healthcheck: Option<String>,
-    ready_timeout_secs: Option<u64>,
+    ready_timeout_secs: Option<NonZeroU64>,
     build_context: Option<String>,
-    command_override: Option<String>,
+    command_override: Option<CommandOverride>,
 }
 
 impl ServiceBuilder {
@@ -449,11 +539,10 @@ impl ServiceBuilder {
         // a random host port, and there is no process for eph to relaunch, so a
         // bare `auto` there is a mistake worth catching at parse time.
         if !matches!(source, ServiceSource::Command(_))
-            && let Some(p) = self.ports.iter().find(|p| p.auto)
+            && let Some(p) = self.ports.iter().find(|p| p.is_auto())
         {
             let which = p
-                .name
-                .as_deref()
+                .name()
                 .map_or_else(|| "port".to_string(), |n| format!("port.{n}"));
             bail!(
                 "service '{}' sets `{} = auto`, but auto-allocated ports are only \
@@ -478,14 +567,36 @@ impl ServiceBuilder {
                 self.name
             );
         }
+        if self.build_context.is_some() && !matches!(source, ServiceSource::Dockerfile(_)) {
+            bail!(
+                "service '{}' sets `context=`, which only applies to dockerfile= services",
+                self.name
+            );
+        }
+        if !self.volumes.is_empty()
+            && !matches!(
+                source,
+                ServiceSource::Image(_) | ServiceSource::Dockerfile(_)
+            )
+        {
+            bail!(
+                "service '{}' sets `volume=`, which only applies to image= or dockerfile= services",
+                self.name
+            );
+        }
+        if self.ready_timeout_secs.is_some() && self.healthcheck.is_none() {
+            bail!(
+                "service '{}' sets `ready-timeout=` without a `healthcheck=` to time",
+                self.name
+            );
+        }
         // `expose.<name>=` names ports of services inside a compose project;
         // `port=`/`port.<name>=` declare ports eph itself publishes. Each is
         // meaningless for the other backend, so a mix-up is caught here.
         let ports = if matches!(source, ServiceSource::Compose(_)) {
             if let Some(p) = self.ports.first() {
                 let which = p
-                    .name
-                    .as_deref()
+                    .name()
                     .map_or_else(|| "port".to_string(), |n| format!("port.{n}"));
                 bail!(
                     "compose service '{}' declares `{}`; compose services name \
@@ -501,7 +612,7 @@ impl ServiceBuilder {
                     "service '{}' declares `expose.{}`, which only applies to \
                      compose= services; use `port=` or `port.<name>=` instead",
                     self.name,
-                    p.name.as_deref().unwrap_or_default()
+                    p.name().unwrap_or_default()
                 );
             }
             self.ports
@@ -517,8 +628,10 @@ impl ServiceBuilder {
             post_start: self.post_start,
             pre_stop: self.pre_stop,
             post_stop: self.post_stop,
-            healthcheck: self.healthcheck,
-            ready_timeout_secs: self.ready_timeout_secs,
+            healthcheck: self.healthcheck.map(|command| Healthcheck {
+                command,
+                timeout_secs: self.ready_timeout_secs,
+            }),
             build_context: self.build_context,
             command_override: self.command_override,
         })
@@ -527,10 +640,11 @@ impl ServiceBuilder {
     /// True if a port with this name (or an unnamed port, for `None`) has
     /// already been declared via either `port` or `expose`.
     fn has_port_named(&self, name: Option<&str>) -> bool {
+        let runtime_name = name.unwrap_or("default");
         self.ports
             .iter()
             .chain(self.expose.iter())
-            .any(|p| p.name.as_deref() == name)
+            .any(|port| port.runtime_name() == runtime_name)
     }
 }
 
@@ -553,9 +667,11 @@ impl ServiceBuilder {
 /// - a bare `KEY=VALUE` appears after a service section (move it into `[env]`)
 /// - a top-level variable name is not a valid environment variable name, or is
 ///   declared twice
-/// - an interpolation is malformed (`${` without `}`, or not
-///   `${service.property}`) or references an unknown service
+/// - an interpolation is malformed, references an unknown service or port,
+///   uses an unknown property, or uses bare `.port` for a service without
+///   exactly one port
 /// - a section declares no source (no `image`/`dockerfile`/`compose`/`run`)
+/// - a property is incompatible with its service source
 ///
 /// # Examples
 ///
@@ -699,6 +815,9 @@ pub fn parse(input: &str) -> Result<EphFile> {
                 let dag = roles_order_dag
                     .as_mut()
                     .expect("dag is initialized on entering [roles_order]");
+                if key.is_empty() {
+                    bail!("line {}: empty role name in [roles_order]", line_num);
+                }
                 if dag.contains_key(key) {
                     bail!(
                         "line {}: duplicate role '{}' in [roles_order]",
@@ -706,7 +825,10 @@ pub fn parse(input: &str) -> Result<EphFile> {
                         key
                     );
                 }
-                dag.insert(key.to_string(), split_roles(value));
+                dag.insert(
+                    key.to_string(),
+                    split_role_dependencies(value, key, line_num)?,
+                );
             }
 
             // Top-of-file: bare variables, plus the linear `roles_order=` form.
@@ -742,6 +864,7 @@ pub fn parse(input: &str) -> Result<EphFile> {
                         line_num
                     );
                 }
+                reject_reserved_env_name(key, line_num, "top-level environment")?;
                 if let Some(first) = env_lines.get(key) {
                     bail!(
                         "duplicate environment variable '{}' at line {} (first \
@@ -776,19 +899,11 @@ pub fn parse(input: &str) -> Result<EphFile> {
         services.insert(service.name.clone(), service);
     }
 
-    // Every ${service.property} must name a defined service. Checked after the
-    // whole file is read so a variable may reference a service defined later.
+    // Every ${service.property} must name a defined service and a property that
+    // the service actually exposes. Checked after the whole file is read so
+    // forward references work without weakening the returned model.
     for r in &refs {
-        if !services.contains_key(&r.service) {
-            bail!(
-                "unknown service '{}' referenced from {} at line {} (known \
-                 services: {})",
-                r.service,
-                r.context,
-                r.line,
-                services.keys().cloned().collect::<Vec<_>>().join(", ")
-            );
-        }
+        validate_placeholder(r, &services)?;
     }
 
     // Collapse the two spellings into one graph: the linear form desugars into an
@@ -813,32 +928,51 @@ pub fn parse(input: &str) -> Result<EphFile> {
     })
 }
 
-/// Split a comma-separated role list (`a, b ,c`), trimming each entry and
-/// dropping empties, into owned role names. Used for both the linear
-/// `roles_order=` value and a `[roles_order]` line's dependency list.
-fn split_roles(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
+/// Parse a non-empty comma-separated role list without discarding typo-shaped
+/// empty or duplicate segments.
+fn split_roles_checked(value: &str, line_num: usize) -> Result<Vec<String>> {
+    split_role_list(value, line_num, "roles_order", false)
 }
 
-/// Like [`split_roles`], but rejects a repeated role. Used for the linear
-/// `roles_order=a,b,c` form, where a duplicate is a mistake: it would desugar to
-/// a role depending on itself (a cycle) and, more usefully, almost always means a
-/// typo. The list is short, so the quadratic scan is fine.
-fn split_roles_checked(value: &str, line_num: usize) -> Result<Vec<String>> {
-    let roles = split_roles(value);
-    for (i, role) in roles.iter().enumerate() {
-        if roles[..i].contains(role) {
+/// Parse one `[roles_order]` dependency list. A wholly empty value declares a
+/// root role; commas still denote segments and therefore cannot be empty.
+fn split_role_dependencies(value: &str, role: &str, line_num: usize) -> Result<Vec<String>> {
+    split_role_list(
+        value,
+        line_num,
+        &format!("dependencies of role '{}'", role),
+        true,
+    )
+}
+
+fn split_role_list(
+    value: &str,
+    line_num: usize,
+    context: &str,
+    allow_empty_list: bool,
+) -> Result<Vec<String>> {
+    if value.trim().is_empty() {
+        if allow_empty_list {
+            return Ok(Vec::new());
+        }
+        bail!("line {}: {} must list at least one role", line_num, context);
+    }
+
+    let mut roles = Vec::new();
+    for segment in value.split(',') {
+        let role = segment.trim();
+        if role.is_empty() {
+            bail!("line {}: empty role in {}", line_num, context);
+        }
+        if roles.iter().any(|existing| existing == role) {
             bail!(
-                "line {}: duplicate role '{}' in roles_order",
+                "line {}: duplicate role '{}' in {}",
                 line_num,
-                role
+                role,
+                context
             );
         }
+        roles.push(role.to_string());
     }
     Ok(roles)
 }
@@ -955,6 +1089,12 @@ fn is_valid_service_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+fn is_valid_compose_service_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// Returns `true` if `name` is a valid environment variable name for the
 /// shells `eph env` targets: letters, digits, and underscores, not starting
 /// with a digit. Anything else would make the emitted `export NAME=...` line
@@ -963,6 +1103,21 @@ fn is_valid_env_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn reject_reserved_env_name(name: &str, line_num: usize, context: &str) -> Result<()> {
+    if name
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("EPH_"))
+    {
+        bail!(
+            "reserved environment variable '{}' in {} at line {}: EPH_* names are managed by eph",
+            name,
+            context,
+            line_num
+        );
+    }
+    Ok(())
 }
 
 /// If `name` looks like a misspelling of a reserved section, the canonical
@@ -998,8 +1153,8 @@ fn strip_quotes(s: &str) -> &str {
     s
 }
 
-/// Validate the `${service.property}` placeholders in `value`, recording each
-/// referenced service in `refs` for the post-parse existence check.
+/// Parse the `${service.property}` placeholders in an environment value,
+/// recording each reference for post-parse semantic checks.
 ///
 /// Rejects an unterminated `${` and any placeholder that is not of the
 /// two-part `service.property` form. A literal `${` can be written as `$${`;
@@ -1033,6 +1188,7 @@ fn scan_placeholders(
                 Some((service, property)) if !service.is_empty() && !property.is_empty() => {
                     refs.push(PlaceholderRef {
                         service: service.to_string(),
+                        property: property.to_string(),
                         line,
                         context: context.to_string(),
                     });
@@ -1054,19 +1210,157 @@ fn scan_placeholders(
     Ok(())
 }
 
-/// Parse a port property's value into `(container_port, auto)`.
-///
-/// The literal `auto` (case-insensitive) requests an eph-allocated free host
-/// port and yields `(0, true)`; anything else must be a valid `u16` port number
-/// and yields `(n, false)`.
-fn parse_port_value(value: &str, line_num: usize) -> Result<(u16, bool)> {
+/// Record eph's dotted placeholders inside a shell command without claiming
+/// ordinary shell parameter expansion such as `${PORT}` or `${HOME:-/tmp}`.
+fn scan_command_placeholders(
+    value: &str,
+    line: usize,
+    context: &str,
+    refs: &mut Vec<PlaceholderRef>,
+) {
+    let mut offset = 0;
+    while offset < value.len() {
+        let rest = &value[offset..];
+        if rest.starts_with("$${") {
+            offset += 3;
+            continue;
+        }
+        if let Some(tail) = rest.strip_prefix("${") {
+            let Some(end) = tail.find('}') else {
+                break;
+            };
+            let content = &tail[..end];
+            if let Some((service, property)) = content.split_once('.')
+                && !service.is_empty()
+                && !property.is_empty()
+            {
+                refs.push(PlaceholderRef {
+                    service: service.to_string(),
+                    property: property.to_string(),
+                    line,
+                    context: context.to_string(),
+                });
+            }
+            offset += 2 + end + 1;
+            continue;
+        }
+        offset += rest.chars().next().map_or(1, char::len_utf8);
+    }
+}
+
+fn validate_placeholder(
+    reference: &PlaceholderRef,
+    services: &IndexMap<String, Service>,
+) -> Result<()> {
+    let Some(service) = services.get(&reference.service) else {
+        bail!(
+            "unknown service '{}' referenced from {} at line {} (known services: {})",
+            reference.service,
+            reference.context,
+            reference.line,
+            services.keys().cloned().collect::<Vec<_>>().join(", ")
+        );
+    };
+
+    match reference.property.as_str() {
+        "host" => Ok(()),
+        "port" if service.ports.len() == 1 => Ok(()),
+        "port" if service.ports.is_empty() => bail!(
+            "service '{}' exposes no ports, so '${{{}.port}}' in {} at line {} cannot resolve",
+            reference.service,
+            reference.service,
+            reference.context,
+            reference.line
+        ),
+        "port" => bail!(
+            "service '{}' exposes multiple ports, so '${{{}.port}}' in {} at line {} is ambiguous; use one of: {}",
+            reference.service,
+            reference.service,
+            reference.context,
+            reference.line,
+            service
+                .ports
+                .iter()
+                .map(PortMapping::runtime_name)
+                .map(|name| format!("${{{}.port.{}}}", reference.service, name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        property if property.starts_with("port.") => {
+            let name = &property[5..];
+            if service.ports.iter().any(|port| port.runtime_name() == name) {
+                Ok(())
+            } else {
+                let known = service
+                    .ports
+                    .iter()
+                    .map(PortMapping::runtime_name)
+                    .collect::<Vec<_>>();
+                let suffix = if known.is_empty() {
+                    "this service has no named ports".to_string()
+                } else {
+                    format!("known named ports: {}", known.join(", "))
+                };
+                bail!(
+                    "unknown port '{}' on service '{}' referenced from {} at line {} ({})",
+                    name,
+                    reference.service,
+                    reference.context,
+                    reference.line,
+                    suffix
+                )
+            }
+        }
+        property => bail!(
+            "unknown interpolation property '{}' on service '{}' referenced from {} at line {}; expected host, port, or port.<name>",
+            property,
+            reference.service,
+            reference.context,
+            reference.line
+        ),
+    }
+}
+
+/// Parse a port value as either `auto` (`None`) or a non-zero fixed port.
+fn parse_port_value(value: &str, line_num: usize) -> Result<Option<NonZeroU16>> {
     if value.eq_ignore_ascii_case("auto") {
-        return Ok((0, true));
+        return Ok(None);
     }
     let port: u16 = value
         .parse()
         .with_context(|| format!("invalid port number at line {}", line_num))?;
-    Ok((port, false))
+    NonZeroU16::new(port).map(Some).with_context(|| {
+        format!(
+            "invalid port number at line {}: port must be non-zero",
+            line_num
+        )
+    })
+}
+
+fn parse_compose_expose(value: &str, alias: &str, line_num: usize) -> Result<(String, NonZeroU16)> {
+    let (service, port) = value
+        .split_once(':')
+        .map_or((alias, value), |(service, port)| {
+            (service.trim(), port.trim())
+        });
+    if !is_valid_compose_service_name(service) {
+        bail!(
+            "invalid Compose service name '{}' in expose.{} at line {}",
+            service,
+            alias,
+            line_num
+        );
+    }
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("invalid port number at line {}", line_num))?;
+    let port = NonZeroU16::new(port).with_context(|| {
+        format!(
+            "invalid port number at line {}: port must be non-zero",
+            line_num
+        )
+    })?;
+    Ok((service.to_string(), port))
 }
 
 /// Set a single-valued property, rejecting a second occurrence. The old parser
@@ -1163,7 +1457,7 @@ fn parse_service_property(
         }
         // Container command override (for use with image/dockerfile)
         "command" => {
-            let v = value.to_string();
+            let v = CommandOverride::parse(value, &service.name)?;
             set_once(
                 &mut service.command_override,
                 v,
@@ -1181,12 +1475,11 @@ fn parse_service_property(
                     line_num
                 );
             }
-            let (port, auto) = parse_port_value(value, line_num)?;
-            service.ports.push(PortMapping {
-                name: None,
-                container_port: port,
-                auto,
-            });
+            let mapping = match parse_port_value(value, line_num)? {
+                Some(port) => PortMapping::Fixed { name: None, port },
+                None => PortMapping::Auto { name: None },
+            };
+            service.ports.push(mapping);
         }
         "volume" => {
             service.volumes.push(value.to_string());
@@ -1204,6 +1497,12 @@ fn parse_service_property(
             service.post_stop.push(value.to_string());
         }
         "healthcheck" => {
+            scan_command_placeholders(
+                value,
+                line_num,
+                &format!("healthcheck of service '{}'", service.name),
+                refs,
+            );
             let v = value.to_string();
             set_once(&mut service.healthcheck, v, key, &service.name, line_num)?;
         }
@@ -1211,6 +1510,12 @@ fn parse_service_property(
             let secs: u64 = value
                 .parse()
                 .with_context(|| format!("invalid timeout at line {}", line_num))?;
+            let secs = NonZeroU64::new(secs).with_context(|| {
+                format!(
+                    "invalid timeout at line {}: ready-timeout must be non-zero",
+                    line_num
+                )
+            })?;
             set_once(
                 &mut service.ready_timeout_secs,
                 secs,
@@ -1230,12 +1535,12 @@ fn parse_service_property(
                     line_num
                 );
             }
-            let (port, auto) = parse_port_value(value, line_num)?;
-            service.ports.push(PortMapping {
-                name: Some(port_name.to_string()),
-                container_port: port,
-                auto,
-            });
+            let name = Some(port_name.to_string());
+            let mapping = match parse_port_value(value, line_num)? {
+                Some(port) => PortMapping::Fixed { name, port },
+                None => PortMapping::Auto { name },
+            };
+            service.ports.push(mapping);
         }
         key if key.starts_with("env.") => {
             let env_name = &key[4..];
@@ -1249,6 +1554,11 @@ fn parse_service_property(
                     line_num
                 );
             }
+            reject_reserved_env_name(
+                env_name,
+                line_num,
+                &format!("service '{}' environment", service.name),
+            )?;
             if service.env.contains_key(env_name) {
                 bail!(
                     "duplicate 'env.{}' in service '{}' at line {}",
@@ -1277,13 +1587,11 @@ fn parse_service_property(
                     line_num
                 );
             }
-            let port: u16 = value
-                .parse()
-                .with_context(|| format!("invalid port number at line {}", line_num))?;
-            service.expose.push(PortMapping {
-                name: Some(port_name.to_string()),
-                container_port: port,
-                auto: false,
+            let (compose_service, port) = parse_compose_expose(value, port_name, line_num)?;
+            service.expose.push(PortMapping::Compose {
+                alias: port_name.to_string(),
+                service: compose_service,
+                port,
             });
         }
         // Build context for Dockerfiles
@@ -1538,7 +1846,7 @@ env.POSTGRES_USER=dev
         assert_eq!(result.services.len(), 1);
         let pg = result.services.get("postgres").unwrap();
         assert!(matches!(&pg.source, ServiceSource::Image(img) if img == "postgres:16"));
-        assert_eq!(pg.ports[0].container_port, 5432);
+        assert_eq!(pg.ports[0].container_port(), Some(5432));
         assert_eq!(pg.env.get("POSTGRES_USER"), Some(&"dev".to_string()));
     }
 
@@ -1736,6 +2044,18 @@ THIRD=3
     }
 
     #[test]
+    fn eph_metadata_names_are_reserved_in_every_environment_scope() {
+        for input in [
+            "EPH_WORKSPACE_ID=shadowed\n",
+            "eph_workspace_id=shadowed\n",
+            "[web]\nrun=serve\nenv.EPH_WEB_PORT=shadowed\n",
+        ] {
+            let error = parse(input).expect_err("EPH_* must remain owned by eph");
+            assert!(error.to_string().contains("managed by eph"), "got: {error}");
+        }
+    }
+
+    #[test]
     fn roles_order_inside_env_section_is_rejected() {
         let input = "[db]\nimage=postgres:16\nrole=dep\n\n[env]\nroles_order=dep\n";
         let err = parse(input).expect_err("roles_order inside [env] must be rejected");
@@ -1830,6 +2150,7 @@ env.POSTGRES_USER=dev
     fn duplicate_ports_and_env_keys_are_rejected() {
         assert!(parse("[web]\nrun=serve\nport=3000\nport=4000\n").is_err());
         assert!(parse("[web]\nrun=serve\nport.api=3000\nport.api=4000\n").is_err());
+        assert!(parse("[web]\nrun=serve\nport=3000\nport.default=4000\n").is_err());
         assert!(parse("[db]\nimage=postgres:16\nenv.X=1\nenv.X=2\n").is_err());
     }
 
@@ -1864,6 +2185,56 @@ env.POSTGRES_USER=dev
     }
 
     #[test]
+    fn command_override_is_parsed_into_argv_at_the_file_boundary() {
+        let eph = parse("[web]\nimage=example/web\ncommand=sh -c \"echo hi\"\n").unwrap();
+        assert_eq!(
+            eph.services["web"]
+                .command_override
+                .as_ref()
+                .unwrap()
+                .argv(),
+            ["sh", "-c", "echo hi"]
+        );
+
+        let error = parse("[web]\nimage=example/web\ncommand=sh -c \"echo hi\n")
+            .expect_err("unbalanced command quoting must fail during parse");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid command override for service 'web'"),
+            "got: {error}"
+        );
+    }
+
+    #[test]
+    fn source_specific_properties_are_rejected_when_the_backend_ignores_them() {
+        assert!(parse("[web]\nrun=serve\ncontext=.\n").is_err());
+        assert!(parse("[web]\nimage=example/web\ncontext=.\n").is_err());
+        assert!(parse("[web]\nrun=serve\nvolume=data:/data\n").is_err());
+        assert!(parse("[stack]\ncompose=compose.yml\nvolume=data:/data\n").is_err());
+        assert!(parse("[web]\ndockerfile=Dockerfile\ncontext=.\nvolume=data:/data\n").is_ok());
+        assert!(parse("[web]\nimage=example/web\nvolume=data:/data\n").is_ok());
+    }
+
+    #[test]
+    fn readiness_timeout_requires_a_healthcheck_and_must_be_non_zero() {
+        assert!(parse("[web]\nrun=serve\nready-timeout=5\n").is_err());
+        assert!(parse("[web]\nrun=serve\nhealthcheck=true\nready-timeout=0\n").is_err());
+
+        let eph = parse("[web]\nrun=serve\nhealthcheck=true\nready-timeout=5\n").unwrap();
+        assert_eq!(
+            eph.services["web"]
+                .healthcheck
+                .as_ref()
+                .unwrap()
+                .timeout_secs
+                .unwrap()
+                .get(),
+            5
+        );
+    }
+
+    #[test]
     fn expose_and_port_are_tied_to_their_backends() {
         // expose.<name>= names compose-project ports; port= is for services eph
         // publishes itself. Each is rejected on the other backend.
@@ -1873,6 +2244,25 @@ env.POSTGRES_USER=dev
         assert!(err.to_string().contains("compose"), "got: {err}");
         let err = parse("[stack]\ncompose=dc.yml\nport=9000\n").expect_err("port on compose=");
         assert!(err.to_string().contains("expose"), "got: {err}");
+    }
+
+    #[test]
+    fn compose_expose_carries_alias_and_target_service_separately() {
+        let eph =
+            parse("[stack]\ncompose=compose.yml\nexpose.cache=redis-main:6379\nexpose.api=8080\n")
+                .unwrap();
+        let stack = &eph.services["stack"];
+
+        assert!(matches!(
+            &stack.ports[0],
+            PortMapping::Compose { alias, service, port }
+                if alias == "cache" && service == "redis-main" && port.get() == 6379
+        ));
+        assert!(matches!(
+            &stack.ports[1],
+            PortMapping::Compose { alias, service, port }
+                if alias == "api" && service == "api" && port.get() == 8080
+        ));
     }
 
     // ------------------------------------------------------------------------
@@ -1892,31 +2282,23 @@ port.api=5000
         let web = result.services.get("web").unwrap();
         assert!(matches!(&web.source, ServiceSource::Command(c) if c == "npm run dev"));
 
-        let unnamed = web.ports.iter().find(|p| p.name.is_none()).unwrap();
-        assert!(unnamed.auto);
-        assert_eq!(unnamed.container_port, 0);
+        let unnamed = web.ports.iter().find(|p| p.name().is_none()).unwrap();
+        assert!(unnamed.is_auto());
+        assert_eq!(unnamed.container_port(), None);
 
-        let hmr = web
-            .ports
-            .iter()
-            .find(|p| p.name.as_deref() == Some("hmr"))
-            .unwrap();
-        assert!(hmr.auto);
+        let hmr = web.ports.iter().find(|p| p.name() == Some("hmr")).unwrap();
+        assert!(hmr.is_auto());
 
         // A fixed numeric port alongside auto ports stays fixed.
-        let api = web
-            .ports
-            .iter()
-            .find(|p| p.name.as_deref() == Some("api"))
-            .unwrap();
-        assert!(!api.auto);
-        assert_eq!(api.container_port, 5000);
+        let api = web.ports.iter().find(|p| p.name() == Some("api")).unwrap();
+        assert!(!api.is_auto());
+        assert_eq!(api.container_port(), Some(5000));
     }
 
     #[test]
     fn test_auto_port_is_case_insensitive() {
         let result = parse("[web]\nrun=serve\nport=AUTO\n").unwrap();
-        assert!(result.services["web"].ports[0].auto);
+        assert!(result.services["web"].ports[0].is_auto());
     }
 
     #[test]
@@ -1936,6 +2318,14 @@ port.api=5000
     fn test_non_auto_invalid_port_still_errors() {
         // A non-numeric, non-`auto` port value remains a hard error.
         assert!(parse("[web]\nrun=serve\nport=nope\n").is_err());
+    }
+
+    #[test]
+    fn zero_fixed_and_compose_ports_are_rejected() {
+        assert!(parse("[web]\nrun=serve\nport=0\n").is_err());
+        assert!(parse("[web]\nimage=example/web\nport.api=0\n").is_err());
+        assert!(parse("[stack]\ncompose=compose.yml\nexpose.api=0\n").is_err());
+        assert!(parse("[stack]\ncompose=compose.yml\nexpose.cache=redis:0\n").is_err());
     }
 
     // ------------------------------------------------------------------------
@@ -2027,11 +2417,52 @@ port.api=5000
     }
 
     #[test]
-    fn hook_and_run_values_are_not_scanned_for_placeholders() {
-        // run=, hooks, and healthchecks are shell commands where ${VAR} is the
-        // shell's own parameter expansion; eph must leave them alone.
+    fn interpolation_properties_must_exist_and_bare_port_must_be_unambiguous() {
+        let cases = [
+            (
+                "[db]\nimage=postgres:16\n\n[env]\nURL=${db.typo}\n",
+                "unknown interpolation property 'typo'",
+            ),
+            (
+                "[db]\nimage=postgres:16\nport.sql=5432\n\n[env]\nURL=${db.port.admin}\n",
+                "unknown port 'admin'",
+            ),
+            (
+                "[db]\nimage=postgres:16\n\n[env]\nURL=${db.port}\n",
+                "exposes no ports",
+            ),
+            (
+                "[db]\nimage=postgres:16\nport.sql=5432\nport.admin=5433\n\n[env]\nURL=${db.port}\n",
+                "is ambiguous",
+            ),
+        ];
+        for (input, expected) in cases {
+            let error = parse(input).expect_err("invalid interpolation must fail during parse");
+            assert!(error.to_string().contains(expected), "got: {error}");
+        }
+
+        assert!(parse("[db]\nimage=postgres:16\nport.sql=5432\n\n[env]\nURL=${db.port}\n").is_ok());
+        assert!(
+            parse(
+                "[web]\nrun=serve\nport=3000\nport.admin=3001\n\n[env]\nURL=${web.port.default}\n"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn shell_commands_preserve_shell_expansion_while_healthchecks_check_eph_references() {
+        // Dotless shell variables belong to the shell. Dotted healthcheck
+        // placeholders belong to eph and receive the same semantic checks as
+        // environment values.
         let input =
             "[web]\nrun=echo ${PORT}\nhealthcheck=test -n ${HOME}\npost-start=echo ${undefined}\n";
+        assert!(parse(input).is_ok());
+
+        let input = "[web]\nrun=serve\nport=3000\nhealthcheck=test ${web.port.missing}\n";
+        assert!(parse(input).is_err());
+
+        let input = "[web]\nrun=serve\nport=3000\nhealthcheck=echo $${ghost.port}\n";
         assert!(parse(input).is_ok());
     }
 
@@ -2289,6 +2720,33 @@ port.api=5000
         let input = "roles_order=dep,dep\n\n[db]\nimage=postgres:16\nrole=dep\n";
         let err = parse(input).expect_err("a repeated role in the linear form must be rejected");
         assert!(err.to_string().contains("duplicate role 'dep'"));
+    }
+
+    #[test]
+    fn empty_role_segments_are_rejected_in_both_order_forms() {
+        for input in [
+            "roles_order=dep,,app\n\n[db]\nrun=db\nrole=dep\n[web]\nrun=web\nrole=app\n",
+            "roles_order=dep,app,\n\n[db]\nrun=db\nrole=dep\n[web]\nrun=web\nrole=app\n",
+            "[db]\nrun=db\nrole=dep\n[web]\nrun=web\nrole=app\n[roles_order]\ndep=\napp=dep,,cache\n",
+        ] {
+            let error = parse(input).expect_err("empty role segments must not be discarded");
+            assert!(error.to_string().contains("empty role"), "got: {error}");
+        }
+    }
+
+    #[test]
+    fn duplicate_dependencies_in_dag_form_are_rejected() {
+        let input =
+            "[db]\nrun=db\nrole=dep\n[web]\nrun=web\nrole=app\n[roles_order]\ndep=\napp=dep,dep\n";
+        let error = parse(input).expect_err("duplicate dependency must be rejected");
+        assert!(error.to_string().contains("duplicate role 'dep'"));
+    }
+
+    #[test]
+    fn empty_role_name_in_dag_form_is_rejected() {
+        let input = "[db]\nrun=db\nrole=dep\n[roles_order]\n=dep\ndep=\n";
+        let error = parse(input).expect_err("an empty role key must be rejected");
+        assert!(error.to_string().contains("empty role name"));
     }
 
     #[test]

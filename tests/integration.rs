@@ -1421,6 +1421,16 @@ command=sleep "3600
         "expected a command-override parse error, got: {stderr}"
     );
 
+    // Restore a parseable file so normal lifecycle cleanup can identify the
+    // already-running container.
+    ws.write_file(
+        ".eph",
+        r#"
+[box]
+image=redis:7-alpine
+command=sleep 3600
+"#,
+    );
     ws.eph_ok(&["down"]).await;
 }
 
