@@ -10,6 +10,7 @@ use crate::workspace::{WORKSPACE_METADATA_FILE, WorkspaceMetadata, state_root};
 use anyhow::{Context, Result};
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
+use bollard::models::{ContainerSummary, ContainerSummaryStateEnum};
 use bollard::query_parameters::{
     ListContainersOptionsBuilder, ListImagesOptionsBuilder, ListNetworksOptionsBuilder,
     RemoveContainerOptionsBuilder, RemoveImageOptionsBuilder, RemoveVolumeOptionsBuilder,
@@ -26,6 +27,52 @@ pub struct PruneOptions {
     pub dry_run: bool,
     /// Prune state directories written by eph v0.4.2 and earlier.
     pub compatibility_v042: bool,
+    /// Remove a stale workspace's resources even when it still has running
+    /// containers or a live `run=` process. Without this, a workspace that
+    /// reads as stale only because it was moved or renamed (its recorded path
+    /// no longer resolves) is reported and skipped instead of force-killed.
+    pub force_live: bool,
+}
+
+/// Whether `eph system prune`'s confirmation prompt should be shown, skipped,
+/// or refused for a real (non-dry-run) prune.
+///
+/// This is a plain function over booleans, not a method that reads
+/// `std::io::stdin()` itself, so the CLI layer's terminal check and its
+/// decision of what to do with that check are two different, independently
+/// testable things: this one needs no real terminal or Docker daemon to
+/// exercise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmationOutcome {
+    /// Nothing would be removed, or `--yes` was passed: proceed without
+    /// asking.
+    Proceed,
+    /// Show the "Remove these resources? [y/N]" prompt on stdin.
+    Prompt,
+    /// stdin is not a terminal and `--yes` was not passed, so there is no way
+    /// to ask and no consent to assume: refuse until the caller passes
+    /// `--yes`.
+    RequireYes,
+}
+
+/// Decide [`ConfirmationOutcome`] for a real prune.
+///
+/// `docker system prune` always confirms before deleting anything; this
+/// mirrors that default while still letting scripts (`--yes`) and dry runs
+/// (`would_remove == false` once nothing is left to remove) skip the prompt.
+#[must_use]
+pub fn confirmation_outcome(
+    would_remove: bool,
+    yes: bool,
+    stdin_is_terminal: bool,
+) -> ConfirmationOutcome {
+    if !would_remove || yes {
+        ConfirmationOutcome::Proceed
+    } else if stdin_is_terminal {
+        ConfirmationOutcome::Prompt
+    } else {
+        ConfirmationOutcome::RequireYes
+    }
 }
 
 /// The reason a metadata-backed workspace is considered stale.
@@ -148,7 +195,21 @@ pub struct PruneReport {
 /// are reported as warnings and skipped.
 pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
     let root = state_root()?;
-    let _lock = PruneLock::acquire(&root)?;
+    let mut prune_lock = open_prune_lock(&root)?;
+    let _lock = prune_lock.try_write().map_err(|err| {
+        let path = root.join("prune.lock");
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            anyhow::anyhow!(
+                "failed to acquire prune lock at {}; another prune may be running",
+                path.display()
+            )
+        } else {
+            anyhow::Error::new(err).context(format!(
+                "failed to acquire prune lock at {}",
+                path.display()
+            ))
+        }
+    })?;
     let docker = Docker::connect_with_local_defaults()
         .context("failed to connect to docker (is docker running?)")?;
     docker
@@ -191,18 +252,20 @@ async fn inspect_state_dir(
 
     if !metadata_path.exists() {
         if options.compatibility_v042 {
-            let pruned = prune_workspace(
+            if let Some(pruned) = prune_workspace(
                 docker,
                 state_dir,
                 short_id,
                 None,
                 StaleReason::CompatibilityV042State,
-                options.dry_run,
+                options,
                 report,
             )
-            .await?;
-            report.totals.add(&pruned.counts);
-            report.pruned.push(pruned);
+            .await?
+            {
+                report.totals.add(&pruned.counts);
+                report.pruned.push(pruned);
+            }
         } else {
             report.skipped.push(SkippedWorkspace {
                 short_id,
@@ -257,42 +320,79 @@ async fn inspect_state_dir(
         return Ok(());
     }
 
-    let pruned = prune_workspace(
+    if let Some(pruned) = prune_workspace(
         docker,
         state_dir,
         metadata.short_id,
         Some(metadata.workspace_path),
         reason,
-        options.dry_run,
+        options,
         report,
     )
-    .await?;
-    report.totals.add(&pruned.counts);
-    report.pruned.push(pruned);
+    .await?
+    {
+        report.totals.add(&pruned.counts);
+        report.pruned.push(pruned);
+    }
     Ok(())
 }
 
+/// Remove a stale workspace's resources, or report and skip it when it turns
+/// out not to be as dead as its recorded path suggests.
+///
+/// Staleness is judged purely by the recorded workspace *path*
+/// ([`classify_workspace_path`]); a workspace that was moved or renamed while
+/// its services still run reads exactly the same as one that is truly gone.
+/// So before removing anything, this checks the workspace's actual Docker
+/// containers and `run=` processes for signs of life. Live resources block
+/// the prune (reported via [`PruneReport::skipped`]) unless
+/// `options.force_live` opts back into the old, unguarded behavior. This
+/// applies during `--dry-run` too, so the preview shown before the
+/// confirmation prompt matches what a real run would do.
+///
+/// Returns `Ok(None)` when the workspace was skipped for liveness rather than
+/// pruned.
 async fn prune_workspace(
     docker: &Docker,
     state_dir: &Path,
     short_id: String,
     workspace_path: Option<PathBuf>,
     reason: StaleReason,
-    dry_run: bool,
+    options: PruneOptions,
     report: &mut PruneReport,
-) -> Result<PrunedWorkspace> {
-    let mut counts = PruneCounts::default();
+) -> Result<Option<PrunedWorkspace>> {
     let prefix = format!("eph-{short_id}-");
 
-    prune_processes(state_dir, &short_id, dry_run, report, &mut counts).await;
-    counts.containers = remove_containers(docker, &prefix, dry_run).await?;
-    counts.volumes = remove_volumes(docker, &prefix, dry_run).await?;
-    counts.networks = remove_networks(docker, &prefix, dry_run).await?;
-    counts.images = remove_images(docker, &prefix, dry_run).await?;
+    let state = load_state_or_warn(state_dir, &short_id, report).await;
+    let live_processes = state.as_ref().map_or(0, count_live_processes);
+    let containers = matching_containers(docker, &prefix).await?;
+    let running_containers = count_running_containers(&containers);
+
+    if blocks_prune(running_containers, live_processes, options.force_live) {
+        report.skipped.push(SkippedWorkspace {
+            short_id,
+            workspace_path,
+            reason: format!(
+                "{reason} but has {}; stop them or re-run with --force-live",
+                live_resource_summary(running_containers, live_processes)
+            ),
+        });
+        return Ok(None);
+    }
+
+    let mut counts = PruneCounts::default();
+
+    if let Some(state) = state {
+        terminate_live_processes(state, &short_id, options.dry_run, report, &mut counts).await;
+    }
+    counts.containers = remove_containers(docker, containers, options.dry_run).await?;
+    counts.volumes = remove_volumes(docker, &prefix, options.dry_run).await?;
+    counts.networks = remove_networks(docker, &prefix, options.dry_run).await?;
+    counts.images = remove_images(docker, &prefix, options.dry_run).await?;
 
     if state_dir.exists() {
         counts.state_dirs = 1;
-        if !dry_run {
+        if !options.dry_run {
             tokio::fs::remove_dir_all(state_dir)
                 .await
                 .with_context(|| {
@@ -301,32 +401,99 @@ async fn prune_workspace(
         }
     }
 
-    Ok(PrunedWorkspace {
+    Ok(Some(PrunedWorkspace {
         short_id,
         workspace_path,
         reason,
         counts,
-    })
+    }))
 }
 
-async fn prune_processes(
+/// Whether a stale-pathed workspace has live resources that block a default
+/// prune: a running container, a live `run=` process, or both. `force_live`
+/// overrides the guard entirely, restoring the old unconditional behavior.
+///
+/// Pulled out of [`prune_workspace`] as a plain function over counts (rather
+/// than the Docker/process-table calls that produce them) so the decision
+/// itself is exercised by a unit test with no Docker daemon involved.
+fn blocks_prune(running_containers: usize, live_processes: usize, force_live: bool) -> bool {
+    !force_live && (running_containers > 0 || live_processes > 0)
+}
+
+/// Describe a positive count of running containers and/or live `run=`
+/// processes for a [`SkippedWorkspace`] reason. Only called once at least one
+/// of the two counts is non-zero.
+fn live_resource_summary(running_containers: usize, live_processes: usize) -> String {
+    let mut parts = Vec::new();
+    if running_containers > 0 {
+        parts.push(format!(
+            "{running_containers} running container{}",
+            if running_containers == 1 { "" } else { "s" }
+        ));
+    }
+    if live_processes > 0 {
+        parts.push(format!(
+            "{live_processes} live run= process{}",
+            if live_processes == 1 { "" } else { "es" }
+        ));
+    }
+    parts.join(" and ")
+}
+
+/// Load `state_dir`'s `state.json`, warning and returning `None` if it cannot
+/// be read or parsed. A missing file (a workspace with no `run=` services)
+/// also returns `None`, silently: that is the common case, not a problem.
+async fn load_state_or_warn(
     state_dir: &Path,
+    short_id: &str,
+    report: &mut PruneReport,
+) -> Option<ServiceState> {
+    match load_state(state_dir).await {
+        Ok(state) => state,
+        Err(err) => {
+            report.warnings.push(format!(
+                "{short_id}: could not read state.json, so run= process prune was skipped: {err:#}"
+            ));
+            None
+        }
+    }
+}
+
+/// Count `state`'s `run=` services whose recorded PID still names the exact
+/// process eph launched (see [`proc::identity_matches`]). This is the pure
+/// half of the liveness check: given an already-loaded [`ServiceState`], no
+/// process table is touched here beyond what `identity_matches` itself
+/// queries by PID, and no Docker or filesystem I/O happens at all.
+fn count_live_processes(state: &ServiceState) -> usize {
+    state
+        .services
+        .values()
+        .filter(|entry| {
+            let Backend::Process {
+                pid,
+                identity: Some(identity),
+            } = &entry.backend
+            else {
+                return false;
+            };
+            proc::identity_matches(*pid, identity)
+        })
+        .count()
+}
+
+/// Terminate every `run=` service in `state` whose recorded PID still matches
+/// the identity eph captured at launch. A PID with no recorded identity, or
+/// one whose live process no longer matches it, is left alone (with a
+/// warning if it is still alive): the state predates identity tracking, or
+/// the PID was reused by an unrelated process, and either way killing it
+/// would be wrong.
+async fn terminate_live_processes(
+    state: ServiceState,
     short_id: &str,
     dry_run: bool,
     report: &mut PruneReport,
     counts: &mut PruneCounts,
 ) {
-    let state = match load_state(state_dir).await {
-        Ok(Some(state)) => state,
-        Ok(None) => return,
-        Err(err) => {
-            report.warnings.push(format!(
-                "{short_id}: could not read state.json, so run= process prune was skipped: {err:#}"
-            ));
-            return;
-        }
-    };
-
     for (name, entry) in state.services {
         let Backend::Process { pid, identity } = entry.backend else {
             continue;
@@ -369,22 +536,46 @@ async fn load_state(state_dir: &Path) -> Result<Option<ServiceState>> {
     Ok(Some(state))
 }
 
-async fn remove_containers(docker: &Docker, prefix: &str, dry_run: bool) -> Result<usize> {
+/// List containers whose name carries `prefix`, eph's `eph-<short_id>-`
+/// namespace. Fetched once per workspace and shared by the liveness check
+/// ([`count_running_containers`]) and the actual removal
+/// ([`remove_containers`]), so the two agree on exactly which containers
+/// exist rather than risking a container starting or stopping between two
+/// separate `docker ps` calls.
+async fn matching_containers(docker: &Docker, prefix: &str) -> Result<Vec<ContainerSummary>> {
     let containers = docker
         .list_containers(Some(ListContainersOptionsBuilder::new().all(true).build()))
         .await
         .context("failed to list containers")?;
+    Ok(containers
+        .into_iter()
+        .filter(|container| {
+            container.names.as_ref().is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|name| docker_name_has_prefix(name, prefix))
+            })
+        })
+        .collect())
+}
+
+/// Count `containers` currently in Docker's `running` state, the liveness
+/// signal for a workspace whose recorded path no longer resolves.
+fn count_running_containers(containers: &[ContainerSummary]) -> usize {
+    containers
+        .iter()
+        .filter(|container| matches!(container.state, Some(ContainerSummaryStateEnum::RUNNING)))
+        .count()
+}
+
+async fn remove_containers(
+    docker: &Docker,
+    containers: Vec<ContainerSummary>,
+    dry_run: bool,
+) -> Result<usize> {
     let mut removed = 0;
 
     for container in containers {
-        let matches = container.names.as_ref().is_some_and(|names| {
-            names
-                .iter()
-                .any(|name| docker_name_has_prefix(name, prefix))
-        });
-        if !matches {
-            continue;
-        }
         removed += 1;
         if dry_run {
             continue;
@@ -561,34 +752,38 @@ async fn metadata_still_stale(state_dir: &Path, original: &WorkspaceMetadata) ->
     Ok(classify_workspace_path(&current.workspace_path)?.is_some())
 }
 
-struct PruneLock {
-    path: PathBuf,
-    _file: File,
-}
-
-impl PruneLock {
-    fn acquire(root: &Path) -> Result<Self> {
-        std::fs::create_dir_all(root)
-            .with_context(|| format!("failed to create state root: {}", root.display()))?;
-        let path = root.join("prune.lock");
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .with_context(|| {
-                format!(
-                    "failed to acquire prune lock at {}; another prune may be running",
-                    path.display()
-                )
-            })?;
-        Ok(PruneLock { path, _file: file })
-    }
-}
-
-impl Drop for PruneLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
+/// Open the lock file that makes `eph system prune` invocations mutually
+/// exclusive, so two prunes never remove resources out from under each other.
+///
+/// This used to be a `create_new` file plus a `Drop` impl that deleted it:
+/// whichever process created the file first held the lock, and finishing
+/// (or a signal) cleaned it up. But a crash skips `Drop`, so the file, and
+/// the lock, outlived the process that made it, and every later prune,
+/// including `--dry-run`, failed until someone deleted it by hand.
+///
+/// [`fd_lock::RwLock`] is an OS advisory lock (`flock` on Unix, `LockFileEx`
+/// on Windows) instead: the kernel releases it the instant the holding
+/// process exits, crash or not, so a dead process can never wedge the next
+/// prune. The lock file itself is still left on disk (fd-lock needs a real
+/// file to hold the lock on), but that is harmless now: it is never load-
+/// bearing on its own, only the OS-level lock on it is.
+///
+/// The caller keeps the returned lock and its `try_write` guard as two locals
+/// in [`prune`], so the OS lock releases when `prune` returns. That matters
+/// because `eph system prune` calls [`prune`] twice, a dry-run preview and
+/// then the real pass, and the second call must be able to take the lock the
+/// first one held.
+fn open_prune_lock(root: &Path) -> Result<fd_lock::RwLock<File>> {
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("failed to create state root: {}", root.display()))?;
+    let path = root.join("prune.lock");
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("failed to open prune lock file: {}", path.display()))?;
+    Ok(fd_lock::RwLock::new(file))
 }
 
 #[cfg(test)]
@@ -648,5 +843,174 @@ mod tests {
         assert!(counts.is_empty());
         counts.state_dirs = 1;
         assert!(!counts.is_empty());
+    }
+
+    #[test]
+    fn confirmation_proceeds_when_nothing_would_be_removed() {
+        assert_eq!(
+            confirmation_outcome(false, false, false),
+            ConfirmationOutcome::Proceed
+        );
+        assert_eq!(
+            confirmation_outcome(false, false, true),
+            ConfirmationOutcome::Proceed
+        );
+    }
+
+    #[test]
+    fn confirmation_proceeds_with_yes_regardless_of_the_terminal() {
+        assert_eq!(
+            confirmation_outcome(true, true, false),
+            ConfirmationOutcome::Proceed
+        );
+        assert_eq!(
+            confirmation_outcome(true, true, true),
+            ConfirmationOutcome::Proceed
+        );
+    }
+
+    #[test]
+    fn confirmation_prompts_on_an_interactive_terminal() {
+        assert_eq!(
+            confirmation_outcome(true, false, true),
+            ConfirmationOutcome::Prompt
+        );
+    }
+
+    #[test]
+    fn confirmation_requires_yes_off_a_terminal() {
+        assert_eq!(
+            confirmation_outcome(true, false, false),
+            ConfirmationOutcome::RequireYes
+        );
+    }
+
+    #[test]
+    fn blocks_prune_on_a_running_container() {
+        assert!(blocks_prune(1, 0, false));
+    }
+
+    #[test]
+    fn blocks_prune_on_a_live_process() {
+        assert!(blocks_prune(0, 1, false));
+    }
+
+    #[test]
+    fn blocks_prune_allows_a_fully_dead_workspace() {
+        assert!(!blocks_prune(0, 0, false));
+    }
+
+    #[test]
+    fn force_live_overrides_the_liveness_guard() {
+        assert!(!blocks_prune(3, 2, true));
+    }
+
+    #[test]
+    fn live_resource_summary_pluralizes_each_kind_independently() {
+        assert_eq!(live_resource_summary(1, 0), "1 running container");
+        assert_eq!(live_resource_summary(2, 0), "2 running containers");
+        assert_eq!(live_resource_summary(0, 1), "1 live run= process");
+        assert_eq!(live_resource_summary(0, 2), "2 live run= processes");
+        assert_eq!(
+            live_resource_summary(1, 1),
+            "1 running container and 1 live run= process"
+        );
+    }
+
+    fn container_with_state(state: Option<ContainerSummaryStateEnum>) -> ContainerSummary {
+        ContainerSummary {
+            state,
+            ..ContainerSummary::default()
+        }
+    }
+
+    #[test]
+    fn count_running_containers_counts_only_the_running_state() {
+        let containers = vec![
+            container_with_state(Some(ContainerSummaryStateEnum::RUNNING)),
+            container_with_state(Some(ContainerSummaryStateEnum::EXITED)),
+            container_with_state(None),
+        ];
+        assert_eq!(count_running_containers(&containers), 1);
+    }
+
+    #[test]
+    fn count_running_containers_is_zero_for_an_empty_list() {
+        assert_eq!(count_running_containers(&[]), 0);
+    }
+
+    fn process_entry(
+        pid: std::num::NonZeroU32,
+        identity: Option<crate::proc::ProcessIdentity>,
+    ) -> crate::service::ServiceStateEntry {
+        crate::service::ServiceStateEntry {
+            backend: Backend::Process { pid, identity },
+            ports: std::collections::HashMap::new(),
+        }
+    }
+
+    fn state_with(name: &str, entry: crate::service::ServiceStateEntry) -> ServiceState {
+        let mut services = std::collections::HashMap::new();
+        services.insert(name.to_string(), entry);
+        ServiceState {
+            services,
+            auto_ports: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn count_live_processes_counts_a_matching_identity() {
+        let pid = std::num::NonZeroU32::new(std::process::id())
+            .expect("the test process has a nonzero pid");
+        let identity = proc::identity(pid).expect("the test process should expose an identity");
+
+        let state = state_with("web", process_entry(pid, Some(identity)));
+
+        assert_eq!(count_live_processes(&state), 1);
+    }
+
+    #[test]
+    fn count_live_processes_ignores_a_mismatched_identity() {
+        let pid = std::num::NonZeroU32::new(std::process::id())
+            .expect("the test process has a nonzero pid");
+        let mut stale_identity =
+            proc::identity(pid).expect("the test process should expose an identity");
+        // Diverge the recorded command line from the real one, standing in for
+        // a PID that got reused by an unrelated process.
+        stale_identity
+            .cmd
+            .push("not-actually-this-test".to_string());
+
+        let state = state_with("web", process_entry(pid, Some(stale_identity)));
+
+        assert_eq!(count_live_processes(&state), 0);
+    }
+
+    #[test]
+    fn count_live_processes_ignores_a_backend_with_no_recorded_identity() {
+        let pid = std::num::NonZeroU32::new(std::process::id())
+            .expect("the test process has a nonzero pid");
+
+        let state = state_with("web", process_entry(pid, None));
+
+        // Legacy state without an identity is a liveness warning, not a
+        // liveness *count*: `terminate_live_processes` handles that case, but
+        // it must not silently block a prune the way a matched identity does.
+        assert_eq!(count_live_processes(&state), 0);
+    }
+
+    #[test]
+    fn count_live_processes_ignores_a_non_process_backend() {
+        let state = state_with(
+            "db",
+            crate::service::ServiceStateEntry {
+                backend: Backend::Container {
+                    id: "abc123".to_string(),
+                },
+                ports: std::collections::HashMap::new(),
+            },
+        );
+
+        assert_eq!(count_live_processes(&state), 0);
     }
 }

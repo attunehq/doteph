@@ -29,6 +29,6 @@ pub mod workspace;
 
 pub use env::{escape_bash, escape_fish, render, render_export, render_fish, render_json};
 pub use parser::{EphFile, Service, ServiceSource, parse, resolve_interpolations};
-pub use prune::{PruneOptions, PruneReport, prune};
-pub use service::{LogOptions, RunningService, ServiceManager, resolve_env_vars};
+pub use prune::{ConfirmationOutcome, PruneOptions, PruneReport, confirmation_outcome, prune};
+pub use service::{Hooks, LogOptions, RunningService, ServiceManager, resolve_env_vars};
 pub use workspace::Workspace;

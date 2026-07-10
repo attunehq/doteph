@@ -101,11 +101,11 @@ for the full write-up.
 
 | Command | Effect |
 |---------|--------|
-| `eph up [svc...] [--role R]...` | Start all / named services. `--role R` (repeatable) adds a role plus its dependency closure (needs a `roles_order`); combines with names. Runs each service's `pre-start` just before it is created, pulls/builds, waits for health, then runs every `post-start`. Both hook kinds run on **every** `eph up`; a failing hook aborts the `up`. `--skip-hooks` skips both. |
-| `eph down [--rm \| -r] [svc...] [--role R]...` | Stop all / named. `--role R` (repeatable) adds a role plus everything that depends on it. `--rm` also removes containers. Compose is always fully torn down. Runs `pre-stop` before each stop and `post-stop` after; a failing `pre-stop` aborts with the service left running, a failing `post-stop` aborts the rest. `--skip-hooks` bypasses both. |
-| `eph clean` | Full reset: remove containers + named volumes + state. Deletes data. Runs teardown hooks like `eph down`; `--skip-hooks` bypasses them. |
-| `eph system prune [--dry-run] [--compatibility-v042]` | Global prune of resources whose recorded workspace path is missing or empty. Verifies `run=` process identity before killing a PID; warns and skips when it cannot. |
-| `eph dev [svc] [--clean] [--watch GLOB]...` | Foreground the stack for a preview server: up + seed + foreground the `run=` app; teardown of what it started on stop. |
+| `eph up [svc...] [--role R]...` | Start all / named services. `--role R` (repeatable) adds a role plus its dependency closure (needs a `roles_order`); combines with names. Runs each service's `pre-start` just before it is created, pulls/builds, waits for health, then runs every `post-start`. Both hook kinds run on **every** `eph up`; a failing hook aborts the `up`. `--skip-hooks` skips both. Serializes with any other `eph up`/`down`/`clean` already running in the same workspace instead of racing it. |
+| `eph down [--rm \| -r] [svc...] [--role R]...` | Stop all / named. `--role R` (repeatable) adds a role plus everything that depends on it. `--rm` also removes containers. Compose is always fully torn down (a failed `docker compose down` is now a real error, not swallowed). Runs `pre-stop` before each stop and `post-stop` after; a failing `pre-stop` aborts with the service left running, a failing `post-stop` aborts the rest. `--skip-hooks` bypasses both. **A bare `eph down` (no names) also tears down anything `state.json` remembers starting under a name no longer in the `.eph` file** (a renamed or deleted section); a targeted `eph down <svc>` only accepts names still in the file. |
+| `eph clean` | Full reset: remove containers + named volumes + state. Deletes data. Also sweeps recorded-but-renamed/deleted services and any leftover `eph-<short_id>-*` container/volume Docker still has. Prints **measured** counts (what was actually stopped/removed, not what is declared); a never-started workspace reports zeros. Runs teardown hooks like `eph down`; `--skip-hooks` bypasses them. |
+| `eph system prune [--dry-run] [--compatibility-v042] [--force-live] [-y\|--yes]` | Global prune of resources whose recorded workspace path is missing or empty. Verifies `run=` process identity before killing a PID; warns and skips when it cannot. Skips (does not force-kill) a stale-pathed workspace that still has a running container or live process unless `--force-live`; confirms before deleting unless `--dry-run`, `--yes`, or nothing would be removed (required when stdin is not a terminal). |
+| `eph dev [svc] [--clean] [--watch GLOB]... [--skip-hooks]` | Foreground the stack for a preview server: up + seed + foreground the `run=` app; teardown of what it started on stop. Hooks are interleaved exactly like `eph up` (each backing service's `pre-start` runs right before it starts, the foreground app's `pre-start` runs right before it starts, then every service's `post-start` runs once everything is up). `--skip-hooks` skips all four hook phases, matching `eph up --skip-hooks` / `eph down --skip-hooks`. |
 | `eph run <cmd>...` | Run a command in the workspace root with the resolved env + `EPH_*` metadata. Exits with the command's code. |
 | `eph logs [svc] [-f] [-n N]` | Show logs. No svc: all services interleaved, each line tagged `[name]`. One svc: raw. Works even for stopped services. `-f` follows. |
 | `eph status` | Running services and ports. |
@@ -180,7 +180,7 @@ when generating a `.eph` file: `eph check` rejects it and names both fixes
 | Key | Notes |
 |-----|-------|
 | `port=` / `port.<name>=` | Single / named ports. `auto` is valid for `run=` services only. Illegal on `compose=` (use `expose.<name>=`). |
-| `env.<KEY>=` | Container env (not shell env). One value per distinct `KEY`. |
+| `env.<KEY>=` | Container env (not shell env). One value per distinct `KEY`. May contain `${service.property}`, resolved against running services for every source (`image`, `dockerfile`, `compose`, `run`) at the moment that service starts. |
 | `volume=` | `name:/path` = named volume; `./host:/path` or `/abs:/path` = bind mount. Repeatable. |
 | `role=` | Tier name for roles mode; requires a `roles_order` listing every role. |
 | `command=` | Override container CMD (shell-word split, no shell). Only legal for `image=`/`dockerfile=`; a parse error on `run=`/`compose=`. |
@@ -206,6 +206,15 @@ services resolve, including `compose` (tracked by the
 `com.docker.compose.project` label); reference a compose service's
 `expose.<name>=` port as `${svc.port.<name>}`.
 
+Resolved values are **host-facing** (`${svc.port}` is the host's loopback
+port). That is correct for a hook, `eph run`, or a `run=` process, all of
+which execute on the host, but usually wrong for one container reaching
+another: a container's own `env.X=...${sibling.port}` resolves to a
+`localhost:PORT` string that, from inside that container, points back at
+itself. Reach a sibling container from inside another container via
+`host.docker.internal` or a shared Docker network, not through this
+interpolation.
+
 ## Behaviors that matter
 
 - **Idempotent up** (image/dockerfile): running is reused,
@@ -226,6 +235,12 @@ services resolve, including `compose` (tracked by the
 - **Windows runs natively**: `run=`, hooks, and shell health checks go
   through `cmd /C` (vs `sh -c` on Unix), so command strings may need a
   `cmd`-compatible form. WSL keeps POSIX command strings working.
+- **State survives crashes.** `state.json` is saved after each service
+  starts (not once at the end), so a failed `eph up` still leaves `eph down`
+  able to find and stop whatever did start. A corrupt `state.json` is
+  quarantined to `state.json.corrupt` with a warning rather than blocking the
+  command. `eph up`/`down`/`clean` on one workspace serialize against each
+  other via an OS lock that a crashed process can never leave stuck.
 
 ## Safe defaults for automation
 

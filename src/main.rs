@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eph::parser::{self, EphFile, ServiceSource};
 use eph::{
-    LogOptions, PruneOptions, PruneReport, RunningService, ServiceManager, Workspace, skills,
+    Hooks, LogOptions, PruneOptions, PruneReport, RunningService, ServiceManager, Workspace, skills,
 };
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
@@ -136,6 +136,11 @@ enum Commands {
         /// bare process bounce. Without `--watch` the stack never restarts.
         #[arg(long = "watch", value_name = "GLOB")]
         watch: Vec<String>,
+
+        /// Bring the stack up and tear it down without running any lifecycle
+        /// hooks, matching `eph up --skip-hooks` / `eph down --skip-hooks`.
+        #[arg(long = "skip-hooks")]
+        skip_hooks: bool,
     },
 
     /// Show status of services
@@ -239,6 +244,18 @@ enum SystemCommand {
         /// Also prune state directories written by eph v0.4.2 and earlier.
         #[arg(long)]
         compatibility_v042: bool,
+
+        /// Remove a stale workspace's resources even if it still has running
+        /// containers or a live `run=` process. Without this, a workspace
+        /// whose recorded path is gone only because it was moved or renamed
+        /// (not truly deleted) is reported and left alone instead of
+        /// force-killed.
+        #[arg(long)]
+        force_live: bool,
+
+        /// Skip the removal confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -315,7 +332,9 @@ async fn main() -> Result<ExitCode> {
             SystemCommand::Prune {
                 dry_run,
                 compatibility_v042,
-            } => cmd_system_prune(dry_run, compatibility_v042)
+                force_live,
+                yes,
+            } => cmd_system_prune(dry_run, compatibility_v042, force_live, yes)
                 .await
                 .map(|()| ExitCode::SUCCESS),
         },
@@ -323,7 +342,8 @@ async fn main() -> Result<ExitCode> {
             service,
             clean,
             watch,
-        } => cmd_dev(service, clean, watch).await,
+            skip_hooks,
+        } => cmd_dev(service, clean, watch, skip_hooks).await,
         Commands::Status => cmd_status().await.map(|()| ExitCode::SUCCESS),
         Commands::Env { format } => cmd_env(&format).await.map(|()| ExitCode::SUCCESS),
         Commands::Run { command } => cmd_run(command).await,
@@ -413,7 +433,7 @@ async fn cmd_up(services: Vec<String>, roles: Vec<String>, skip_hooks: bool) -> 
     let mut manager = ServiceManager::new(workspace).await?;
 
     let running = manager
-        .start_services(&eph, &service_filter, skip_hooks)
+        .start_services(&eph, &service_filter, Hooks::from_skip_flag(skip_hooks))
         .await?;
 
     // Print summary in declaration order (iterate the .eph definitions rather
@@ -490,10 +510,68 @@ async fn cmd_clean(skip_hooks: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_system_prune(dry_run: bool, compatibility_v042: bool) -> Result<()> {
-    let report = eph::prune(PruneOptions {
-        dry_run,
+/// `eph system prune`: report what would be torn down for stale workspaces,
+/// then (unless `--dry-run`) confirm and actually tear it down.
+///
+/// A plain `--dry-run` request is a single pass: list, print, done. A real
+/// prune runs the exact same listing pass first (`dry_run: true` under the
+/// hood) so the confirmation prompt shows precisely what is about to be
+/// removed, including any workspace the liveness guard would skip; only after
+/// that plan is shown and confirmed does a second pass, with `dry_run: false`,
+/// perform the removal. The two passes can in principle race with something
+/// changing on disk or in Docker between them, but `prune` already re-checks
+/// each workspace's staleness right before acting on it, the same protection
+/// a single dry-run-then-prompt-then-act flow would need anyway.
+async fn cmd_system_prune(
+    dry_run: bool,
+    compatibility_v042: bool,
+    force_live: bool,
+    yes: bool,
+) -> Result<()> {
+    let options = PruneOptions {
+        dry_run: true,
         compatibility_v042,
+        force_live,
+    };
+
+    if dry_run {
+        let report = eph::prune(options).await?;
+        print_prune_report(&report);
+        return Ok(());
+    }
+
+    let preview = eph::prune(options).await?;
+    print_prune_report(&preview);
+
+    match eph::confirmation_outcome(!preview.totals.is_empty(), yes, io::stdin().is_terminal()) {
+        eph::ConfirmationOutcome::Proceed => {}
+        eph::ConfirmationOutcome::RequireYes => {
+            anyhow::bail!(
+                "stdin is not a terminal, so system prune cannot prompt for confirmation; pass -y/--yes to remove these resources without asking"
+            );
+        }
+        eph::ConfirmationOutcome::Prompt => {
+            print!("\nRemove these resources? [y/N] ");
+            io::stdout()
+                .flush()
+                .context("failed to write the prune confirmation prompt")?;
+
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .context("failed to read the prune confirmation")?;
+            let answer = answer.trim();
+            if !answer.eq_ignore_ascii_case("y") && !answer.eq_ignore_ascii_case("yes") {
+                println!("Aborted; nothing removed.");
+                return Ok(());
+            }
+        }
+    }
+
+    let report = eph::prune(PruneOptions {
+        dry_run: false,
+        compatibility_v042,
+        force_live,
     })
     .await?;
     print_prune_report(&report);
@@ -590,7 +668,12 @@ enum DevStop {
 /// watcher should, since editing is exactly when the app is most likely to
 /// crash. Without `--watch` that same exit is reported as a failure and ends
 /// `eph dev`, so a preview server sees the dev server went down.
-async fn cmd_dev(service: Option<String>, clean: bool, watch: Vec<String>) -> Result<ExitCode> {
+async fn cmd_dev(
+    service: Option<String>,
+    clean: bool,
+    watch: Vec<String>,
+    skip_hooks: bool,
+) -> Result<ExitCode> {
     let workspace = Workspace::find_from_cwd()?;
     // The watcher matches globs relative to the workspace root, so capture it
     // before `workspace` is moved into the manager.
@@ -654,7 +737,8 @@ async fn cmd_dev(service: Option<String>, clean: bool, watch: Vec<String>) -> Re
     // dev` behavior.
     let mut first = true;
     loop {
-        let (mut child, gate) = dev_bring_up(&mut manager, &eph, &foreground, gate_port).await?;
+        let (mut child, gate) =
+            dev_bring_up(&mut manager, &eph, &foreground, gate_port, skip_hooks).await?;
 
         announce_serving(&manager, &foreground, clean, &watch, first, gate_port).await;
         first = false;
@@ -680,7 +764,7 @@ async fn cmd_dev(service: Option<String>, clean: bool, watch: Vec<String>) -> Re
 
         match stop {
             DevStop::Signal => {
-                final_teardown(&mut manager, &eph, clean, &brought_up).await?;
+                final_teardown(&mut manager, &eph, clean, &brought_up, skip_hooks).await?;
                 // Reap the foreground child we just tore down.
                 let _ = child.wait().await;
                 return Ok(ExitCode::SUCCESS);
@@ -707,7 +791,7 @@ async fn cmd_dev(service: Option<String>, clean: bool, watch: Vec<String>) -> Re
                 eprintln!("dev server '{foreground}' {how}; waiting for a change to restart");
                 tokio::select! {
                     () = wait_for_shutdown() => {
-                        final_teardown(&mut manager, &eph, clean, &brought_up).await?;
+                        final_teardown(&mut manager, &eph, clean, &brought_up, skip_hooks).await?;
                         return Ok(ExitCode::SUCCESS);
                     }
                     path = watcher.changed_or_pending() => {
@@ -749,13 +833,16 @@ async fn final_teardown(
     eph: &EphFile,
     clean: bool,
     brought_up: &[String],
+    skip_hooks: bool,
 ) -> Result<()> {
     eprintln!();
     if clean {
-        manager.clean(eph, false).await?;
+        manager.clean(eph, skip_hooks).await?;
         eprintln!("Workspace cleaned");
     } else {
-        manager.stop_selected(eph, brought_up, false, false).await?;
+        manager
+            .stop_selected(eph, brought_up, false, skip_hooks)
+            .await?;
         eprintln!("Services stopped");
     }
     Ok(())
@@ -787,34 +874,41 @@ async fn dev_bring_up(
     eph: &EphFile,
     foreground: &str,
     gate_port: Option<u16>,
+    skip_hooks: bool,
 ) -> Result<(tokio::process::Child, Option<tokio::task::JoinHandle<()>>)> {
-    // Run every service's pre-start hooks before anything comes up, so codegen or
-    // other prep the app needs to compile finishes first. The backing/foreground
-    // split below drives startup by hand (bypassing `start_services`' interleaved
-    // pre-start), so this is where dev honors the hook. It runs on every pass, so
-    // a watch-triggered restart re-runs pre-start along with the rest of the stack.
-    manager.run_all_pre_start(eph).await?;
-
     // Two steps so the foreground app inherits eph's stdio. First bring the
-    // backing services up (no hooks yet: pre-start already ran above, post-start
-    // is deferred to run_all_post_start); then start the app in the foreground.
-    // `start_services` with an empty filter would start everything, so only call
-    // it when there is at least one backing service.
+    // backing services up with `eph up`'s exact hook interleaving (each
+    // service's pre-start runs just before that service is created, so it can
+    // reference the services already up); post-start is deferred below so it
+    // can also reference the foreground app. Then start the app in the
+    // foreground, running its own pre-start immediately before it, again
+    // matching `up`. `start_services` with an empty filter would start
+    // everything, so only call it when there is at least one backing service.
     let backing: Vec<String> = eph
         .services
         .keys()
         .filter(|name| *name != foreground)
         .cloned()
         .collect();
+    let hooks = if skip_hooks {
+        Hooks::None
+    } else {
+        Hooks::PreStartOnly
+    };
     if !backing.is_empty() {
-        manager.start_services(eph, &backing, true).await?;
+        manager.start_services(eph, &backing, hooks).await?;
+    }
+    if !skip_hooks {
+        manager.run_pre_start_for(eph, foreground).await?;
     }
     let (fg, child) = manager.start_foreground(eph, foreground).await?;
 
     // Everything is healthy now, so run post-start hooks (seeding) for every
     // service, preserving the `eph up` rule that a hook may reference any
     // service's assigned port.
-    manager.run_all_post_start(eph).await?;
+    if !skip_hooks {
+        manager.run_all_post_start(eph).await?;
+    }
 
     // Seeding is done, so open the preview-facing gate. Binding $PORT here, and
     // not one step earlier, is the whole point: the preview server watches this

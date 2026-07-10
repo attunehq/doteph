@@ -283,12 +283,15 @@ ad-hoc queries) -- unlike `post-start`, it runs every time you invoke it.
 
 `eph dev` runs the whole stack in the foreground for a Claude Desktop preview
 server (`.claude/launch.json`), which launches one command and watches its port
-but has no setup or teardown hook. `eph dev` fills both: it runs
-`pre-start` hooks (e.g. codegen), brings every service up, foregrounds a `run=`
-app with eph's own stdin, stdout, and stderr wired through to it, runs
-`post-start` (seeding), and on stop tears the stack down -- `eph down` by
-default, or `eph clean` with `--clean` (each running `pre-stop` then
-`post-stop`).
+but has no setup or teardown hook. `eph dev` fills both: it brings up the
+backing services (each one's `pre-start` running right before it starts, same
+interleaving as `eph up`), runs the foregrounded app's own `pre-start`, starts
+a `run=` app with eph's own stdin, stdout, and stderr wired through to it, runs
+every service's `post-start` (seeding) once everything is up, and on stop tears
+the stack down -- `eph down` by default, or `eph clean` with `--clean` (each
+running `pre-stop` then `post-stop`). Pass `--skip-hooks` to skip all four hook
+phases for the whole session, matching `eph up --skip-hooks` /
+`eph down --skip-hooks`.
 
 **Running `eph dev` yourself? Launch it in the background.** `eph dev` foregrounds
 the app and does not return until the app exits, so running it as an ordinary

@@ -26,6 +26,11 @@ dirs = "6"
 # plain `C:\...` path whenever one exists (the common case), keeping the verbatim
 # prefix only for paths that genuinely require it. On Unix it is std::fs::canonicalize.
 dunce = "1"
+# Cross-platform OS advisory file locks (flock / LockFileEx) guarding the
+# per-workspace state file and `eph system prune` against concurrent runs. An
+# OS lock releases automatically when the holding process dies, so a crashed
+# command can never wedge the next one the way a create-new lock file can.
+fd-lock = "4"
 # `eph update` unpacks the release `.tar.gz`. flate2's default `miniz_oxide`
 # backend is pure Rust (no zlib/C), so the updater adds no system dependency and
 # keeps every cross target building as cleanly as the rest of eph does.

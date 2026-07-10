@@ -209,6 +209,28 @@ pub(crate) enum Backend {
 }
 
 impl Backend {
+    /// True if a recorded `Process` backend still refers to the process it
+    /// tracked: the PID is alive and, when an identity was recorded at spawn
+    /// time, that identity still matches. Guards every liveness probe against
+    /// PID reuse; a bare `is_alive` would happily claim an unrelated process
+    /// that inherited the number after a reboot, and teardown would then
+    /// signal that innocent process. Backends other than `Process` return
+    /// `false` (they have no PID to probe).
+    fn process_is_alive(&self) -> bool {
+        let Backend::Process { pid, identity } = self else {
+            return false;
+        };
+        if !proc::is_alive(*pid) {
+            return false;
+        }
+        match identity {
+            Some(expected) => proc::identity_matches(*pid, expected),
+            // Legacy state (written before identities were recorded): PID
+            // presence is the best signal available.
+            None => true,
+        }
+    }
+
     /// Parse a pre-typed-`Backend` state id back into a [`Backend`].
     ///
     /// Earlier versions stored a single `container_id` string that encoded the
@@ -289,7 +311,15 @@ impl<'de> Deserialize<'de> for ServiceStateEntry {
 }
 
 impl ServiceState {
-    /// Load state from disk
+    /// Load state from disk.
+    ///
+    /// A missing file is an empty state. A file that exists but does not parse
+    /// (a crash mid-write before atomic saves existed, manual editing, disk
+    /// corruption) is quarantined rather than fatal: the broken file is moved
+    /// aside to `state.json.corrupt` and an empty state is returned, so `eph
+    /// clean` (the reset everyone reaches for at that point) can still run.
+    /// Teardown recovers the containers themselves from Docker by name, so the
+    /// only thing genuinely lost with the file is any `run=` service's PID.
     pub(crate) async fn load(workspace: &Workspace) -> Result<Self> {
         let path = state_file_path(workspace)?;
 
@@ -301,13 +331,33 @@ impl ServiceState {
             .await
             .with_context(|| format!("failed to read state file: {}", path.display()))?;
 
-        let state: ServiceState = serde_json::from_str(&contents)
-            .with_context(|| format!("failed to parse state file: {}", path.display()))?;
-
-        Ok(state)
+        match serde_json::from_str(&contents) {
+            Ok(state) => Ok(state),
+            Err(e) => {
+                let quarantine = path.with_extension("json.corrupt");
+                warn!(
+                    "state file {} is corrupt ({}); moving it to {} and continuing \
+                     with empty state. Containers are recovered from Docker by \
+                     name, but a `run=` service started before the corruption may \
+                     need to be stopped by hand.",
+                    path.display(),
+                    e,
+                    quarantine.display()
+                );
+                tokio::fs::rename(&path, &quarantine)
+                    .await
+                    .with_context(|| {
+                        format!("failed to quarantine corrupt state file {}", path.display())
+                    })?;
+                Ok(ServiceState::default())
+            }
+        }
     }
 
-    /// Save state to disk
+    /// Save state to disk atomically: serialize to a sibling temp file, then
+    /// rename it over the real one, so a crash mid-write can never leave a
+    /// truncated `state.json` behind (rename replaces the destination on both
+    /// Unix and Windows).
     pub(crate) async fn save(&self, workspace: &Workspace) -> Result<()> {
         let path = state_file_path(workspace)?;
 
@@ -320,11 +370,79 @@ impl ServiceState {
 
         let contents = serde_json::to_string_pretty(self).context("failed to serialize state")?;
 
-        tokio::fs::write(&path, contents)
+        let tmp = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp, contents)
             .await
-            .with_context(|| format!("failed to write state file: {}", path.display()))?;
+            .with_context(|| format!("failed to write state file: {}", tmp.display()))?;
+        tokio::fs::rename(&tmp, &path)
+            .await
+            .with_context(|| format!("failed to replace state file: {}", path.display()))?;
 
         Ok(())
+    }
+}
+
+/// An exclusive, per-workspace lock over state-mutating commands (`up`,
+/// `down`, `clean`), held for the duration of the operation.
+///
+/// Backed by an OS advisory lock (`flock` / `LockFileEx`) on a file in the
+/// workspace's state directory, so it releases automatically when the process
+/// exits for any reason: a killed `eph up` can never wedge the next command.
+/// Two overlapping `eph up` runs used to each spawn services and then race
+/// their `state.json` writes, with the loser's processes leaked untracked;
+/// with the lock the second command simply waits.
+pub(crate) struct WorkspaceLock {
+    lock: fd_lock::RwLock<std::fs::File>,
+}
+
+impl WorkspaceLock {
+    /// Open (creating if needed) the lock file for `workspace`.
+    ///
+    /// The file lives NEXT TO the workspace's state directory, not inside it:
+    /// `eph clean` deletes the state directory while holding this lock, and on
+    /// Windows a directory cannot be fully removed while an open, locked file
+    /// lives in it.
+    pub(crate) fn open(workspace: &Workspace) -> Result<Self> {
+        let dir = workspace.state_dir()?;
+        let parent = dir
+            .parent()
+            .context("workspace state directory has no parent")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create state root: {}", parent.display()))?;
+        let dir_name = dir
+            .file_name()
+            .context("workspace state directory has no name")?
+            .to_string_lossy()
+            .into_owned();
+        let path = parent.join(format!("{dir_name}.lock"));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("failed to open workspace lock: {}", path.display()))?;
+        Ok(Self {
+            lock: fd_lock::RwLock::new(file),
+        })
+    }
+
+    /// Acquire the exclusive lock, blocking until it is free. Logs a notice
+    /// first when another eph command currently holds it, so a user watching a
+    /// stalled `eph up` knows what it is waiting for.
+    pub(crate) fn acquire(&mut self) -> Result<fd_lock::RwLockWriteGuard<'_, std::fs::File>> {
+        // Probe without blocking purely to decide whether to log the notice; a
+        // probe guard acquired here is dropped immediately and the real
+        // acquisition below re-takes the lock.
+        match self.lock.try_write() {
+            Ok(_probe) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                info!("another eph command is running in this workspace; waiting for it");
+            }
+            Err(e) => return Err(e).context("failed to acquire workspace lock"),
+        }
+        self.lock
+            .write()
+            .context("failed to acquire workspace lock")
     }
 }
 
@@ -1117,8 +1235,9 @@ impl DockerClient {
         Ok(())
     }
 
-    /// Stop a container
-    pub(crate) async fn stop_container(&self, name: &str) -> Result<()> {
+    /// Stop a container. Returns `true` if a running container was actually
+    /// stopped, `false` if there was nothing running under that name.
+    pub(crate) async fn stop_container(&self, name: &str) -> Result<bool> {
         if let Some(info) = self.get_container(name).await?
             && info.is_running
         {
@@ -1130,12 +1249,14 @@ impl DockerClient {
                 )
                 .await
                 .context("failed to stop container")?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
-    /// Remove a container
-    pub(crate) async fn remove_container(&self, name: &str) -> Result<()> {
+    /// Remove a container. Returns `true` if a container existed and was
+    /// removed, `false` if there was nothing under that name.
+    pub(crate) async fn remove_container(&self, name: &str) -> Result<bool> {
         if let Some(info) = self.get_container(name).await? {
             info!("Removing container {}", name);
             self.client
@@ -1145,12 +1266,14 @@ impl DockerClient {
                 )
                 .await
                 .context("failed to remove container")?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
-    /// Remove a named volume, ignoring "not found" errors
-    pub(crate) async fn remove_volume(&self, name: &str) -> Result<()> {
+    /// Remove a named volume, ignoring "not found" errors. Returns `true` if
+    /// the volume existed and was removed, `false` if it was already gone.
+    pub(crate) async fn remove_volume(&self, name: &str) -> Result<bool> {
         use bollard::errors::Error as BollardError;
 
         info!("Removing volume {}", name);
@@ -1162,13 +1285,55 @@ impl DockerClient {
             )
             .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(true),
             // Volume already gone (or never created) - treat as success.
             Err(BollardError::DockerResponseServerError {
                 status_code: 404, ..
-            }) => Ok(()),
+            }) => Ok(false),
             Err(e) => Err(e).with_context(|| format!("failed to remove volume {}", name)),
         }
+    }
+
+    /// Names of all containers (running or not) whose name starts with
+    /// `prefix`. Docker reports names with a leading `/`, which is stripped.
+    /// Used by `eph clean`'s leftover sweep.
+    pub(crate) async fn containers_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let containers = self
+            .client
+            .list_containers(Some(ListContainersOptionsBuilder::new().all(true).build()))
+            .await
+            .context("failed to list containers")?;
+        let mut names = Vec::new();
+        for container in containers {
+            for name in container.names.unwrap_or_default() {
+                let name = name.strip_prefix('/').unwrap_or(&name);
+                if name.starts_with(prefix) {
+                    names.push(name.to_string());
+                    break;
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    /// Names of all volumes whose name starts with `prefix`. Used by `eph
+    /// clean`'s leftover sweep.
+    pub(crate) async fn volumes_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        let volumes = self
+            .client
+            .list_volumes(None::<bollard::query_parameters::ListVolumesOptions>)
+            .await
+            .context("failed to list volumes")?;
+        let mut names: Vec<String> = volumes
+            .volumes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| v.name)
+            .filter(|name| name.starts_with(prefix))
+            .collect();
+        names.sort();
+        Ok(names)
     }
 
     /// Execute a command inside a running container
@@ -1231,6 +1396,7 @@ impl DockerClient {
         service: &Service,
         workspace: &Workspace,
         cmd: Option<Vec<String>>,
+        running: &HashMap<String, RunningService>,
     ) -> Result<(RunningService, String)> {
         // Pull image if needed
         self.ensure_image(image).await?;
@@ -1256,10 +1422,16 @@ impl DockerClient {
         }
 
         // Build environment variables
+        // Resolve `${service.property}` references in env values against the
+        // services already up, exactly as the `run=` path does (`app_env`).
+        // These used to be passed into the container verbatim, so the same
+        // documented syntax silently shipped a literal `${postgres.port}`
+        // string. Note the resolved host/port are as seen FROM THE HOST;
+        // container-to-container traffic may need `host.docker.internal`.
         let env: Vec<String> = service
             .env
             .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
+            .map(|(k, v)| format!("{}={}", k, resolve_against(v, running)))
             .collect();
 
         // Build volume bindings
@@ -1333,6 +1505,7 @@ impl DockerClient {
         service: &Service,
         workspace: &Workspace,
         cmd: Option<Vec<String>>,
+        running: &HashMap<String, RunningService>,
     ) -> Result<(RunningService, String)> {
         let image_tag = format!("eph-{}-{}", workspace.short_id, service.name);
 
@@ -1372,7 +1545,7 @@ impl DockerClient {
         }
 
         // Now run like a normal image
-        self.run_image(container_name, &image_tag, service, workspace, cmd)
+        self.run_image(container_name, &image_tag, service, workspace, cmd, running)
             .await
     }
 
@@ -1402,6 +1575,35 @@ impl DockerClient {
 // ============================================================================
 // Service Manager
 // ============================================================================
+
+/// Which lifecycle hooks a bring-up runs.
+///
+/// `eph up` uses [`All`](Hooks::All) (or [`None`](Hooks::None) under
+/// `--skip-hooks`). [`PreStartOnly`](Hooks::PreStartOnly) exists for `eph
+/// dev`, which starts its backing services first and the foreground app after:
+/// pre-start hooks stay interleaved per service exactly as under `up`, but the
+/// post-start phase is deferred until the app is up too, preserving the rule
+/// that a post-start hook may reference any service's assigned port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hooks {
+    /// Run pre-start hooks interleaved per service and post-start hooks once
+    /// everything is healthy.
+    All,
+    /// Run no hooks at all (`--skip-hooks`).
+    None,
+    /// Run pre-start hooks interleaved per service, but skip the post-start
+    /// phase; the caller runs it later via
+    /// [`ServiceManager::run_all_post_start`].
+    PreStartOnly,
+}
+
+impl Hooks {
+    /// The hooks `eph up`-style commands run for a `--skip-hooks` flag.
+    #[must_use]
+    pub fn from_skip_flag(skip_hooks: bool) -> Self {
+        if skip_hooks { Hooks::None } else { Hooks::All }
+    }
+}
 
 /// Manager for all services in a workspace.
 ///
@@ -1445,7 +1647,7 @@ impl ServiceManager {
     /// Returns an error if any service fails to start or if state cannot be
     /// saved.
     pub async fn start_all(&mut self, eph: &EphFile) -> Result<HashMap<String, RunningService>> {
-        self.start_services(eph, &[], false).await
+        self.start_services(eph, &[], Hooks::All).await
     }
 
     /// Start the requested services (or all of them when `filter` is empty),
@@ -1474,8 +1676,7 @@ impl ServiceManager {
     /// `INSERT ... ON CONFLICT` seed); use [`eph run`](crate) for one-off,
     /// non-idempotent operations.
     ///
-    /// When `skip_hooks` is true, both hook phases are skipped entirely: services
-    /// are brought up healthy but no `pre-start` or `post-start` hooks run.
+    /// `hooks` selects which hook phases run; see [`Hooks`].
     ///
     /// # Errors
     ///
@@ -1487,8 +1688,17 @@ impl ServiceManager {
         &mut self,
         eph: &EphFile,
         filter: &[String],
-        skip_hooks: bool,
+        hooks: Hooks,
     ) -> Result<HashMap<String, RunningService>> {
+        // One state-mutating eph command per workspace at a time. Without this,
+        // two overlapping `eph up` runs each spawn services and race their
+        // state writes, and the loser's processes leak untracked.
+        let mut lock = WorkspaceLock::open(&self.workspace)?;
+        let _guard = lock.acquire()?;
+        // Re-read state under the lock: another command may have finished
+        // between this manager's construction and lock acquisition.
+        self.state = ServiceState::load(&self.workspace).await?;
+
         // Resolve the target set: every service, or just the requested ones (in
         // the order requested). post-start hooks run in a second phase once all
         // of these are healthy, so the phase-1 start order does not affect
@@ -1534,19 +1744,21 @@ impl ServiceManager {
         let mut resolved = self.status().await?;
         for name in &targets {
             let service = &eph.services[*name];
-            if !skip_hooks {
+            if matches!(hooks, Hooks::All | Hooks::PreStartOnly) {
                 self.run_service_pre_start(eph, &resolved, service).await?;
             }
-            let result = self.create_service(name, service, eph).await?;
+            let result = self.create_service(name, service, eph, &resolved).await?;
+            // Persist after every service, not once at the end: if a later
+            // target's pre-start hook or creation fails, `eph up` exits with
+            // this in-memory state discarded, and anything not yet on disk is
+            // a process or container that `eph down` cannot see. run= services
+            // used to leak exactly this way.
+            self.state.save(&self.workspace).await?;
             resolved.insert((*name).clone(), result.clone());
             running.insert((*name).clone(), result);
         }
 
-        // Persist before running hooks so a hook that itself shells out to eph,
-        // or that fails, leaves accurate state behind.
-        self.state.save(&self.workspace).await?;
-
-        if skip_hooks {
+        if !matches!(hooks, Hooks::All) {
             return Ok(running);
         }
 
@@ -1568,7 +1780,7 @@ impl ServiceManager {
     /// A no-op when the service declares no hooks. Runs before the service is
     /// created, so the resolved environment reflects only the services already
     /// up (never the service's own port). Shared by the `eph up` first phase and
-    /// by [`run_all_pre_start`](Self::run_all_pre_start).
+    /// by [`run_pre_start_for`](Self::run_pre_start_for).
     async fn run_service_pre_start(
         &self,
         eph: &EphFile,
@@ -1588,27 +1800,26 @@ impl ServiceManager {
         Ok(())
     }
 
-    /// Run every declared service's `pre-start` hooks once, before any service
-    /// is brought up.
+    /// Run a single named service's `pre-start` hooks against the services
+    /// currently up.
     ///
-    /// `eph dev` calls this before starting its backing services and foregrounded
-    /// app, so preparatory work (codegen the app needs to compile) finishes
-    /// first. Unlike `eph up`, where each `pre-start` runs interleaved in start
-    /// order, here every hook runs up front against whatever is already up
-    /// (nothing, on a cold `eph dev`), so a `pre-start` cannot reference a
-    /// sibling's port. That is an acceptable trade for the codegen use case,
-    /// which needs no running services.
+    /// `eph dev` calls this for the foreground app immediately before starting
+    /// it, mirroring `eph up`'s interleaving: the hook sees every backing
+    /// service already up (so `${postgres.port}` resolves), never the app's own
+    /// not-yet-assigned port. `eph dev` used to run every service's pre-start
+    /// up front instead, before anything existed, so the same hook resolved
+    /// differently under `dev` than under `up`.
     ///
     /// # Errors
     ///
-    /// Returns an error if any `pre-start` hook fails.
-    pub async fn run_all_pre_start(&self, eph: &EphFile) -> Result<()> {
+    /// Returns an error if the service is unknown or a `pre-start` hook fails.
+    pub async fn run_pre_start_for(&self, eph: &EphFile, name: &str) -> Result<()> {
+        let service = eph
+            .services
+            .get(name)
+            .with_context(|| format!("unknown service: {name}"))?;
         let running = self.status().await?;
-        for name in start_order(eph) {
-            self.run_service_pre_start(eph, &running, &eph.services[name])
-                .await?;
-        }
-        Ok(())
+        self.run_service_pre_start(eph, &running, service).await
     }
 
     /// Run one service's `post-start` hooks against an already-resolved set of
@@ -1684,6 +1895,7 @@ impl ServiceManager {
         name: &str,
         service: &Service,
         eph: &EphFile,
+        running: &HashMap<String, RunningService>,
     ) -> Result<RunningService> {
         let container_name = self.workspace.container_name(name);
 
@@ -1701,7 +1913,7 @@ impl ServiceManager {
         if matches!(service.source, ServiceSource::Command(_))
             && let Some(entry) = self.state.services.get(name)
             && let Backend::Process { pid, .. } = &entry.backend
-            && proc::is_alive(*pid)
+            && entry.backend.process_is_alive()
         {
             info!("Service {} already running (PID {})", name, pid);
             return Ok(RunningService {
@@ -1775,7 +1987,14 @@ impl ServiceManager {
             ServiceSource::Image(image) => {
                 let (r, id) = self
                     .docker
-                    .run_image(&container_name, image, service, &self.workspace, command)
+                    .run_image(
+                        &container_name,
+                        image,
+                        service,
+                        &self.workspace,
+                        command,
+                        running,
+                    )
                     .await?;
 
                 // Wait for health check
@@ -1793,6 +2012,7 @@ impl ServiceManager {
                         service,
                         &self.workspace,
                         command,
+                        running,
                     )
                     .await?;
 
@@ -1804,7 +2024,9 @@ impl ServiceManager {
             ServiceSource::Command(cmd) => {
                 self.start_shell_command(name, cmd, service, eph).await?
             }
-            ServiceSource::Compose(path) => self.start_compose(name, path, service).await?,
+            ServiceSource::Compose(path) => {
+                self.start_compose(name, path, service, running).await?
+            }
         };
 
         // Record in state
@@ -2195,6 +2417,7 @@ impl ServiceManager {
         name: &str,
         compose_path: &str,
         service: &Service,
+        running: &HashMap<String, RunningService>,
     ) -> Result<(RunningService, Backend)> {
         let compose_file = self.workspace.path.join(compose_path);
         let project_name = format!("eph-{}-{}", self.workspace.short_id, name);
@@ -2204,6 +2427,17 @@ impl ServiceManager {
             name,
             compose_file.display()
         );
+
+        // The service's env.X values, with ${service.property} references
+        // resolved, exported into `docker compose`'s process environment.
+        // Compose files consume them through their own `${VAR}` substitution.
+        // env.X on a compose service used to be dropped entirely (never even
+        // read), so the documented syntax silently did nothing here.
+        let compose_env: Vec<(String, String)> = service
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), resolve_against(v, running)))
+            .collect();
 
         // Start compose
         let output = TokioCommand::new("docker")
@@ -2216,6 +2450,7 @@ impl ServiceManager {
                 "up",
                 "-d",
             ])
+            .envs(compose_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .current_dir(&self.workspace.path)
             .output()
             .await
@@ -2234,7 +2469,9 @@ impl ServiceManager {
                 .clone()
                 .unwrap_or_else(|| "default".to_string());
 
-            // Try to get the actual mapped port from docker compose
+            // Try to get the actual mapped port from docker compose. Same
+            // environment as the `up` call, so a compose file whose structure
+            // depends on those variables parses identically.
             let port_output = TokioCommand::new("docker")
                 .args([
                     "compose",
@@ -2246,6 +2483,7 @@ impl ServiceManager {
                     &port_name,
                     &port_mapping.container_port.to_string(),
                 ])
+                .envs(compose_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .output()
                 .await;
 
@@ -2262,7 +2500,16 @@ impl ServiceManager {
                 }
             }
 
-            // Fallback to declared port
+            // `docker compose port` failed or did not parse. Fall back to the
+            // declared container port, but say so: compose normally maps to a
+            // random host port, so this fallback value is usually wrong and a
+            // connection string interpolating it will not reach the service.
+            warn!(
+                "could not resolve the host port for '{}' port '{}' via `docker \
+                 compose port`; using the declared container port {} (this is \
+                 probably not the mapped host port)",
+                name, port_name, port_mapping.container_port
+            );
             ports.insert(port_name, port_mapping.container_port);
         }
 
@@ -2297,7 +2544,8 @@ impl ServiceManager {
         ))
     }
 
-    /// Stop all services, clear in-memory state, and persist the result.
+    /// Stop all services (declared ones plus any recorded in state under a
+    /// name no longer in the `.eph` file) and persist the result.
     ///
     /// When `remove` is true, also remove containers (and compose resources) so
     /// they do not accumulate.
@@ -2307,6 +2555,12 @@ impl ServiceManager {
     /// Returns an error if stopping a service fails (see
     /// [`stop_service`](Self::stop_service)) or if state cannot be saved.
     pub async fn stop_all(&mut self, eph: &EphFile, remove: bool, skip_hooks: bool) -> Result<()> {
+        let mut lock = WorkspaceLock::open(&self.workspace)?;
+        let _guard = lock.acquire()?;
+        // Re-read state under the lock: it was loaded when this manager was
+        // constructed, and another command may have finished in between.
+        self.state = ServiceState::load(&self.workspace).await?;
+
         // Snapshot the running services once, before any teardown, so every
         // pre-stop and post-stop hook sees the full environment as it was when
         // `down` began.
@@ -2320,7 +2574,14 @@ impl ServiceManager {
             self.stop_service(name, service, remove, eph, &running, skip_hooks)
                 .await?;
         }
-        self.state.services.clear();
+        // State may also record services whose sections were renamed or
+        // deleted since they started; stop those too, from their recorded
+        // backends. Each stop_service/stop_orphan call removed its own state
+        // entry, so there is no wholesale clear (which would silently forget
+        // anything that failed to stop above).
+        for name in self.orphaned_state_entries(eph) {
+            self.stop_orphan(&name, remove).await?;
+        }
         self.state.save(&self.workspace).await?;
         Ok(())
     }
@@ -2341,6 +2602,11 @@ impl ServiceManager {
         remove: bool,
         skip_hooks: bool,
     ) -> Result<()> {
+        let mut lock = WorkspaceLock::open(&self.workspace)?;
+        let _guard = lock.acquire()?;
+        // Re-read state under the lock (see stop_all).
+        self.state = ServiceState::load(&self.workspace).await?;
+
         let wanted: HashSet<&str> = targets.iter().map(String::as_str).collect();
         // Snapshot running services once so every pre-stop/post-stop hook sees the
         // full environment as it was before teardown began.
@@ -2362,18 +2628,21 @@ impl ServiceManager {
     ///
     /// When `remove` is true, also remove the underlying container after
     /// stopping it (compose uses `down`, which already removes containers;
-    /// killing a `run` process already removes it). The process/compose teardown
-    /// itself is best-effort and logged rather than propagated, so a stale or
-    /// already-stopped service does not error.
+    /// killing a `run` process already removes it).
     ///
     /// When `skip_hooks` is true, neither `pre-stop` nor `post-stop` hooks run --
     /// the escape hatch for a broken hook that would otherwise wedge teardown.
+    ///
+    /// Returns `true` when something was actually stopped or removed, `false`
+    /// when the service turned out not to be up (so callers can report honest
+    /// counts instead of counting declared services).
     ///
     /// # Errors
     ///
     /// Returns an error if a `pre-stop` hook fails (the service is left running
     /// so the hook can be retried), if a Docker stop or remove call fails for an
-    /// `image`/`dockerfile` service, or if a `post-stop` hook fails (the service
+    /// `image`/`dockerfile` service, if `docker compose down` fails for a
+    /// compose service that was up, or if a `post-stop` hook fails (the service
     /// is already stopped by then).
     pub async fn stop_service(
         &mut self,
@@ -2383,7 +2652,7 @@ impl ServiceManager {
         eph: &EphFile,
         running: &HashMap<String, RunningService>,
         skip_hooks: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Run pre-stop hooks with the resolved environment, the same way
         // post-start hooks receive it. A failing hook aborts the teardown
         // (before the service is stopped), mirroring how a failing post-start
@@ -2404,56 +2673,93 @@ impl ServiceManager {
             }
         }
 
-        match &service.source {
+        let stopped_something = match &service.source {
             ServiceSource::Command(_) => {
                 // Kill the process, reading its PID from the recorded backend.
-                if let Some(ServiceStateEntry {
-                    backend: Backend::Process { pid, .. },
-                    ..
-                }) = self.state.services.get(name)
+                if let Some(entry) = self.state.services.get(name)
+                    && let Backend::Process { pid, .. } = &entry.backend
                 {
                     let pid = *pid;
-                    info!("Stopping process {} (PID {})", name, pid);
-                    // Ask it to terminate gracefully (SIGTERM on Unix,
-                    // TerminateProcess on Windows). Best-effort: the process may
-                    // already have exited (stale PID), in which case this is a
-                    // no-op, so any failure is intentionally ignored.
-                    proc::terminate(pid);
-                    // Wait a bit then force-kill if it ignored the request. Same
-                    // best-effort rationale: a process that is already gone is a
-                    // no-op.
-                    sleep(Duration::from_secs(2)).await;
-                    proc::force_kill(pid);
+                    if entry.backend.process_is_alive() {
+                        info!("Stopping process {} (PID {})", name, pid);
+                        // Ask it to terminate gracefully (SIGTERM on Unix,
+                        // TerminateProcess on Windows), then force-kill if it
+                        // ignored the request. Both are best-effort: a process
+                        // that exits in between is a no-op.
+                        proc::terminate(pid);
+                        sleep(Duration::from_secs(2)).await;
+                        proc::force_kill(pid);
+                        true
+                    } else {
+                        // Either already exited, or the PID now belongs to an
+                        // unrelated process (identity mismatch). Never signal
+                        // it; just drop the stale entry below.
+                        debug!(
+                            "process for {} (PID {}) is already gone or reused; \
+                             nothing to stop",
+                            name, pid
+                        );
+                        false
+                    }
+                } else {
+                    false
                 }
             }
             ServiceSource::Compose(path) => {
-                let compose_file = self.workspace.path.join(path);
-                let project_name = format!("eph-{}-{}", self.workspace.short_id, name);
-
-                info!("Stopping docker-compose service {}", name);
-                // Best-effort teardown: if the compose project is already down
-                // (or was never brought up) `docker compose down` reports an
-                // error we cannot act on here, so it is intentionally ignored.
-                let _ = TokioCommand::new("docker")
-                    .args([
-                        "compose",
-                        "-f",
-                        &compose_file.to_string_lossy(),
-                        "-p",
-                        &project_name,
-                        "down",
-                    ])
-                    .output()
-                    .await;
+                // Only invoke `docker compose down` when eph has any record of
+                // the project being up; a never-started service is a no-op,
+                // matching the container path below. When it does run, a
+                // failure is a real error (a broken compose file, a missing
+                // compose plugin) and propagates: this used to be swallowed
+                // wholesale, so `eph down` reported success while the compose
+                // containers kept running.
+                if running.contains_key(name) || self.state.services.contains_key(name) {
+                    let compose_file = self.workspace.path.join(path);
+                    let project_name = format!("eph-{}-{}", self.workspace.short_id, name);
+                    info!("Stopping docker-compose service {}", name);
+                    // Same env the compose file was brought up with, so its
+                    // `${VAR}` substitutions parse the same way on the way down.
+                    let compose_env: Vec<(String, String)> = service
+                        .env
+                        .iter()
+                        .map(|(k, v)| (k.clone(), resolve_against(v, running)))
+                        .collect();
+                    let output = TokioCommand::new("docker")
+                        .args([
+                            "compose",
+                            "-f",
+                            &compose_file.to_string_lossy(),
+                            "-p",
+                            &project_name,
+                            "down",
+                        ])
+                        .envs(compose_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                        .output()
+                        .await
+                        .context("failed to run docker compose down")?;
+                    if !output.status.success() {
+                        bail!(
+                            "`docker compose down` failed for service '{}':\n{}",
+                            name,
+                            String::from_utf8_lossy(&output.stderr).trim_end()
+                        );
+                    }
+                    true
+                } else {
+                    false
+                }
             }
             _ => {
                 let container_name = self.workspace.container_name(name);
-                self.docker.stop_container(&container_name).await?;
-                if remove {
-                    self.docker.remove_container(&container_name).await?;
-                }
+                let stopped = self.docker.stop_container(&container_name).await?;
+                let removed = if remove {
+                    self.docker.remove_container(&container_name).await?
+                } else {
+                    false
+                };
+                stopped || removed
             }
-        }
+        };
 
         self.state.services.remove(name);
 
@@ -2478,7 +2784,83 @@ impl ServiceManager {
             }
         }
 
-        Ok(())
+        Ok(stopped_something)
+    }
+
+    /// Stop a service that exists only in recorded state, not in the current
+    /// `.eph` file (its section was renamed or deleted since it started).
+    /// Teardown works entirely from the recorded [`Backend`]; there is no
+    /// [`Service`] definition anymore, so no hooks run and no volumes are
+    /// known. These entries used to be invisible to `down` and `clean` (both
+    /// iterated only declared services and then cleared state wholesale), so
+    /// renaming a running service leaked its container permanently.
+    ///
+    /// Returns `true` when something was actually stopped or removed.
+    async fn stop_orphan(&mut self, name: &str, remove: bool) -> Result<bool> {
+        let Some(entry) = self.state.services.get(name) else {
+            return Ok(false);
+        };
+        info!(
+            "Stopping '{}', which is no longer defined in .eph but is recorded \
+             as started by eph",
+            name
+        );
+        let stopped = match entry.backend.clone() {
+            Backend::Process { pid, .. } => {
+                if entry.backend.process_is_alive() {
+                    proc::terminate(pid);
+                    sleep(Duration::from_secs(2)).await;
+                    proc::force_kill(pid);
+                    true
+                } else {
+                    false
+                }
+            }
+            Backend::Compose { project } => {
+                // No compose file path is recorded, but `docker compose down`
+                // resolves the project's containers from their labels, so `-p`
+                // alone is enough to tear it down.
+                let output = TokioCommand::new("docker")
+                    .args(["compose", "-p", &project, "down"])
+                    .output()
+                    .await
+                    .context("failed to run docker compose down")?;
+                if !output.status.success() {
+                    bail!(
+                        "`docker compose down` failed for removed service '{}':\n{}",
+                        name,
+                        String::from_utf8_lossy(&output.stderr).trim_end()
+                    );
+                }
+                true
+            }
+            Backend::Container { .. } => {
+                let container_name = self.workspace.container_name(name);
+                let stopped = self.docker.stop_container(&container_name).await?;
+                let removed = if remove {
+                    self.docker.remove_container(&container_name).await?
+                } else {
+                    false
+                };
+                stopped || removed
+            }
+        };
+        self.state.services.remove(name);
+        Ok(stopped)
+    }
+
+    /// Names present in recorded state but absent from the `.eph` file, in a
+    /// stable order.
+    fn orphaned_state_entries(&self, eph: &EphFile) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .state
+            .services
+            .keys()
+            .filter(|name| !eph.services.contains_key(*name))
+            .cloned()
+            .collect();
+        names.sort();
+        names
     }
 
     /// Fully reset the workspace: stop and remove every service's container
@@ -2496,6 +2878,11 @@ impl ServiceManager {
     /// `skip_hooks`), if stopping a service, removing a named volume, or deleting
     /// the state directory fails.
     pub async fn clean(&mut self, eph: &EphFile, skip_hooks: bool) -> Result<CleanSummary> {
+        let mut lock = WorkspaceLock::open(&self.workspace)?;
+        let _guard = lock.acquire()?;
+        // Re-read state under the lock (see stop_all).
+        self.state = ServiceState::load(&self.workspace).await?;
+
         let mut summary = CleanSummary::default();
 
         // Snapshot running services once so pre-stop and post-stop hooks see the
@@ -2503,13 +2890,18 @@ impl ServiceManager {
         let running = self.status().await?;
 
         // Reverse of the actual start order, matching `stop_all`: tear a
-        // dependent down before the dependency it relies on.
+        // dependent down before the dependency it relies on. The summary counts
+        // what was actually stopped or removed, not what the file declares: a
+        // `clean` of a workspace that never ran reports zeros.
         for name in start_order(eph).into_iter().rev() {
             let service = &eph.services[name];
             // Stop and remove the underlying resource for this service.
-            self.stop_service(name, service, true, eph, &running, skip_hooks)
-                .await?;
-            summary.services_removed += 1;
+            if self
+                .stop_service(name, service, true, eph, &running, skip_hooks)
+                .await?
+            {
+                summary.services_removed += 1;
+            }
 
             // Remove per-workspace named volumes. A volume entry is a named
             // volume (not a bind mount) when its source is not a host path (see
@@ -2525,7 +2917,35 @@ impl ServiceManager {
                     continue; // bind mount, not a managed named volume
                 }
                 let volume_name = self.workspace.volume_name(name, base);
-                self.docker.remove_volume(&volume_name).await?;
+                if self.docker.remove_volume(&volume_name).await? {
+                    summary.volumes_removed += 1;
+                }
+            }
+        }
+
+        // Stop anything recorded in state under a name no longer in the file
+        // (a renamed or deleted section).
+        for name in self.orphaned_state_entries(eph) {
+            if self.stop_orphan(&name, true).await? {
+                summary.services_removed += 1;
+            }
+        }
+
+        // Finally, sweep Docker itself for leftovers carrying this workspace's
+        // name prefix: containers and volumes from a service that was renamed
+        // before state recorded it, or from a crash before state was written.
+        // `clean` promises a full reset, so it cannot trust state (or the
+        // current .eph file) to know everything that exists.
+        let prefix = format!("eph-{}-", self.workspace.short_id);
+        for container in self.docker.containers_with_prefix(&prefix).await? {
+            info!("Removing leftover container {}", container);
+            if self.docker.remove_container(&container).await? {
+                summary.services_removed += 1;
+            }
+        }
+        for volume in self.docker.volumes_with_prefix(&prefix).await? {
+            info!("Removing leftover volume {}", volume);
+            if self.docker.remove_volume(&volume).await? {
                 summary.volumes_removed += 1;
             }
         }
@@ -2688,8 +3108,9 @@ impl ServiceManager {
                     self.docker.compose_project_running(project).await?
                 }
                 // run= services are tracked by PID; probe it the same way
-                // `eph up`'s dedup check does.
-                Backend::Process { pid, .. } => proc::is_alive(*pid),
+                // `eph up`'s dedup check does, identity included, so a PID
+                // reused by an unrelated process does not read as "running".
+                Backend::Process { .. } => entry.backend.process_is_alive(),
                 Backend::Container { .. } => {
                     let container_name = self.workspace.container_name(name);
                     self.docker
@@ -3107,7 +3528,16 @@ impl ServiceManager {
         service: &Service,
     ) -> Vec<(String, String)> {
         let mut env = self.command_env(eph, running);
-        env.extend(service.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+        // Resolve ${service.property} in the service's own env values, exactly
+        // as the values the service itself received were resolved. A hook used
+        // to get them raw, so `env.PORT=${web.port}` read as the literal
+        // placeholder inside the very service's own post-start hook.
+        env.extend(
+            service
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), resolve_against(v, running))),
+        );
         env
     }
 
@@ -3126,8 +3556,21 @@ impl ServiceManager {
             .with_context(|| format!("failed to execute hook: {}", cmd))?;
 
         if !output.status.success() {
+            // Surface both streams: plenty of tools (migrators especially)
+            // print the useful diagnostic to stdout, and reporting only stderr
+            // used to hide it.
+            let mut detail = String::new();
+            let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("hook failed: {}\n{}", cmd, stderr);
+            if !stdout.trim().is_empty() {
+                detail.push_str("\nstdout:\n");
+                detail.push_str(stdout.trim_end());
+            }
+            if !stderr.trim().is_empty() {
+                detail.push_str("\nstderr:\n");
+                detail.push_str(stderr.trim_end());
+            }
+            bail!("hook failed: {}{}", cmd, detail);
         }
 
         Ok(())
