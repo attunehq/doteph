@@ -288,9 +288,9 @@ fn process_tree(system: &System, root: Pid) -> Vec<Pid> {
 /// fall back to a hard kill. Best-effort throughout: a process that has already
 /// exited is a no-op.
 ///
-/// A child spawned after the snapshot can still escape this walk, the accepted
-/// limitation of snapshot-based teardown (the Unix process-group path does not
-/// have it).
+/// Descendants are stopped before their parents. Keeping the ancestry intact
+/// until each child has been addressed prevents Windows from reparenting a live
+/// child out of the captured tree during teardown.
 fn signal_tree(pid: NonZeroU32, signal: Signal) {
     // A full snapshot is needed (not just `pid`): the parent links of every
     // process are what let us find the descendants to signal. Only the bare
@@ -301,7 +301,10 @@ fn signal_tree(pid: NonZeroU32, signal: Signal) {
     let mut system = System::new();
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
 
-    for target in process_tree(&system, Pid::from_u32(pid.get())) {
+    for target in process_tree(&system, Pid::from_u32(pid.get()))
+        .into_iter()
+        .rev()
+    {
         if let Some(process) = system.process(target)
             && process.kill_with(signal).is_none()
         {
