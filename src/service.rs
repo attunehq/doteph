@@ -4257,6 +4257,10 @@ mod tests {
     use super::*;
     use crate::parser::EnvVar;
 
+    /// These tests release and reclaim OS-assigned ports. Serializing them keeps
+    /// one test from occupying another test's candidate between those operations.
+    static PORT_ALLOCATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn running_with(name: &str, port: u16) -> HashMap<String, RunningService> {
         HashMap::from([(
             name.to_string(),
@@ -4420,6 +4424,7 @@ mod tests {
 
     #[test]
     fn allocate_ports_assigns_distinct_free_ports_for_auto() {
+        let _guard = PORT_ALLOCATION_TEST_LOCK.lock().unwrap();
         let declared = vec![
             auto_port(None),
             auto_port(Some("hmr")),
@@ -4438,6 +4443,7 @@ mod tests {
 
     #[test]
     fn allocate_ports_reuses_previous_free_port() {
+        let _guard = PORT_ALLOCATION_TEST_LOCK.lock().unwrap();
         // Pick a port the OS just told us is free, then ask for an auto port with
         // that as the previous assignment: it should be reused for a stable URL.
         let free = std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -4453,6 +4459,7 @@ mod tests {
 
     #[test]
     fn allocate_ports_skips_busy_previous_port() {
+        let _guard = PORT_ALLOCATION_TEST_LOCK.lock().unwrap();
         // Hold a port so it is not bindable, then offer it as the previous
         // assignment: allocation must fall back to a different, free port.
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
