@@ -600,7 +600,7 @@ impl ServiceBuilder {
                     .map_or_else(|| "port".to_string(), |n| format!("port.{n}"));
                 bail!(
                     "compose service '{}' declares `{}`; compose services name \
-                     their ports with `expose.<name>=<container-port>` instead",
+                     their ports with `expose.<alias>=<compose-service>:<container-port>` instead",
                     self.name,
                     which
                 );
@@ -1764,13 +1764,10 @@ where
 /// consumed by [`resolve_interpolations`] before `resolver` is ever called for
 /// it), so it never appears in the returned list.
 ///
-/// This is `eph env`'s hook into resolution: unlike every other `${...}`
-/// consumer (lifecycle hooks, `eph run`, a service's own `env.` entries), which
-/// all leave an unresolved reference verbatim so a hook that runs before its
-/// referenced service starts still gets a placeholder it can recognize, `eph
-/// env`'s output is meant to be handed straight to `eval`. A literal `${...}`
-/// there would break the caller's shell, so its caller needs to know which
-/// variables to omit instead.
+/// Lifecycle consumers use this tracked result to reject incomplete values
+/// before launching a process, container, hook, or health check. `eph env` also
+/// needs the affected variable names so shell output can clear stale values and
+/// JSON can omit incomplete entries before the command returns failure.
 ///
 /// # Examples
 ///

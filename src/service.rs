@@ -3093,166 +3093,182 @@ impl ServiceManager {
         service: &Service,
         running: &HashMap<String, RunningService>,
     ) -> Result<(RunningService, Backend)> {
-        let compose_file = self.workspace.path.join(compose_path);
         let project_name = format!("eph-{}-{}", self.workspace.short_id, name);
+        let mut compose_was_invoked = false;
+        let attempt: Result<RunningService> = async {
+            let compose_file = self.workspace.path.join(compose_path);
 
-        info!(
-            "Starting docker-compose service {} from {}",
-            name,
-            compose_file.display()
-        );
+            info!(
+                "Starting docker-compose service {} from {}",
+                name,
+                compose_file.display()
+            );
 
-        // The service's env.X values, with ${service.property} references
-        // resolved, exported into `docker compose`'s process environment.
-        // Compose files consume them through their own `${VAR}` substitution.
-        // env.X on a compose service used to be dropped entirely (never even
-        // read), so the documented syntax silently did nothing here.
-        let compose_env: BTreeMap<String, String> = resolve_service_env_strict(service, running)?
-            .into_iter()
-            .collect();
+            // The service's env.X values, with ${service.property} references
+            // resolved, exported into `docker compose`'s process environment.
+            // Compose files consume them through their own `${VAR}` substitution.
+            // env.X on a compose service used to be dropped entirely (never even
+            // read), so the documented syntax silently did nothing here.
+            let compose_env: BTreeMap<String, String> =
+                resolve_service_env_strict(service, running)?
+                    .into_iter()
+                    .collect();
 
-        // Start compose
-        let output = TokioCommand::new("docker")
-            .args([
-                "compose",
-                "-f",
-                &compose_file.to_string_lossy(),
-                "-p",
-                &project_name,
-                "up",
-                "-d",
-            ])
-            .envs(&compose_env)
-            .current_dir(&self.workspace.path)
-            .output()
-            .await
-            .context("failed to run docker compose")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("docker compose failed:\n{}", stderr);
-        }
-
-        // Get port mappings from compose
-        let mut ports = HashMap::new();
-        for port_mapping in &service.ports {
-            let PortMapping::Compose {
-                alias,
-                service: compose_service,
-                port: container_port,
-            } = port_mapping
-            else {
-                bail!("compose service '{}' contains a non-Compose port", name);
-            };
-
-            // Try to get the actual mapped port from docker compose. Same
-            // environment as the `up` call, so a compose file whose structure
-            // depends on those variables parses identically.
-            let port_output = TokioCommand::new("docker")
+            // Start compose
+            compose_was_invoked = true;
+            let output = TokioCommand::new("docker")
                 .args([
                     "compose",
                     "-f",
                     &compose_file.to_string_lossy(),
                     "-p",
                     &project_name,
-                    "port",
-                    compose_service,
-                    &container_port.to_string(),
+                    "up",
+                    "-d",
                 ])
                 .envs(&compose_env)
+                .current_dir(&self.workspace.path)
                 .output()
                 .await
-                .with_context(|| {
-                    format!(
-                        "failed to query Compose port '{}:{}' for service '{}'",
-                        compose_service, container_port, name
-                    )
-                })?;
+                .context("failed to run docker compose")?;
 
-            if !port_output.status.success() {
-                let stderr = String::from_utf8_lossy(&port_output.stderr);
-                bail!(
-                    "could not resolve Compose port '{}:{}' for service '{}': {}",
-                    compose_service,
-                    container_port,
-                    name,
-                    stderr.trim()
-                );
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                bail!("docker compose failed:\n{}", stderr);
             }
 
-            let port_text = String::from_utf8_lossy(&port_output.stdout);
-            let host_port = port_text
-                .trim()
-                .rsplit(':')
-                .next()
-                .and_then(|port| port.parse::<u16>().ok())
-                .filter(|port| *port != 0)
-                .with_context(|| {
-                    format!(
-                        "docker compose returned an invalid host port for '{}:{}': {}",
+            // Get port mappings from compose
+            let mut ports = HashMap::new();
+            for port_mapping in &service.ports {
+                let PortMapping::Compose {
+                    alias,
+                    service: compose_service,
+                    port: container_port,
+                } = port_mapping
+                else {
+                    bail!("compose service '{}' contains a non-Compose port", name);
+                };
+
+                // Try to get the actual mapped port from docker compose. Same
+                // environment as the `up` call, so a compose file whose structure
+                // depends on those variables parses identically.
+                let port_output = TokioCommand::new("docker")
+                    .args([
+                        "compose",
+                        "-f",
+                        &compose_file.to_string_lossy(),
+                        "-p",
+                        &project_name,
+                        "port",
+                        compose_service,
+                        &container_port.to_string(),
+                    ])
+                    .envs(&compose_env)
+                    .output()
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to query Compose port '{}:{}' for service '{}'",
+                            compose_service, container_port, name
+                        )
+                    })?;
+
+                if !port_output.status.success() {
+                    let stderr = String::from_utf8_lossy(&port_output.stderr);
+                    bail!(
+                        "could not resolve Compose port '{}:{}' for service '{}': {}",
                         compose_service,
                         container_port,
-                        port_text.trim()
-                    )
-                })?;
-            ports.insert(alias.clone(), host_port);
+                        name,
+                        stderr.trim()
+                    );
+                }
+
+                let port_text = String::from_utf8_lossy(&port_output.stdout);
+                let host_port = port_text
+                    .trim()
+                    .rsplit(':')
+                    .next()
+                    .and_then(|port| port.parse::<u16>().ok())
+                    .filter(|port| *port != 0)
+                    .with_context(|| {
+                        format!(
+                            "docker compose returned an invalid host port for '{}:{}': {}",
+                            compose_service,
+                            container_port,
+                            port_text.trim()
+                        )
+                    })?;
+                ports.insert(alias.clone(), host_port);
+            }
+
+            // Wait for health check if specified
+            if let Some(ref healthcheck) = service.healthcheck {
+                let mut health_running = running.clone();
+                health_running.insert(
+                    name.to_string(),
+                    RunningService {
+                        name: name.to_string(),
+                        ports: ports.clone(),
+                    },
+                );
+                let command = resolve_value_strict(
+                    &healthcheck.command,
+                    &health_running,
+                    &format!("healthcheck of service '{name}'"),
+                )?;
+                let timeout_dur = Duration::from_secs(
+                    healthcheck
+                        .timeout_secs
+                        .map_or(60, std::num::NonZeroU64::get),
+                );
+                let readiness =
+                    wait_until_ready(name, timeout_dur, Duration::from_secs(2), async || {
+                        let output = proc::shell_command(&command)
+                            .current_dir(&self.workspace.path)
+                            .envs(&compose_env)
+                            .output()
+                            .await?;
+
+                        if output.status.success() {
+                            info!("Service {} is healthy", name);
+                            return Ok(Some(()));
+                        }
+
+                        debug!("Health check for {} failed, retrying...", name);
+                        Ok(None)
+                    })
+                    .await;
+                readiness?;
+            }
+
+            Ok(RunningService {
+                name: name.to_string(),
+                ports,
+            })
         }
+        .await;
 
-        // Wait for health check if specified
-        if let Some(ref healthcheck) = service.healthcheck {
-            let mut health_running = running.clone();
-            health_running.insert(
-                name.to_string(),
-                RunningService {
-                    name: name.to_string(),
-                    ports: ports.clone(),
+        match attempt {
+            Ok(running) => Ok((
+                running,
+                Backend::Compose {
+                    project: project_name,
                 },
-            );
-            let command = resolve_value_strict(
-                &healthcheck.command,
-                &health_running,
-                &format!("healthcheck of service '{name}'"),
-            )?;
-            let timeout_dur = Duration::from_secs(
-                healthcheck
-                    .timeout_secs
-                    .map_or(60, std::num::NonZeroU64::get),
-            );
-            let readiness =
-                wait_until_ready(name, timeout_dur, Duration::from_secs(2), async || {
-                    let output = proc::shell_command(&command)
-                        .current_dir(&self.workspace.path)
-                        .envs(&compose_env)
-                        .output()
-                        .await?;
-
-                    if output.status.success() {
-                        info!("Service {} is healthy", name);
-                        return Ok(Some(()));
-                    }
-
-                    debug!("Health check for {} failed, retrying...", name);
-                    Ok(None)
-                })
-                .await;
-            if let Err(error) = readiness {
+            )),
+            Err(error) if !compose_was_invoked => Err(error),
+            Err(error) => {
                 let backend = Backend::Compose {
                     project: project_name.clone(),
                 };
-                self.discard_failed_start(name, &backend).await?;
-                return Err(error);
+                if let Err(cleanup_error) = self.discard_failed_start(name, &backend).await {
+                    return Err(error.context(format!(
+                        "also failed to remove Compose project '{project_name}' after startup failure: {cleanup_error:#}"
+                    )));
+                }
+                Err(error)
             }
         }
-
-        Ok((
-            RunningService {
-                name: name.to_string(),
-                ports,
-            },
-            Backend::Compose {
-                project: project_name,
-            },
-        ))
     }
 
     /// Stop all services (declared ones plus any recorded in state under a
@@ -4330,6 +4346,37 @@ mod tests {
                 "cost is ${db.port} dollars".to_string(),
             )]
         );
+    }
+
+    #[test]
+    fn strict_service_environment_rejects_a_stopped_dependency() {
+        let eph = crate::parser::parse(
+            "[db]\nrun=sleep 300\nport=5432\n\n[web]\nrun=sleep 300\nenv.DATABASE_URL=postgres://localhost:${db.port}/app\n",
+        )
+        .unwrap();
+
+        let error = resolve_service_env_strict(&eph.services["web"], &HashMap::new()).unwrap_err();
+
+        assert_eq!(error.unresolved[0].name, "DATABASE_URL");
+        assert_eq!(
+            error.unresolved[0].references,
+            vec![UnresolvedReference {
+                service: "db".to_string(),
+                property: "port".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn strict_healthcheck_resolution_preserves_shell_variables() {
+        let command = resolve_value_strict(
+            "curl http://localhost:${api.port}/health -H ${TOKEN}",
+            &running_with("api", 4100),
+            "healthcheck",
+        )
+        .unwrap();
+
+        assert_eq!(command, "curl http://localhost:4100/health -H ${TOKEN}");
     }
 
     fn port(name: Option<&str>, container_port: u16) -> PortMapping {
