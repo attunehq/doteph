@@ -126,9 +126,8 @@ impl Updater {
     /// Build an updater honoring the `EPH_REPO` and `EPH_BASE_URL` overrides the
     /// install scripts also respect.
     pub fn new() -> Self {
-        let repo = env_nonempty("EPH_REPO").unwrap_or_else(|| DEFAULT_REPO.to_string());
         Self::with_endpoints(
-            repo,
+            effective_repo(),
             "https://api.github.com".to_string(),
             env_nonempty("EPH_BASE_URL"),
         )
@@ -346,6 +345,18 @@ fn env_nonempty(key: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// The `owner/repo` eph's network calls target, honoring `EPH_REPO`.
+///
+/// Shared by [`Updater::new`], the passive update-check nag, and the
+/// background refresh worker, so all three agree on which repo's releases
+/// they mean, and therefore, via [`cache_path`], on which cache file to
+/// read and write. Before this was centralized, `eph update` and the passive
+/// nag each independently read `EPH_REPO` in different modules; a single
+/// shared source keeps that from drifting apart.
+fn effective_repo() -> String {
+    env_nonempty("EPH_REPO").unwrap_or_else(|| DEFAULT_REPO.to_string())
+}
+
 /// How long a cached latest-release lookup stays fresh before the startup check
 /// refreshes it in the background. A day keeps the nag current without checking
 /// on every invocation.
@@ -392,7 +403,8 @@ pub fn warn_if_outdated(current: &str) {
         return;
     }
 
-    let cache = read_cache();
+    let repo = effective_repo();
+    let cache = read_cache(&repo);
 
     // Warn from the last known latest release, before kicking off the refresh
     // that updates it for next time.
@@ -410,10 +422,13 @@ pub fn warn_if_outdated(current: &str) {
     let stale = cache.as_ref().is_none_or(|c| is_stale(c.checked_at, now));
     if stale {
         let latest = cache.map_or_else(|| current.to_string(), |c| c.latest);
-        let _ = write_cache(&CachedCheck {
-            latest,
-            checked_at: now,
-        });
+        let _ = write_cache(
+            &repo,
+            &CachedCheck {
+                latest,
+                checked_at: now,
+            },
+        );
         spawn_background_refresh();
     }
 }
@@ -438,10 +453,13 @@ pub fn run_check_worker() {
     let Ok(latest) = Updater::new().latest_tag() else {
         return;
     };
-    let _ = write_cache(&CachedCheck {
-        latest,
-        checked_at: now_unix(),
-    });
+    let _ = write_cache(
+        &effective_repo(),
+        &CachedCheck {
+            latest,
+            checked_at: now_unix(),
+        },
+    );
 }
 
 /// Spawn a detached `eph __update-check` process that refreshes the cache and
@@ -478,23 +496,50 @@ fn spawn_background_refresh() {
 /// The path of the cross-workspace update-check cache, under the user's cache
 /// directory. `None` when no cache directory can be resolved (a headless or
 /// misconfigured environment), which simply disables the passive check.
-fn cache_path() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("eph").join("update-check.json"))
+///
+/// Namespaced by `repo` (see [`sanitize_repo_for_filename`]) so a fork's
+/// release cache can never poison the default repo's nag, or vice versa: a
+/// user who points `EPH_REPO` at their own fork sees that fork's releases
+/// cached separately from `attunehq/doteph`'s.
+fn cache_path(repo: &str) -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join("eph").join(format!(
+        "update-check-{}.json",
+        sanitize_repo_for_filename(repo)
+    )))
 }
 
-/// Read the cached latest-release lookup, or `None` when it is absent or
-/// unreadable (a corrupt or older-format cache is treated as missing and
-/// refreshed).
-fn read_cache() -> Option<CachedCheck> {
-    let bytes = std::fs::read(cache_path()?).ok()?;
+/// Sanitize an `owner/repo` string into a filesystem-safe filename component.
+///
+/// Anything outside `[A-Za-z0-9._-]` (crucially the `/` between owner and
+/// repo) becomes `-`, so `attunehq/doteph` becomes `attunehq-doteph` and the
+/// result is always a single valid path component on every platform eph runs
+/// on, never a directory separator or a reserved character.
+fn sanitize_repo_for_filename(repo: &str) -> String {
+    repo.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Read the cached latest-release lookup for `repo`, or `None` when it is
+/// absent or unreadable (a corrupt or older-format cache is treated as
+/// missing and refreshed).
+fn read_cache(repo: &str) -> Option<CachedCheck> {
+    let bytes = std::fs::read(cache_path(repo)?).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Write the cache atomically (temp file then rename) so a concurrent reader
-/// never sees a half-written file. A missing cache directory or write error is
-/// returned for the caller to ignore: the passive check is best-effort.
-fn write_cache(cache: &CachedCheck) -> io::Result<()> {
-    let Some(path) = cache_path() else {
+/// Write `repo`'s cache atomically (temp file then rename) so a concurrent
+/// reader never sees a half-written file. A missing cache directory or write
+/// error is returned for the caller to ignore: the passive check is
+/// best-effort.
+fn write_cache(repo: &str, cache: &CachedCheck) -> io::Result<()> {
+    let Some(path) = cache_path(repo) else {
         return Ok(());
     };
     if let Some(dir) = path.parent() {
@@ -582,6 +627,44 @@ mod tests {
         assert!(is_stale(1000, 1000 + CHECK_TTL_SECS));
         // A backward clock jump reads as fresh, not a panic.
         assert!(!is_stale(1000, 500));
+    }
+
+    #[test]
+    fn sanitize_repo_for_filename_replaces_the_slash_and_anything_unsafe() {
+        assert_eq!(
+            sanitize_repo_for_filename("attunehq/doteph"),
+            "attunehq-doteph"
+        );
+        assert_eq!(
+            sanitize_repo_for_filename("some-org/weird repo!"),
+            "some-org-weird-repo-"
+        );
+        // Already-safe characters (letters, digits, `.`, `_`, `-`) pass through.
+        assert_eq!(sanitize_repo_for_filename("a.b_c-9/D0"), "a.b_c-9-D0");
+    }
+
+    #[test]
+    fn different_repos_get_different_cache_paths() {
+        let default_path = cache_path("attunehq/doteph").expect("cache dir resolvable");
+        let fork_path = cache_path("someone/fork").expect("cache dir resolvable");
+        assert_ne!(
+            default_path, fork_path,
+            "distinct repos must never share a cache file"
+        );
+        assert!(
+            default_path
+                .to_string_lossy()
+                .contains("update-check-attunehq-doteph"),
+            "got: {}",
+            default_path.display()
+        );
+        assert!(
+            fork_path
+                .to_string_lossy()
+                .contains("update-check-someone-fork"),
+            "got: {}",
+            fork_path.display()
+        );
     }
 
     #[test]

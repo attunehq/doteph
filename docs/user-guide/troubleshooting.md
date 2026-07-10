@@ -55,28 +55,82 @@ Causes, in rough order of likelihood:
 
 Run `eph -v up` to watch each health-check attempt and its exit code.
 
-## A property was ignored
+## A property was rejected
 
-If a service property seems to have no effect, you probably have a typo. Two
-distinct behaviors, by case:
+Any typo'd or misplaced service property is a hard parse error; `eph check`
+catches it before any `eph up`. Two shapes show up in practice:
 
-- A **lowercase** unknown property is a hard error:
-  `unknown service property 'prot' at line N`. `eph check` catches it.
-- An **UPPERCASE** unknown key is silently reclassified as a top-level
-  environment variable and **ends the section**, with a warning on stderr. So
-  `HEALTHCHECK=pg_isready` (wrong case) becomes a global variable named
-  `HEALTHCHECK`, not a health check, and any lines after it are no longer part
-  of the service. Property names are lowercase: `image`, `port`, `env.X`,
-  `healthcheck`, `post-start`, and so on.
+- **A lowercase typo** is an unknown-property error listing every known
+  property name:
 
-Run `eph -v check` to see the reclassification warnings.
+  ```
+  unknown service property 'prot' at line 5 (known properties: image,
+  dockerfile, compose, run, role, command, port, port.<name>, expose.<name>,
+  env.<KEY>, volume, pre-start, post-start, pre-stop, post-stop, healthcheck,
+  ready-timeout, context)
+  ```
 
-> One reclassification warning is **normal** if you put your top-level
-> variables after your service sections (the layout used throughout this
-> guide): the first variable ends the last section and emits a single warning.
-> The file still parses correctly. Put top-level variables before the sections
-> to silence it. See
-> [The `.eph` File](eph-file.md#where-to-put-top-level-variables).
+  Property names are lowercase: `image`, `port`, `env.X`, `healthcheck`,
+  `post-start`, and so on.
+
+- **An UPPERCASE key inside a section** (the classic `HEALTHCHECK=...` instead
+  of `env.HEALTHCHECK=...`, or a top-level variable you meant to put after this
+  service) is rejected rather than silently absorbed as a top-level variable:
+
+  ```
+  'HEALTHCHECK' at line 5 looks like an environment variable, but it is
+  inside service 'postgres' (sections do not end at blank lines). To set it
+  in the container, write env.HEALTHCHECK=...; to export it from `eph env`,
+  move it into an [env] section or above the first section
+  ```
+
+  The error names both possible intents so you can pick the right fix: prefix
+  it with `env.` if it belongs in the container, or move it into an `[env]`
+  section (or above the first section) if it belongs to your shell. See
+  [Where to put top-level variables](eph-file.md#where-to-put-top-level-variables).
+
+## Something is "duplicate"
+
+Nothing in a `.eph` file is silently merged or overwritten. A repeated
+declaration is a parse error naming both occurrences:
+
+- **A reopened section** (`[db]` appearing twice) does not merge the two
+  blocks; the second `[db]` is rejected, naming the line the first one started
+  on.
+- **A repeated single-valued property** (a second `image=`, `healthcheck=`,
+  `command=`, `ready-timeout=`, or a second source under any spelling, such as
+  `image=` followed by `run=`) is rejected. Hooks and `volume=` are the
+  exception: they are designed to repeat and accumulate.
+- **A repeated port or `env.` key** (`port=` twice, the same `port.<name>=`
+  twice, the same `env.KEY=` twice) is rejected; give each a distinct name
+  instead.
+- **A repeated top-level variable name** is rejected, whether both
+  declarations are above the first section, both inside `[env]` sections, or
+  split across the two: the top-of-file block and every `[env]` section share
+  one namespace.
+
+Give the second occurrence a different name, or delete it if it was a
+leftover from editing.
+
+## An interpolation reference did not parse
+
+`${service.property}` placeholders in a top-level variable or `env.<KEY>=`
+value are validated at parse time, before any `eph up`:
+
+- **`unterminated '${' ...`**: a `${` with no closing `}`. Close it, or if you
+  meant a literal `${`, escape it as `$${`.
+- **`invalid interpolation ... expected ${service.property}`**: the text
+  inside `${...}` has no `.`, so it cannot name a service and a property (for
+  example `${name}` instead of `${web.port}`). Add the missing part, or escape
+  it as `$${` if it was never meant to be a placeholder.
+- **`unknown service '...' referenced from ...`**: the placeholder names a
+  service that is not defined anywhere in the file. Check the spelling against
+  the section header; a service defined later in the file resolves fine, so
+  this is always a genuine typo or a missing section.
+
+These are different from [a port reference that does not resolve](#a-port-reference-did-not-resolve):
+that is a well-formed reference to a real service that just is not running
+right now.
 
 ## An inline comment broke a value
 
@@ -149,6 +203,45 @@ state ever looks wrong, `eph clean` resets the workspace completely (removing
 containers, named volumes, and the state file), after which `eph up` rebuilds
 from scratch.
 
+Renaming or deleting a service's section from the `.eph` file does not orphan
+its container: a bare `eph down` and `eph clean` both also tear down whatever
+`state.json` remembers starting under a name no longer in the file. If you
+still find a container `docker ps -a` shows but `eph status` does not, run
+`eph clean`, which additionally sweeps any leftover container or volume
+carrying the workspace's `eph-<short_id>-` prefix even if state does not know
+about it.
+
+## "state file ... is corrupt"
+
+If `state.json` cannot be parsed (a hand edit, disk corruption, damage from
+something outside eph), the next `eph` command logs a warning, moves the
+broken file aside to `state.json.corrupt`, and continues as if the workspace
+had no recorded state, rather than aborting. Containers and compose projects
+are found again from Docker by name on the next `eph up` or `eph status`; a
+`run=` service's PID is the one thing this cannot recover, since the PID lived
+only in the corrupted file, so stop a leftover `run=` process by hand
+(`docker ps` will not show it) if `eph status` still reports it running.
+
+## "another eph command is running in this workspace; waiting for it"
+
+`eph up`, `eph down`, and `eph clean` on one workspace exclude each other with
+an OS-level lock, so two overlapping runs never race the same `state.json`.
+This message just means a second command has to wait; it clears on its own
+once the first command finishes. If it never clears, the first command is
+still genuinely running (check `eph -v up`'s output or `docker ps`) rather
+than stuck: the lock is an OS file lock released automatically when the
+holding process exits, so a crashed or killed `eph` cannot leave a later
+command wedged.
+
+## `docker compose down` failed during `eph down` or `eph clean`
+
+A compose service's teardown failure (a broken compose file, a missing
+`docker compose` plugin) is a real error and stops the rest of the teardown,
+rather than being silently treated as success. Fix the underlying problem
+(`docker compose -f <file> -p eph-<short_id>-<service> down` reproduces it
+directly) and re-run `eph down` or `eph clean`. `--skip-hooks` does not help
+here: it only skips lifecycle hooks, not the compose command itself.
+
 If the workspace directory itself was deleted, run `eph system prune` from
 anywhere. It scans all eph state directories and removes resources for
 recorded workspace paths that are missing or are now empty folders. Use
@@ -188,6 +281,8 @@ builtins). Two ways to handle it:
 Under WSL, `eph` is a Linux process, so its state directory is the **Linux**
 path (`~/.local/share/eph/<short_id>/`), not the Windows `%LOCALAPPDATA%`
 path. The `%LOCALAPPDATA%` location applies only to a native Windows build.
+(`EPH_STATE_ROOT` overrides either default; see
+[Core Concepts](concepts.md#persisted-state).)
 
 ### Relative bind mounts on Windows
 

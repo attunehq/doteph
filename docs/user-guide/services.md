@@ -15,11 +15,12 @@ Every service declares a **source**: the thing `eph` starts. There are four:
 | `compose=` | A multi-container subsystem you already maintain as Compose. |
 | `run=` | A plain process on the host: your own app, a local binary. |
 
-Declare exactly one per service. If several are listed, the last silently
-wins, so treat that as a mistake. This page covers the first three in depth
-and introduces `run=`; [Running Your App](run-your-app.md) is the full story
-for first-party apps. The [common definitions](#common-service-definitions) at
-the end are ready to paste.
+Declare exactly one per service. A section that declares a second one (the
+same key twice, or two different keys) is a parse error. This page covers the
+first three in depth and introduces `run=`; [Running Your App](run-your-app.md)
+is the full story for first-party apps. The
+[common definitions](#common-service-definitions) at the end are ready to
+paste.
 
 ## `image=`: Docker image services
 
@@ -40,6 +41,14 @@ healthcheck=pg_isready -U dev
 `eph-<short_id>-postgres`, publishes each `port=` on a random host port bound
 to loopback, applies your `env.*` and `volume=` settings, and waits for the
 `healthcheck`.
+
+An `env.<KEY>=` value can reference another service with
+`${service.property}`, resolved against whichever services are already
+running at the moment this container is created, the same interpolation as a
+top-level `[env]` variable. See
+[Interpolation](eph-file.md#interpolation) for the full contract, including
+why the resolved value (a host-facing `localhost:PORT`) usually is not the
+right address for one container to reach another.
 
 Use `command=` to override the image's default command:
 
@@ -96,7 +105,12 @@ expose.zookeeper=2181
 - `expose.<name>=<container_port>` makes a port available for interpolation as
   `${kafka.port.kafka}` and so on. `eph` asks `docker compose port` for the
   real mapped host port and falls back to the declared value if Compose does
-  not report one.
+  not report one (with a warning, since the declared port is usually not the
+  actual mapped one).
+- `env.<KEY>=`, with `${service.property}` references resolved against
+  running services first, is exported into the process environment `docker
+  compose up` and `docker compose down` themselves run with, so your compose
+  file's own `${VAR}` substitution can read it.
 - Compose services are tracked by `eph status` and `eph env`. Compose names its
   own containers, so `eph` finds the project by its
   `com.docker.compose.project` label rather than by container name.
@@ -107,7 +121,7 @@ expose.zookeeper=2181
 ### How compose services differ
 
 Compose support is intentionally thin: `eph` shells out to `docker compose`
-and lets it own the container lifecycle. Two differences from the other
+and lets it own the container lifecycle. Three differences from the other
 sources are worth knowing:
 
 - **Teardown is coarser.** Both `eph down` and `eph down --rm` run
@@ -117,6 +131,10 @@ sources are worth knowing:
   the named volumes you declare with `volume=` in the `.eph` file. Volumes
   defined inside the Compose file belong to `docker compose`; run
   `docker compose ... down -v` yourself if you need to drop them.
+- **A failed `docker compose down` is a real error.** If the compose file is
+  broken or the `docker compose` plugin is missing, `eph down` and
+  `eph clean` stop and report it rather than treating it as success; fix the
+  underlying problem and re-run.
 
 ## `run=`: a process instead of a container
 
@@ -170,6 +188,7 @@ image=minio/minio
 port.api=9000
 port.console=9001
 
+[env]
 S3_ENDPOINT=http://localhost:${minio.port.api}
 S3_CONSOLE=http://localhost:${minio.port.console}
 ```
@@ -193,6 +212,7 @@ env.POSTGRES_DB=myapp
 volume=pgdata:/var/lib/postgresql/data
 healthcheck=pg_isready -U dev
 
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 ```
 
@@ -209,6 +229,7 @@ env.MYSQL_PASSWORD=dev
 volume=mysqldata:/var/lib/mysql
 healthcheck=mysqladmin ping -h localhost
 
+[env]
 DATABASE_URL=mysql://dev:dev@localhost:${mysql.port}/myapp
 ```
 
@@ -220,6 +241,7 @@ image=redis:7-alpine
 port=6379
 healthcheck=redis-cli ping
 
+[env]
 REDIS_URL=redis://localhost:${redis.port}
 ```
 
@@ -234,6 +256,7 @@ env.MONGO_INITDB_ROOT_PASSWORD=dev
 volume=mongodata:/data/db
 healthcheck=mongosh --eval db.adminCommand(ping)
 
+[env]
 MONGO_URL=mongodb://dev:dev@localhost:${mongo.port}
 ```
 
@@ -253,6 +276,7 @@ env.MINIO_ROOT_PASSWORD=devdevdev
 command=server /data --console-address ":9001"
 volume=miniodata:/data
 
+[env]
 S3_ENDPOINT=http://localhost:${minio.port.api}
 S3_ACCESS_KEY=dev
 S3_SECRET_KEY=devdevdev
@@ -266,6 +290,7 @@ image=mailhog/mailhog
 port.smtp=1025
 port.web=8025
 
+[env]
 SMTP_HOST=localhost
 SMTP_PORT=${mailhog.port.smtp}
 MAIL_WEB_UI=http://localhost:${mailhog.port.web}
@@ -282,6 +307,7 @@ env.RABBITMQ_DEFAULT_USER=dev
 env.RABBITMQ_DEFAULT_PASS=dev
 healthcheck=rabbitmq-diagnostics -q ping
 
+[env]
 AMQP_URL=amqp://dev:dev@localhost:${rabbitmq.port.amqp}
 ```
 

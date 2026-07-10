@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eph::parser::{self, EphFile, ServiceSource};
 use eph::{
-    LogOptions, PruneOptions, PruneReport, RunningService, ServiceManager, Workspace, skills,
+    Hooks, LogOptions, PruneOptions, PruneReport, RunningService, ServiceManager, Workspace, skills,
 };
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
@@ -136,6 +136,11 @@ enum Commands {
         /// bare process bounce. Without `--watch` the stack never restarts.
         #[arg(long = "watch", value_name = "GLOB")]
         watch: Vec<String>,
+
+        /// Bring the stack up and tear it down without running any lifecycle
+        /// hooks, matching `eph up --skip-hooks` / `eph down --skip-hooks`.
+        #[arg(long = "skip-hooks")]
+        skip_hooks: bool,
     },
 
     /// Show status of services
@@ -144,7 +149,7 @@ enum Commands {
     /// Print environment variables for shell eval
     /// Usage: eval "$(eph env)"
     Env {
-        /// Output format: export (default), fish, json
+        /// Output format: export (default), fish, powershell, json
         #[arg(short, long, default_value = "export")]
         format: String,
     },
@@ -156,6 +161,17 @@ enum Commands {
     /// `eph run psql "$DATABASE_URL"` or `eph run ./scripts/seed.sh` without
     /// `eval`-ing anything first. The command is executed directly, not through
     /// a shell; use `eph run sh -c '...'` if you need shell features.
+    ///
+    /// Every token after `run` belongs to the command, including ones that look
+    /// like eph's own flags: `eph run -v ./script.sh`, `eph run -h`, and
+    /// `eph run --foo` all pass `-v`/`-h`/`--foo` straight through as the
+    /// command's own argument, with no `--` separator needed. A flag placed
+    /// *before* `run` (`eph -v run ...`) is still eph's own: `main` splits the
+    /// two apart before clap ever sees the command's tokens (see
+    /// `split_run_argv`), since clap's `global = true` verbose flag, and its
+    /// auto `-h`/`--help`/`-V`/`--version`, would otherwise be recognized
+    /// anywhere on the line and steal them from the command.
+    #[command(disable_help_flag = true, disable_version_flag = true)]
     Run {
         /// The command and its arguments.
         #[arg(
@@ -239,6 +255,18 @@ enum SystemCommand {
         /// Also prune state directories written by eph v0.4.2 and earlier.
         #[arg(long)]
         compatibility_v042: bool,
+
+        /// Remove a stale workspace's resources even if it still has running
+        /// containers or a live `run=` process. Without this, a workspace
+        /// whose recorded path is gone only because it was moved or renamed
+        /// (not truly deleted) is reported and left alone instead of
+        /// force-killed.
+        #[arg(long)]
+        force_live: bool,
+
+        /// Skip the removal confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -270,23 +298,26 @@ enum SkillsCommand {
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
-    let cli = Cli::parse();
+    // `eph run`'s own argv must never be intercepted by eph's global `-v`, nor
+    // its auto `-h`/`--help`/`-V`/`--version`: split it out of clap's view
+    // entirely before parsing, rather than trying to fight clap's `global =
+    // true` propagation after the fact. Falls through to ordinary clap parsing
+    // when the invocation is not `run` at all (including `eph help run`) or
+    // `run` was given no command (clap's own "required argument" error is
+    // clearer than anything hand-rolled here).
+    let argv: Vec<String> = std::env::args().collect();
+    if let Some((global_args, command_args)) = split_run_argv(&argv[1..])
+        && !command_args.is_empty()
+    {
+        init_tracing(global_args.iter().any(|a| a == "-v" || a == "--verbose"));
+        // `eph run` is never the updater or its internal worker, so the nag
+        // always applies here; see `maybe_nag_about_update`.
+        eph::update::warn_if_outdated(env!("EPH_VERSION"));
+        return cmd_run(command_args.to_vec()).await;
+    }
 
-    // Initialize logging
-    let filter = if cli.verbose {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::new("info")
-    };
-    // Log to stderr, never stdout. stdout carries the command's real output
-    // (e.g. `eph env` emits shell/JSON meant for `eval "$(eph env)"` or piping
-    // into a parser); mixing log lines into it corrupts that machine-readable
-    // output.
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
+    let cli = Cli::parse();
+    init_tracing(cli.verbose);
 
     // Passively nudge a user on an old release to upgrade, before running the
     // command they asked for. This reads a small on-disk cache and refreshes it
@@ -315,7 +346,9 @@ async fn main() -> Result<ExitCode> {
             SystemCommand::Prune {
                 dry_run,
                 compatibility_v042,
-            } => cmd_system_prune(dry_run, compatibility_v042)
+                force_live,
+                yes,
+            } => cmd_system_prune(dry_run, compatibility_v042, force_live, yes)
                 .await
                 .map(|()| ExitCode::SUCCESS),
         },
@@ -323,7 +356,8 @@ async fn main() -> Result<ExitCode> {
             service,
             clean,
             watch,
-        } => cmd_dev(service, clean, watch).await,
+            skip_hooks,
+        } => cmd_dev(service, clean, watch, skip_hooks).await,
         Commands::Status => cmd_status().await.map(|()| ExitCode::SUCCESS),
         Commands::Env { format } => cmd_env(&format).await.map(|()| ExitCode::SUCCESS),
         Commands::Run { command } => cmd_run(command).await,
@@ -358,6 +392,50 @@ async fn main() -> Result<ExitCode> {
         }
         Commands::UpdateCheck => cmd_update_check_worker().await.map(|()| ExitCode::SUCCESS),
     }
+}
+
+/// Initialize the tracing subscriber eph logs through.
+///
+/// Log to stderr, never stdout: stdout carries the command's real output (e.g.
+/// `eph env` emits shell/JSON meant for `eval "$(eph env)"` or piping into a
+/// parser); mixing log lines into it corrupts that machine-readable output.
+fn init_tracing(verbose: bool) {
+    let filter = if verbose {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::new("info")
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+/// Split `eph`'s raw argv (everything after the program name) into
+/// (`global_args`, `run_command`) when the invocation is `eph [-v] run
+/// <cmd...>`, so every token from `run`'s first argument onward can be handed
+/// to the child process verbatim.
+///
+/// clap's `global = true` verbose flag (and its auto `-h`/`--help` and
+/// `-V`/`--version`) are otherwise recognized anywhere on the command line
+/// (that is what `global = true` means, and clap has no per-subcommand
+/// opt-out for it), so without this split `eph run -v echo hi` would silently steal
+/// `-v` as eph's own verbosity flag rather than passing it to `echo`. Only the
+/// tokens *before* `run` are still eph's own flags (today, only
+/// `-v`/`--verbose`), so `eph -v run ...` keeps enabling verbose logging.
+///
+/// Returns `None` when `run` is not the subcommand being invoked at all: no
+/// `run` token is present, or a non-flag token precedes it (meaning `run`, if
+/// present, is an argument to something else, not eph's own subcommand). This
+/// also correctly falls through for `eph help run`, whose first token is
+/// `help`, so clap's generated help still works.
+fn split_run_argv(args: &[String]) -> Option<(&[String], &[String])> {
+    let idx = args.iter().position(|a| a == "run")?;
+    if args[..idx].iter().any(|a| a != "-v" && a != "--verbose") {
+        return None;
+    }
+    Some((&args[..idx], &args[idx + 1..]))
 }
 
 /// Which direction a `--role` selection resolves in: `Up` pulls in each role's
@@ -406,6 +484,7 @@ fn resolve_service_selection(
 
 async fn cmd_up(services: Vec<String>, roles: Vec<String>, skip_hooks: bool) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
+    let short_id = workspace.short_id.clone();
     let eph = load_eph_file(&workspace)?;
 
     let service_filter = resolve_service_selection(&eph, services, &roles, Direction::Up)?;
@@ -413,7 +492,7 @@ async fn cmd_up(services: Vec<String>, roles: Vec<String>, skip_hooks: bool) -> 
     let mut manager = ServiceManager::new(workspace).await?;
 
     let running = manager
-        .start_services(&eph, &service_filter, skip_hooks)
+        .start_services(&eph, &service_filter, Hooks::from_skip_flag(skip_hooks))
         .await?;
 
     // Print summary in declaration order (iterate the .eph definitions rather
@@ -430,7 +509,31 @@ async fn cmd_up(services: Vec<String>, roles: Vec<String>, skip_hooks: bool) -> 
     println!();
     println!("Run `eval \"$(eph env)\"` to set environment variables");
 
+    print_stale_workspace_nudge(&short_id).await;
+
     Ok(())
+}
+
+/// Print a one-line note to stderr when `eph up` notices other workspaces'
+/// state pointing at deleted checkouts, nudging toward `eph system prune`.
+///
+/// A pure filesystem scan (see [`eph::prune::count_stale_workspaces`]), so it
+/// is cheap enough to run after every `up`; any error resolving the state root
+/// is swallowed rather than surfaced, since this decorates a command that
+/// already succeeded and must never turn that success into a failure.
+async fn print_stale_workspace_nudge(current_short_id: &str) {
+    let Ok(root) = eph::workspace::state_root() else {
+        return;
+    };
+    let count = eph::prune::count_stale_workspaces(&root, current_short_id).await;
+    if count == 0 {
+        return;
+    }
+    let plural = if count == 1 { "" } else { "s" };
+    eprintln!(
+        "note: {count} stale eph workspace{plural} from deleted checkouts; \
+         run 'eph system prune' to review them."
+    );
 }
 
 async fn cmd_down(
@@ -490,10 +593,68 @@ async fn cmd_clean(skip_hooks: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_system_prune(dry_run: bool, compatibility_v042: bool) -> Result<()> {
-    let report = eph::prune(PruneOptions {
-        dry_run,
+/// `eph system prune`: report what would be torn down for stale workspaces,
+/// then (unless `--dry-run`) confirm and actually tear it down.
+///
+/// A plain `--dry-run` request is a single pass: list, print, done. A real
+/// prune runs the exact same listing pass first (`dry_run: true` under the
+/// hood) so the confirmation prompt shows precisely what is about to be
+/// removed, including any workspace the liveness guard would skip; only after
+/// that plan is shown and confirmed does a second pass, with `dry_run: false`,
+/// perform the removal. The two passes can in principle race with something
+/// changing on disk or in Docker between them, but `prune` already re-checks
+/// each workspace's staleness right before acting on it, the same protection
+/// a single dry-run-then-prompt-then-act flow would need anyway.
+async fn cmd_system_prune(
+    dry_run: bool,
+    compatibility_v042: bool,
+    force_live: bool,
+    yes: bool,
+) -> Result<()> {
+    let options = PruneOptions {
+        dry_run: true,
         compatibility_v042,
+        force_live,
+    };
+
+    if dry_run {
+        let report = eph::prune(options).await?;
+        print_prune_report(&report);
+        return Ok(());
+    }
+
+    let preview = eph::prune(options).await?;
+    print_prune_report(&preview);
+
+    match eph::confirmation_outcome(!preview.totals.is_empty(), yes, io::stdin().is_terminal()) {
+        eph::ConfirmationOutcome::Proceed => {}
+        eph::ConfirmationOutcome::RequireYes => {
+            anyhow::bail!(
+                "stdin is not a terminal, so system prune cannot prompt for confirmation; pass -y/--yes to remove these resources without asking"
+            );
+        }
+        eph::ConfirmationOutcome::Prompt => {
+            print!("\nRemove these resources? [y/N] ");
+            io::stdout()
+                .flush()
+                .context("failed to write the prune confirmation prompt")?;
+
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .context("failed to read the prune confirmation")?;
+            let answer = answer.trim();
+            if !answer.eq_ignore_ascii_case("y") && !answer.eq_ignore_ascii_case("yes") {
+                println!("Aborted; nothing removed.");
+                return Ok(());
+            }
+        }
+    }
+
+    let report = eph::prune(PruneOptions {
+        dry_run: false,
+        compatibility_v042,
+        force_live,
     })
     .await?;
     print_prune_report(&report);
@@ -590,7 +751,12 @@ enum DevStop {
 /// watcher should, since editing is exactly when the app is most likely to
 /// crash. Without `--watch` that same exit is reported as a failure and ends
 /// `eph dev`, so a preview server sees the dev server went down.
-async fn cmd_dev(service: Option<String>, clean: bool, watch: Vec<String>) -> Result<ExitCode> {
+async fn cmd_dev(
+    service: Option<String>,
+    clean: bool,
+    watch: Vec<String>,
+    skip_hooks: bool,
+) -> Result<ExitCode> {
     let workspace = Workspace::find_from_cwd()?;
     // The watcher matches globs relative to the workspace root, so capture it
     // before `workspace` is moved into the manager.
@@ -654,7 +820,8 @@ async fn cmd_dev(service: Option<String>, clean: bool, watch: Vec<String>) -> Re
     // dev` behavior.
     let mut first = true;
     loop {
-        let (mut child, gate) = dev_bring_up(&mut manager, &eph, &foreground, gate_port).await?;
+        let (mut child, gate) =
+            dev_bring_up(&mut manager, &eph, &foreground, gate_port, skip_hooks).await?;
 
         announce_serving(&manager, &foreground, clean, &watch, first, gate_port).await;
         first = false;
@@ -680,7 +847,7 @@ async fn cmd_dev(service: Option<String>, clean: bool, watch: Vec<String>) -> Re
 
         match stop {
             DevStop::Signal => {
-                final_teardown(&mut manager, &eph, clean, &brought_up).await?;
+                final_teardown(&mut manager, &eph, clean, &brought_up, skip_hooks).await?;
                 // Reap the foreground child we just tore down.
                 let _ = child.wait().await;
                 return Ok(ExitCode::SUCCESS);
@@ -707,7 +874,7 @@ async fn cmd_dev(service: Option<String>, clean: bool, watch: Vec<String>) -> Re
                 eprintln!("dev server '{foreground}' {how}; waiting for a change to restart");
                 tokio::select! {
                     () = wait_for_shutdown() => {
-                        final_teardown(&mut manager, &eph, clean, &brought_up).await?;
+                        final_teardown(&mut manager, &eph, clean, &brought_up, skip_hooks).await?;
                         return Ok(ExitCode::SUCCESS);
                     }
                     path = watcher.changed_or_pending() => {
@@ -749,13 +916,16 @@ async fn final_teardown(
     eph: &EphFile,
     clean: bool,
     brought_up: &[String],
+    skip_hooks: bool,
 ) -> Result<()> {
     eprintln!();
     if clean {
-        manager.clean(eph, false).await?;
+        manager.clean(eph, skip_hooks).await?;
         eprintln!("Workspace cleaned");
     } else {
-        manager.stop_selected(eph, brought_up, false, false).await?;
+        manager
+            .stop_selected(eph, brought_up, false, skip_hooks)
+            .await?;
         eprintln!("Services stopped");
     }
     Ok(())
@@ -787,34 +957,41 @@ async fn dev_bring_up(
     eph: &EphFile,
     foreground: &str,
     gate_port: Option<u16>,
+    skip_hooks: bool,
 ) -> Result<(tokio::process::Child, Option<tokio::task::JoinHandle<()>>)> {
-    // Run every service's pre-start hooks before anything comes up, so codegen or
-    // other prep the app needs to compile finishes first. The backing/foreground
-    // split below drives startup by hand (bypassing `start_services`' interleaved
-    // pre-start), so this is where dev honors the hook. It runs on every pass, so
-    // a watch-triggered restart re-runs pre-start along with the rest of the stack.
-    manager.run_all_pre_start(eph).await?;
-
     // Two steps so the foreground app inherits eph's stdio. First bring the
-    // backing services up (no hooks yet: pre-start already ran above, post-start
-    // is deferred to run_all_post_start); then start the app in the foreground.
-    // `start_services` with an empty filter would start everything, so only call
-    // it when there is at least one backing service.
+    // backing services up with `eph up`'s exact hook interleaving (each
+    // service's pre-start runs just before that service is created, so it can
+    // reference the services already up); post-start is deferred below so it
+    // can also reference the foreground app. Then start the app in the
+    // foreground, running its own pre-start immediately before it, again
+    // matching `up`. `start_services` with an empty filter would start
+    // everything, so only call it when there is at least one backing service.
     let backing: Vec<String> = eph
         .services
         .keys()
         .filter(|name| *name != foreground)
         .cloned()
         .collect();
+    let hooks = if skip_hooks {
+        Hooks::None
+    } else {
+        Hooks::PreStartOnly
+    };
     if !backing.is_empty() {
-        manager.start_services(eph, &backing, true).await?;
+        manager.start_services(eph, &backing, hooks).await?;
+    }
+    if !skip_hooks {
+        manager.run_pre_start_for(eph, foreground).await?;
     }
     let (fg, child) = manager.start_foreground(eph, foreground).await?;
 
     // Everything is healthy now, so run post-start hooks (seeding) for every
     // service, preserving the `eph up` rule that a hook may reference any
     // service's assigned port.
-    manager.run_all_post_start(eph).await?;
+    if !skip_hooks {
+        manager.run_all_post_start(eph).await?;
+    }
 
     // Seeding is done, so open the preview-facing gate. Binding $PORT here, and
     // not one step earlier, is the whole point: the preview server watches this
@@ -1124,6 +1301,15 @@ fn print_service_ports(name: &str, svc: &RunningService) {
     }
 }
 
+/// `eph env`: print the resolved top-level variables for `eval`.
+///
+/// Unlike lifecycle hooks and `eph run` (which use [`eph::resolve_env_vars`]
+/// and leave an unresolved `${service.property}` reference verbatim), this
+/// command's output is handed straight to a shell's `eval`. A literal
+/// `${...}` there would be a syntax the shell cannot evaluate meaningfully, so
+/// a variable that still has one is dropped from stdout entirely and named in
+/// a warning on stderr instead; the command still exits 0; see
+/// [`eph::resolve_env_vars_for_eval`].
 async fn cmd_env(format: &str) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
@@ -1131,9 +1317,19 @@ async fn cmd_env(format: &str) -> Result<()> {
     let manager = ServiceManager::new(workspace).await?;
     let running = manager.status().await?;
 
-    // The resolved KEY=VALUE pairs, shared with the lifecycle-hook and `eph run`
-    // machinery so a developer's shell and a post-start hook see the same env.
-    let env_vars = eph::resolve_env_vars(&eph, &running);
+    let (env_vars, omitted) = eph::resolve_env_vars_for_eval(&eph, &running);
+
+    for var in &omitted {
+        let not_running = if running.contains_key(&var.service) {
+            String::new()
+        } else {
+            format!(" while {} is not running", var.service)
+        };
+        eprintln!(
+            "warning: omitted {}: ${{{}.{}}} is not resolvable{not_running}",
+            var.name, var.service, var.property
+        );
+    }
 
     // Render in the requested format
     print!("{}", eph::render(&env_vars, format)?);
@@ -1398,9 +1594,23 @@ fn cmd_skills_list() -> Result<()> {
 /// The repository root to install skills into: the git toplevel containing the
 /// current directory, or the current directory itself when it is not inside a
 /// repo, so first-time setup still works.
+///
+/// The fallback prints a warning naming the directory it installs into: a user
+/// who ran `eph skills install` from the wrong place (outside the repo they
+/// meant to target) would otherwise get no signal that eph silently picked the
+/// current directory instead of failing.
 fn skills_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("determining the current directory")?;
-    Ok(git_repo_root(&cwd).unwrap_or(cwd))
+    match git_repo_root(&cwd) {
+        Some(root) => Ok(root),
+        None => {
+            eprintln!(
+                "warning: not inside a git repository; installing skills into {}",
+                cwd.display()
+            );
+            Ok(cwd)
+        }
+    }
 }
 
 /// The git toplevel containing `cwd`, or `None` when `cwd` is not inside a git
@@ -1553,6 +1763,51 @@ mod tests {
 
     fn parse_eph(input: &str) -> EphFile {
         parser::parse(input).expect("test .eph should parse")
+    }
+
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn split_run_argv_hands_every_token_after_run_to_the_command() {
+        let argv = args(&["run", "-v", "-h", "-V", "--foo", "cmd"]);
+        let (global, command) = split_run_argv(&argv).expect("run should split");
+        assert!(global.is_empty());
+        assert_eq!(command, &args(&["-v", "-h", "-V", "--foo", "cmd"])[..]);
+    }
+
+    #[test]
+    fn split_run_argv_keeps_a_leading_verbose_flag_as_ephs_own() {
+        let argv = args(&["-v", "run", "cmd", "-x"]);
+        let (global, command) = split_run_argv(&argv).expect("run should split");
+        assert_eq!(global, &args(&["-v"])[..]);
+        assert_eq!(command, &args(&["cmd", "-x"])[..]);
+
+        let argv = args(&["--verbose", "run", "cmd"]);
+        let (global, command) = split_run_argv(&argv).expect("run should split");
+        assert_eq!(global, &args(&["--verbose"])[..]);
+        assert_eq!(command, &args(&["cmd"])[..]);
+    }
+
+    #[test]
+    fn split_run_argv_is_none_when_run_is_not_the_subcommand() {
+        // "help" precedes "run": this is `eph help run`, not `eph run`.
+        assert!(split_run_argv(&args(&["help", "run"])).is_none());
+        // A flag other than -v/--verbose precedes "run": not eph's own subcommand.
+        assert!(split_run_argv(&args(&["--foo", "run", "cmd"])).is_none());
+        // No "run" token at all.
+        assert!(split_run_argv(&args(&["up", "web"])).is_none());
+    }
+
+    #[test]
+    fn split_run_argv_finds_the_first_run_token_even_if_the_command_repeats_it() {
+        // The user's own command happens to contain the literal word "run"
+        // again; only the first occurrence is eph's subcommand marker.
+        let argv = args(&["run", "make", "run"]);
+        let (global, command) = split_run_argv(&argv).expect("run should split");
+        assert!(global.is_empty());
+        assert_eq!(command, &args(&["make", "run"])[..]);
     }
 
     #[test]

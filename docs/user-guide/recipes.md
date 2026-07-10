@@ -62,6 +62,7 @@ image=redis:7-alpine
 port=6379
 healthcheck=redis-cli ping
 
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 REDIS_URL=redis://localhost:${redis.port}
 ```
@@ -93,6 +94,7 @@ healthcheck=pg_isready -U dev
 post-start=npm run db:migrate
 post-start=npm run db:seed
 
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 ```
 
@@ -167,6 +169,7 @@ role=app
 port=auto
 env.PORT=${web.port}
 
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 ```
 
@@ -255,7 +258,7 @@ checkout's services, and `eph info` shows the differing short IDs.
 
 When you later delete a checkout (a finished worktree, an abandoned
 experiment), its containers and volumes do not die with the directory. Run
-[`eph system prune`](command-reference.md#eph-system-prune---dry-run---compatibility-v042)
+[`eph system prune`](command-reference.md#eph-system-prune---dry-run---compatibility-v042---force-live--y---yes)
 from anywhere to sweep up resources belonging to workspaces whose directory no
 longer exists.
 

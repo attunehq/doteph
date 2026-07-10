@@ -39,6 +39,7 @@ run=npm run dev
 port=auto
 env.PORT=${web.port}
 
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 APP_URL=http://localhost:${web.port}
 ```
@@ -58,7 +59,8 @@ allocate a free host port and hand it to the process through its environment.
 [web]
 run=npm run dev
 port=auto
-env.PORT=${web.port}              # tell your framework which port to bind
+# tell your framework which port to bind
+env.PORT=${web.port}
 ```
 
 How it behaves:
@@ -100,22 +102,32 @@ env.VITE_HMR_PORT=${web.port.hmr}
 same stack as one foreground process.
 
 ```sh
-eph dev            # foreground the sole run= service
-eph dev web        # foreground a specific run= service by name
+eph dev              # foreground the sole run= service
+eph dev web          # foreground a specific run= service by name
+eph dev --skip-hooks # bring up and tear down with no lifecycle hooks
 ```
 
 What it does, in order:
 
-1. Runs every service's `pre-start` hooks up front.
-2. Brings the backing services up and waits for health.
+1. Brings the backing services up, running each one's own `pre-start` hook
+   immediately before it starts (so a later service's hook can reference an
+   earlier one's assigned port) and waiting for health, exactly the
+   interleaving `eph up` uses.
+2. Runs the foregrounded app's own `pre-start` hook, which can therefore
+   reference every backing service's assigned port.
 3. Starts the chosen `run=` app in the **foreground**: eph's stdin, stdout,
    and stderr are wired straight through, so the app is fully interactive and
    its output streams to your terminal. eph's own startup chrome goes to
    stderr, out of the app's stdout.
-4. Runs every service's `post-start` hooks (migrations, seeds).
+4. Runs **every** service's `post-start` hooks (migrations, seeds), the
+   foregrounded app included, once everything is up, so a `post-start` hook
+   may reference any service's port.
 5. Blocks until the app is stopped, then tears down **only the services it
    started itself**, and leaves anything that was already running (a
    prewarmed dependency tier, say) untouched.
+
+`--skip-hooks` skips all four hook phases for the whole session (bring-up and
+teardown alike), matching `eph up --skip-hooks` and `eph down --skip-hooks`.
 
 The teardown default is `eph down`: containers and data stay for a fast next
 launch. Pass `--clean` to end with a full `eph clean` instead, dropping named

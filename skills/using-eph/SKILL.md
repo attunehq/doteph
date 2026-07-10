@@ -54,12 +54,17 @@ the `.eph` file: that is the *container* port, not the published host port.
 ```sh
 eval "$(eph env)"                        # bash / zsh / sh
 eph env -f fish | source                 # fish
+eph env --format powershell | Out-String | Invoke-Expression   # PowerShell
 eph env -f json | jq -r .DATABASE_URL    # machine-readable, best for scripts
 ```
 
 `eph env` prints only the top-level `KEY=VALUE` variables from the `.eph` file,
-with `${service.port}` style interpolations filled in from **running** services.
-A reference to a stopped service is left unresolved, so run `eph up` first.
+with `${service.port}` style interpolations filled in from **running**
+services. A variable whose reference cannot resolve (its service is not
+running) is dropped from the output and named in a warning on stderr instead,
+so `eph env`'s stdout never contains a raw `${...}` placeholder; the command
+still exits `0`. Run `eph up` first so everything resolves. (Hooks and
+`eph run`, by contrast, leave an unresolved reference verbatim; see below.)
 
 ## Tearing down
 
@@ -90,21 +95,34 @@ volume=pgdata:/var/lib/postgresql/data
 healthcheck=pg_isready -U dev
 post-start=npm run db:migrate
 
+[env]
 DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 ```
 
 - A service names exactly one source: `image=`, `dockerfile=` (+ `context=`),
-  `compose=` (+ `expose.<name>=`), or `run=` (a host process via `sh -c`).
+  `compose=` (+ `expose.<name>=`), or `run=` (a host process via `sh -c`). A
+  section with none, or with two, is a parse error.
 - `port=` is a *container* port published on a random host port; `${svc.port}`
   in a top-level variable resolves to the assigned host port at `eph env` time.
+  `port=`/`port.<name>=` are illegal on `compose=` services (use
+  `expose.<name>=` there instead).
 - For a `run=` service (a first-party app eph launches), `port=auto` /
   `port.<name>=auto` make eph allocate a free host port and inject it into the
   process; reference the service's own assigned port as `${svc.port}` in its
   `env.X` (e.g. `env.PORT=${web.port}`). eph keeps the port stable across
   restarts and re-launches the app on a fresh port if it dies on a port
-  conflict. Still never hardcode it — read it via `eph env` / `${svc.port}`.
-- `env.X=` is set inside the container; the trailing `DATABASE_URL=` is a shell
-  env var emitted by `eph env`.
+  conflict. Still never hardcode it: read it via `eph env` / `${svc.port}`.
+- `env.X=` is set **inside the container**; it is a different namespace from
+  the top-level `DATABASE_URL=` above, which is a **shell**
+  variable emitted by `eph env`. **Top-level variables only parse in two
+  places**: above the first section, or inside a reserved `[env]` section
+  (shown above, right after `postgres`'s properties). `[env]` may repeat, so
+  you can group a variable near the service it describes. Sections do **not**
+  end at blank lines: a bare `KEY=VALUE` written directly after a service
+  section (with no `[env]`) is a parse error, not a silently-accepted trailing
+  variable. If you generate a `.eph` file and want a variable to reach the
+  container instead of the shell, use `env.KEY=` inside the section, not a
+  bare `KEY=` after it.
 - `volume=name:/path` is a per-workspace named volume; `healthcheck` for an image
   service runs with no shell (whitespace-split, `docker exec`); the lifecycle
   hooks run on the host via `sh -c` with eph's resolved environment injected (see
@@ -119,7 +137,8 @@ first-party app you are building (start it on demand; it may bind preview ports
 or run side effects). Roles let you bring up one tier without the other.
 
 ```ini
-roles_order=dep,app            # dep services come up before the app
+# dep services come up before the app
+roles_order=dep,app
 
 [postgres]
 image=postgres:16
@@ -198,13 +217,21 @@ Four hooks bracket a service, in order: `pre-start` (before it is created),
 in their environment, so a database migration or codegen step just works:
 
 ```ini
+[postgres]
+image=postgres:16-alpine
+port=5432
+
 [api]
 run=./bin/server
-pre-start=go generate ./...                     # runs before the server boots
-post-start=psql "$DATABASE_URL" -f schema.sql   # DATABASE_URL is already set
+# runs before the server boots
+pre-start=go generate ./...
+# DATABASE_URL is already set
+post-start=psql "$DATABASE_URL" -f schema.sql
 pre-stop=./scripts/backup.sh
-post-stop=rm -rf .cache/scratch                 # cleanup eph cannot do itself
+# cleanup eph cannot do itself
+post-stop=rm -rf .cache/scratch
 
+[env]
 DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 ```
 
@@ -255,18 +282,26 @@ The command is executed directly, not through a shell, so eph does not expand
 `$VAR` in the arguments; wrap it in `sh -c '...'` when you need shell expansion
 of eph's injected variables, piping, or globbing. `eph run` exits with the
 command's own exit code. Use it for repeatable operations (seeding, resets,
-ad-hoc queries) -- unlike `post-start`, it runs every time you invoke it.
+ad-hoc queries): unlike `post-start`, it runs every time you invoke it.
+
+Every token after `run` belongs to the command, flag-shaped or not: `eph run
+-v ./script.sh`, `eph run -h`, and `eph run --foo` all pass `-v`/`-h`/`--foo`
+straight through as the command's own argument, with no `--` separator needed.
+Only a flag placed *before* `run` (`eph -v run ...`) is still eph's own.
 
 ## Claude Desktop preview servers: `eph dev`
 
 `eph dev` runs the whole stack in the foreground for a Claude Desktop preview
 server (`.claude/launch.json`), which launches one command and watches its port
-but has no setup or teardown hook. `eph dev` fills both: it runs
-`pre-start` hooks (e.g. codegen), brings every service up, foregrounds a `run=`
-app with eph's own stdin, stdout, and stderr wired through to it, runs
-`post-start` (seeding), and on stop tears the stack down -- `eph down` by
-default, or `eph clean` with `--clean` (each running `pre-stop` then
-`post-stop`).
+but has no setup or teardown hook. `eph dev` fills both: it brings up the
+backing services (each one's `pre-start` running right before it starts, same
+interleaving as `eph up`), runs the foregrounded app's own `pre-start`, starts
+a `run=` app with eph's own stdin, stdout, and stderr wired through to it, runs
+every service's `post-start` (seeding) once everything is up, and on stop tears
+the stack down -- `eph down` by default, or `eph clean` with `--clean` (each
+running `pre-stop` then `post-stop`). Pass `--skip-hooks` to skip all four hook
+phases for the whole session, matching `eph up --skip-hooks` /
+`eph down --skip-hooks`.
 
 **Running `eph dev` yourself? Launch it in the background.** `eph dev` foregrounds
 the app and does not return until the app exits, so running it as an ordinary

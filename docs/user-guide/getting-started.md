@@ -35,6 +35,11 @@ curl -sSfL https://raw.githubusercontent.com/attunehq/doteph/main/scripts/instal
 irm https://raw.githubusercontent.com/attunehq/doteph/main/scripts/install.ps1 | iex
 ```
 
+Both scripts honor `EPH_REPO` (an `owner/repo`, default `attunehq/doteph`) and
+`EPH_BASE_URL` (replaces the GitHub download base entirely, with no release
+tag appended after it) for installing from a fork or a mirror; `eph update`
+honors the same two variables (see below).
+
 Or build from a source checkout:
 
 ```sh
@@ -67,6 +72,7 @@ env.POSTGRES_PASSWORD=dev
 env.POSTGRES_DB=myapp
 healthcheck=pg_isready -U dev
 
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 ```
 
@@ -80,6 +86,10 @@ Reading it line by line:
   here they configure the Postgres superuser and database.
 - `healthcheck=` is a command `eph` runs repeatedly until it succeeds, so
   `eph up` only returns once Postgres actually accepts connections.
+- `[env]` opens a section for top-level variables: a plain `KEY=VALUE` line
+  directly after a service section is a parse error (see
+  [The `.eph` File](eph-file.md#where-to-put-top-level-variables)), so
+  anything you want `eph env` to export after your services go here.
 - `DATABASE_URL=...` is a top-level environment variable for **your shell**.
   `${postgres.port}` is replaced with the real assigned host port when you run
   `eph env`.

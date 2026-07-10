@@ -83,6 +83,15 @@ Because ports are dynamic, your environment variables reference services
 symbolically:
 
 ```ini
+[postgres]
+image=postgres:16-alpine
+port=5432
+
+[redis]
+image=redis:7-alpine
+port=6379
+
+[env]
 DATABASE_URL=postgres://dev:dev@localhost:${postgres.port}/myapp
 REDIS_URL=redis://localhost:${redis.port}
 ```
@@ -96,9 +105,13 @@ running** services:
 | `${service.port.name}` | A named port (multi-port services) |
 | `${service.host}` | Always `localhost` |
 
-If a service is not running, its placeholders are left **untouched**, so the
-unresolved reference stays visible instead of silently becoming empty. Run
-`eph up` before `eph env`.
+If a service is not running, `eph env` **omits** the affected variable
+entirely and warns on stderr instead, since its output is `eval`'d directly
+and a raw `${...}` would break the shell. The command still exits `0`. (Hooks,
+`eph run`, and a service's own `env.*` values keep the older behavior of
+leaving an unresolved reference untouched; see
+[The `.eph` File](eph-file.md#interpolation).) Run `eph up` before `eph env`
+so everything resolves.
 
 All four service types resolve once running: `eph` finds `image` and
 `dockerfile` services by container name, `run` services by their tracked
@@ -117,15 +130,44 @@ beside it:
 | macOS | `~/Library/Application Support/eph/<short_id>/state.json` |
 | Windows | `%LOCALAPPDATA%\eph\<short_id>\state.json` |
 
+Set `EPH_STATE_ROOT` to override the parent directory (the `eph` above
+`<short_id>`) for every workspace, in place of the platform default: useful
+for relocating eph's state off the default disk, or for a test harness that
+wants a throwaway state root instead of touching your real one.
+
 State is why `eph status` and `eph env` answer instantly, why assigned ports
 survive a terminal restart, and why `eph` knows which containers and volumes
 belong to this workspace.
 
-Two commands manage it: `eph clean` deletes the state directory for the current
-workspace along with its services and data, and
-[`eph system prune`](command-reference.md#eph-system-prune---dry-run---compatibility-v042)
+`state.json` is written after every individual service starts, not once at
+the end of `eph up`: if a later service's `pre-start` hook or creation fails,
+whatever already started is still on disk, so `eph down` can find and stop
+it instead of leaking it. The write itself is atomic (a temp file, renamed
+over the real one), so a crash mid-write can never leave a truncated file
+behind. If `state.json` is still unreadable (hand-edited, corrupted by
+something outside eph), the next command quarantines it to
+`state.json.corrupt`, warns, and continues with empty state rather than
+aborting; recover a `run=` service's PID by hand if it needs stopping, since
+that is the one thing the quarantine cannot recover on its own (containers are
+found again from Docker by name).
+
+`eph up`, `eph down`, and `eph clean` on a given workspace serialize against
+each other through an OS-level file lock, so two overlapping commands never
+race the same `state.json` or double-spawn a service; the second command
+waits for the first (printing a notice while it does) rather than
+proceeding against stale state. The lock is released by the operating system
+the instant the holding process exits, crash included, so a killed `eph up`
+can never wedge a later command.
+
+Two commands manage state directories in bulk: `eph clean` deletes the state
+directory for the current workspace along with its services and data, and
+[`eph system prune`](command-reference.md#eph-system-prune---dry-run---compatibility-v042---force-live--y---yes)
 scans **all** state directories and removes leftovers for workspaces whose
-directory has since been deleted (a worktree you removed, for example).
+directory has since been deleted (a worktree you removed, for example). A
+successful `eph up` checks for exactly that situation in other workspaces (a
+cheap filesystem scan, never Docker) and prints a one-line note on stderr
+pointing at `eph system prune` when it finds any, so stale state does not sit
+unnoticed until you happen to run prune yourself.
 
 ## The service lifecycle
 
@@ -176,7 +218,7 @@ removes containers but keeps named-volume data, forcing a fresh create next
 time. `eph clean` is the full reset: it **deletes the data in named volumes**,
 so use it when you want to start over completely.
 
-Two footnotes to the table:
+Three footnotes to the table:
 
 - Bind mounts (host paths like `./seed` or `C:\data`) are never deleted by
   `eph clean`. Only Docker named volumes are.
@@ -184,6 +226,19 @@ Two footnotes to the table:
   `--rm` makes no difference for them, and `eph clean` removes only the named
   volumes declared in your `.eph` file, not volumes internal to the Compose
   file. See [Defining Services](services.md#how-compose-services-differ).
+- Teardown works from **recorded state**, not just the sections currently in
+  your `.eph` file. A bare `eph down` (no service names) and `eph clean` both
+  also stop and remove anything `state.json` remembers starting under a name
+  that is no longer in the file, so renaming or deleting a service's section
+  does not orphan its container. (A targeted `eph down <service>` only
+  accepts names that still exist in the file, so it cannot reach a renamed
+  entry by its old name; use the bare form to sweep those up.) `eph clean`
+  additionally reports **measured** counts, what it actually stopped or
+  removed rather than the number of services declared, so a workspace that
+  never started anything reports zeros; it also sweeps any leftover Docker
+  container or volume still carrying the workspace's `eph-<short_id>-` name
+  prefix, in case something exists that neither the file nor the recorded
+  state knows about.
 
 ## Dependency services vs the app
 

@@ -35,10 +35,11 @@ External dependencies of note: `clap` (CLI), `bollard` (async Docker API),
 (workspace IDs), `dirs` (platform data directory), `shell-words` (command
 parsing), `sysinfo` (process-table liveness and the Windows descendant-tree
 teardown walk), `libc` (Unix only: signaling a `run=` shell's process group
-via `killpg`), and `tracing` (logging to stderr). `eph update` adds `ureq`
-(rustls HTTPS, no system TLS), `flate2`/`tar` (pure-Rust archive extraction),
-`self-replace` (the platform-correct in-place binary swap), and `semver`
-(version comparison).
+via `killpg`), `fd-lock` (the per-workspace and prune advisory file locks; see
+[Internals](internals.md#service)), and `tracing` (logging to stderr).
+`eph update` adds `ureq` (rustls HTTPS, no system TLS), `flate2`/`tar`
+(pure-Rust archive extraction), `self-replace` (the platform-correct in-place
+binary swap), and `semver` (version comparison).
 
 ## Core concepts
 
@@ -83,14 +84,35 @@ the recorded workspace path still exists.
 - macOS: `~/Library/Application Support/eph/<short_id>/state.json`
 - Windows: `%LOCALAPPDATA%\eph\<short_id>\state.json`
 
+`EPH_STATE_ROOT` overrides the parent directory (the `eph` above `<short_id>`)
+in place of the platform default; `workspace::state_root()` checks it first.
+
 State lets `eph status` and `eph env` work without re-deriving everything,
 lets assigned ports survive terminal restarts, and records which resources
-belong to a workspace. `eph clean` deletes this directory for the current
-workspace. `eph system prune` scans every state directory and removes Docker
-resources by the `eph-<short_id>-` namespace when the recorded workspace path
-is missing or empty. For `run=` services it signals only PIDs whose current
-process identity matches the identity saved at launch; legacy process entries
-are warned about and left alone.
+belong to a workspace. Writes are atomic (a temp file, renamed over the real
+one) so a crash mid-write cannot leave a truncated `state.json`; a file that
+still fails to parse (corruption predating atomic writes, or manual editing)
+is quarantined to `state.json.corrupt` rather than treated as fatal, and eph
+continues with fresh empty state. Every command that mutates state (`up`,
+`down`, `clean`) holds an OS advisory lock scoped to the workspace (a file
+next to the state directory, released automatically if the process dies) for
+the duration of the operation, so two overlapping invocations in the same
+workspace serialize instead of racing each other's writes.
+
+`eph clean` deletes this directory for the current workspace. `eph system
+prune` scans every state directory and removes Docker resources by the
+`eph-<short_id>-` namespace when the recorded workspace path is missing or
+empty, but only once it has confirmed the workspace is actually dead: a
+recorded path that no longer resolves could mean the workspace was moved or
+renamed rather than deleted, so prune first checks for any running container
+or live `run=` process under that namespace and skips (reports, does not
+remove) a workspace that still has either, unless `--force-live` is passed.
+For `run=` services it signals only PIDs whose current process identity
+matches the identity saved at launch; legacy process entries are warned about
+and left alone. A real (non-dry-run) prune also asks for confirmation before
+removing anything, unless `--yes` is passed or there is nothing to remove;
+off a non-interactive terminal without `--yes` it refuses rather than
+guessing.
 
 ## File format
 
@@ -111,10 +133,16 @@ The `.eph` format was designed to be:
 | HCL | Learning curve, overkill |
 
 The trade-off is a small custom parser (see [Internals](internals.md#parser))
-and a couple of sharp edges documented for users: comments must be on their
-own line, and an unknown `SCREAMING_SNAKE_CASE` key inside a section is
-reclassified as a trailing top-level variable (with a warning) rather than an
-error.
+and one sharp edge documented for users: comments must be on their own line,
+since there is no inline-comment stripping. The parser favors hard errors over
+guessing: an unknown key inside a section, a duplicated section or property, an
+invalid service or variable name, and a malformed interpolation are all
+rejected at parse time rather than silently reinterpreted or overwritten. A
+top-level variable placed directly after a service section is the sharpest
+case of this: sections do not end at blank lines, so it is rejected rather
+than treated as ending the section, and the error names the two places a
+variable can legally go (above the first section, or inside a reserved
+`[env]` section).
 
 ## Service types
 
@@ -178,16 +206,24 @@ no group).
 
 `ServiceManager::status` reconciles state by looking up a container named
 `eph-<short_id>-<service>`, which exists for image and dockerfile services
-(and is approximated by a tracked PID for `run` services). Compose names its
-own containers (`<project>-<service>-N`), so a compose service has no such
-container. It is instead recorded with a `compose:<project>` id and detected
-by `DockerClient::compose_project_running`, which lists containers carrying
-the `com.docker.compose.project=<project>` label. This is what lets compose
-services appear in `status` and resolve their `expose` ports in `eph env`.
-Teardown remains coarser than for direct containers: `stop_service` always
-runs `docker compose down` regardless of the `--rm` flag, and `clean` removes
-only the named volumes declared in the `.eph` file (Compose-internal volumes
-are left to `docker compose`).
+(and is approximated by an identity-checked PID for `run` services). Compose
+names its own containers (`<project>-<service>-N`), so a compose service has
+no such container. It is instead recorded with a `compose:<project>` id and
+detected by `DockerClient::compose_project_running`, which lists containers
+carrying the `com.docker.compose.project=<project>` label. This is what lets
+compose services appear in `status` and resolve their `expose` ports in
+`eph env`. A service's `env.X` values are resolved (`${service.property}`
+interpolation) and passed as `docker compose`'s process environment on every
+invocation (`up`, `port`, `down`), the same way they are resolved into an
+image/dockerfile container's own environment, so a compose file's `${VAR}`
+substitution sees the same connection details eph itself resolves. Teardown
+remains coarser than for direct containers: `stop_service` runs
+`docker compose down` regardless of the `--rm` flag, but only when the
+project is known to be up (from `status` or recorded state); a service never
+brought up is a no-op, matching the container path, and a `docker compose
+down` that does run and fails is a real error that aborts teardown rather
+than being swallowed. `clean` removes only the named volumes declared in the
+`.eph` file (Compose-internal volumes are left to `docker compose`).
 
 ## Health checks
 
@@ -239,12 +275,21 @@ environment to arbitrary commands.
 Three deliberately distinct levels:
 
 - `eph down`: stop services, leave containers and volumes in place for a fast
-  restart. Clears persisted state entries.
+  restart. Removes each service's own state entry as it is actually stopped
+  (not a wholesale clear), and does the same for any state entry whose
+  section was later renamed or deleted from the `.eph` file, so a rename never
+  strands a running container beyond `down`'s reach.
 - `eph down --rm`: additionally remove the stopped containers. Named-volume
   data is preserved; the next `up` recreates containers.
 - `eph clean`: full reset. Remove containers (and Compose projects and
-  processes), remove per-workspace **named volumes** (data loss), and delete
-  the state directory. Bind mounts are never removed.
+  processes), including ones recorded under a renamed or deleted section;
+  remove per-workspace **named volumes** (data loss); sweep Docker itself for
+  any leftover container or volume still carrying the workspace's
+  `eph-<short_id>-` prefix (a service renamed before state recorded it, or a
+  resource orphaned by a crash before state was written); and delete the
+  state directory. Bind mounts are never removed. Reports how many services,
+  volumes, and the state directory were actually removed, not how many the
+  `.eph` file declares.
 
 ## CLI design
 
