@@ -201,13 +201,18 @@ the `EPH_<NAME>_*` metadata variables (allowing both `-` and `_` would let
 Reopening a section name later in the file (`[db]` ... `[db]` again) is a
 parse error naming both line numbers; sections are never silently merged.
 
+Environment variable names must match `^[A-Za-z_][A-Za-z0-9_]*$`. Names that
+start with `EPH_`, in any letter case, are reserved for eph's workspace and
+service metadata and are rejected in top-level variables, `[env]`, and
+`env.<KEY>=` properties.
+
 ### Service properties
 
 | Property | Repeatable | Description |
 |----------|:----------:|-------------|
 | `image=` | no | Docker image to pull and run. |
 | `dockerfile=` | no | Path to a Dockerfile to build (relative to the workspace). |
-| `context=` | no | Build context for `dockerfile=` (defaults to the Dockerfile's directory). |
+| `context=` | no | Build context for `dockerfile=` (defaults to the Dockerfile's directory). Illegal with every other source. |
 | `compose=` | no | Path to a Docker Compose file to delegate to. |
 | `run=` | no | Shell command for a non-Docker service. |
 | `role=` | no | The role (tier) this service belongs to; a free-form name you choose, such as `dep` or `app`. See [Roles and ordering](#roles-and-ordering). |
@@ -215,14 +220,14 @@ parse error naming both line numbers; sections are never silently merged.
 | `port=` | no (one per service) | A container port to publish on a random host port. For `run=` services, `port=auto` makes eph allocate the port (see [Running Your App](run-your-app.md#portauto)). Illegal on `compose=` services; use `expose.<name>=` there instead. |
 | `port.<name>=` | one per distinct name | A **named** port, for multi-port services. `port.<name>=auto` is allowed for `run=` services. Same restrictions as `port=`. |
 | `env.<KEY>=` | one per distinct key | An environment variable passed into the container. |
-| `volume=` | yes | A volume mount: `name:/path` (named) or `./host:/path` (bind). |
+| `volume=` | yes | A volume mount: `name:/path` (named) or `./host:/path` (bind). Only legal for `image=` and `dockerfile=` services. |
 | `healthcheck=` | no | Command that must succeed before the service counts as ready. |
-| `ready-timeout=` | no | Seconds to wait for the `healthcheck` (default 30; 60 for compose). Ignored when no `healthcheck` is set. |
+| `ready-timeout=` | no | Non-zero seconds to wait for the `healthcheck` (default 30; 60 for compose). Requires `healthcheck=`. |
 | `pre-start=` | yes | Hook run before the service is created. |
 | `post-start=` | yes | Hook run after every service in the `up` is healthy. |
 | `pre-stop=` | yes | Hook run before the service is stopped. |
 | `post-stop=` | yes | Hook run after the service has stopped. |
-| `expose.<name>=` | one per distinct name | For `compose=`: expose a port for interpolation. Illegal on every other source; those use `port=`/`port.<name>=`. |
+| `expose.<alias>=` | one per distinct alias | For `compose=`: expose `<compose-service>:<container-port>` for interpolation. The short form `<container-port>` targets the Compose service named by the alias. Illegal on every other source. |
 
 "Repeatable" means the property can appear multiple times and every value is
 kept; several `post-start=` lines run in order. Every non-repeatable property
@@ -267,10 +272,11 @@ Port names follow the same rule as service names (`^[a-z][a-z0-9-]*$`): they
 become part of `${service.port.<name>}` interpolation and the
 `EPH_<SERVICE>_PORT_<NAME>` metadata variable.
 
-Reference them as `${minio.port.api}` and `${minio.port.console}`. For a
-single-port service, `${service.port}` is the one port. For a multi-port
-service, always use the named form; `${service.port}` is not well-defined when
-there are several.
+Reference them as `${minio.port.api}` and `${minio.port.console}`. A service
+with exactly one port may use `${service.port}`, whether that port was declared
+as `port=` or `port.<name>=`. A bare `${service.port}` is a parse error when the
+service exposes zero or multiple ports; use a named reference for multi-port
+services.
 
 `port=` and `port.<name>=` are only for services eph itself publishes:
 `image=`, `dockerfile=`, and `run=`. On a `compose=` service they are a parse
@@ -280,6 +286,9 @@ error; declare `expose.<name>=` instead (see
 ## Volumes
 
 `volume=` accepts two forms, distinguished by the shape of the host part:
+
+Volumes are supported only for `image=` and `dockerfile=` services. Compose
+volumes belong in the Compose file, and host processes use ordinary paths.
 
 - **Named volume**: a bare name that does not look like a path. Docker manages
   it, and `eph` prefixes it per workspace (`eph-<short_id>-<service>-<name>`).
@@ -326,6 +335,7 @@ Where the command runs depends on the service type, and this matters:
 
 If you omit `healthcheck`, `eph` waits a fixed 500 ms and assumes the service
 is ready. `ready-timeout` defaults to 30 seconds, or 60 for compose services.
+`ready-timeout=0` and a timeout without a health check are parse errors.
 
 ## Lifecycle hooks
 
@@ -564,28 +574,24 @@ Two different things happen at two different times:
   services. This is consistent across every source: an `image=` or
   `dockerfile=` service's `env.<KEY>=` is resolved just before its container is
   created, a `compose=` service's `env.<KEY>=` is resolved into the environment
-  `docker compose up` and `docker compose down` themselves run with (so the
-  compose file's own `${VAR}` substitution sees it too), and a `run=` service's
+  `docker compose up` and port discovery run with (so the compose file's own
+  `${VAR}` substitution sees it too), and a `run=` service's
   `env.<KEY>=` is resolved into the process it launches. For hooks, `eph run`,
-  and every service's own `env.<KEY>=`, a reference that parsed fine but names
-  a service that is not running right now is left in place verbatim rather
-  than blanked, so an unresolved reference stays visible instead of silently
-  disappearing.
+  and every service's own `env.<KEY>=`, every reference must resolve before
+  eph launches the hook, command, process, container, or Compose invocation.
+  A stopped dependency is an error naming the affected variable and reference.
 
-  **`eph env` is the one exception.** Its output is handed straight to a
-  shell's `eval`, and a literal `${...}` there is a syntax the shell cannot
-  evaluate. So instead of leaving a raw placeholder, `eph env` drops the whole
-  variable from its output and prints a warning naming the variable and the
-  unresolved reference to stderr, for example:
+  Shell output from `eph env` has one extra safety requirement: stale variables
+  from an earlier successful evaluation must be cleared. It emits an unset for
+  each unresolved variable, appends a shell failure statement, warns on stderr,
+  and exits non-zero. JSON output omits unresolved variables and also exits
+  non-zero. For example:
 
   ```
-  warning: omitted DATABASE_URL: ${postgres.port} is not resolvable while postgres is not running
+  warning: DATABASE_URL: ${postgres.port} is not resolvable while postgres is not running
   ```
 
-  The command still exits `0`; run `eph up` and the variable reappears once
-  its service is running. This contract belongs to `eph env` alone: hooks,
-  `eph run`, and a service's own `env.<KEY>=` all keep the leave-verbatim
-  behavior above.
+  Run `eph up` and evaluate `eph env` again once the dependency is running.
 
   Resolved values are host-facing: `${service.port}` is the port Docker
   published on the host's loopback interface, and `${service.host}` is always
@@ -599,13 +605,16 @@ Two different things happen at two different times:
   addressing the sibling on a shared Docker network by its container name and
   **container** port, not through eph's interpolated, host-facing value.
 
-`run=`, hook (`pre-start`/`post-start`/`pre-stop`/`post-stop`), and
-`healthcheck=` command strings are never scanned for placeholders: those are
-shell commands, and `${VAR}` there is the shell's own parameter expansion, not
-eph's interpolation.
+`run=` and hook (`pre-start`/`post-start`/`pre-stop`/`post-stop`) command
+strings are shell commands, so `${VAR}` there belongs to the shell rather than
+eph. Health checks preserve ordinary shell forms such as `${PORT}` too, while
+recognizing, validating, and resolving dotted eph references such as
+`${api.port}` before execution.
 
-For a `compose` service, the ports you declared with `expose.<name>=` resolve
-as `${service.port.<name>}`.
+For a `compose` service, `expose.<alias>=<compose-service>:<container-port>`
+resolves as `${service.port.<alias>}`. The short form
+`expose.<alias>=<container-port>` targets the Compose service whose name is the
+alias. Failure to query that exact mapping from Compose is a startup error.
 
 ## Complete example
 

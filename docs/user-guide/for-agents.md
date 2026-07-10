@@ -40,7 +40,8 @@ eph clean                    # remove containers + named volumes (DATA LOSS) + s
 Prefer `eph env -f json` for parsing:
 
 ```sh
-DATABASE_URL=$(eph env -f json | jq -r .DATABASE_URL)
+env_json=$(eph env -f json) || exit $?
+DATABASE_URL=$(printf '%s' "$env_json" | jq -r .DATABASE_URL)
 ```
 
 ## Prewarm dependency services on session start
@@ -101,15 +102,15 @@ for the full write-up.
 
 | Command | Effect |
 |---------|--------|
-| `eph up [svc...] [--role R]...` | Start all / named services. `--role R` (repeatable) adds a role plus its dependency closure (needs a `roles_order`); combines with names. Runs each service's `pre-start` just before it is created, pulls/builds, waits for health, then runs every `post-start`. Both hook kinds run on **every** `eph up`; a failing hook aborts the `up`. `--skip-hooks` skips both. Serializes with any other `eph up`/`down`/`clean` already running in the same workspace instead of racing it. After success, a filesystem-only check for *other* stale workspaces (deleted checkouts) prints a one-line note toward `eph system prune`; it never fails the `up`. |
-| `eph down [--rm \| -r] [svc...] [--role R]...` | Stop all / named. `--role R` (repeatable) adds a role plus everything that depends on it. `--rm` also removes containers. Compose is always fully torn down (a failed `docker compose down` is now a real error, not swallowed). Runs `pre-stop` before each stop and `post-stop` after; a failing `pre-stop` aborts with the service left running, a failing `post-stop` aborts the rest. `--skip-hooks` bypasses both. **A bare `eph down` (no names) also tears down anything `state.json` remembers starting under a name no longer in the `.eph` file** (a renamed or deleted section); a targeted `eph down <svc>` only accepts names still in the file. |
+| `eph up [svc...] [--role R]...` | Start all / selected services. In roles mode, a positional service also selects the dependency roles below its role, without selecting peer services in its own role. `--role R` (repeatable) selects the whole role plus its dependency closure. Runs each selected service's `pre-start` just before creation, pulls/builds, waits for health, then runs every selected `post-start`. Both hook kinds run on **every** `eph up`; a failing hook aborts the `up`. `--skip-hooks` skips both. Serializes with any other `eph up`/`down`/`clean` in the workspace. |
+| `eph down [--rm \| -r] [svc...] [--role R]...` | Stop all / selected services. In roles mode, a positional service also selects the dependent roles above its role, without selecting peer services in its own role. `--role R` selects the whole role plus all dependent roles. `--rm` also removes containers. Compose is always fully torn down. Runs `pre-stop` before each stop and `post-stop` after; failures abort. A bare `eph down` also tears down services remembered in state but removed or renamed in `.eph`. |
 | `eph clean` | Full reset: remove containers + named volumes + state. Deletes data. Also sweeps recorded-but-renamed/deleted services and any leftover `eph-<short_id>-*` container/volume Docker still has. Prints **measured** counts (what was actually stopped/removed, not what is declared); a never-started workspace reports zeros. Runs teardown hooks like `eph down`; `--skip-hooks` bypasses them. |
 | `eph system prune [--dry-run] [--compatibility-v042] [--force-live] [-y\|--yes]` | Global prune of resources whose recorded workspace path is missing or empty. Verifies `run=` process identity before killing a PID; warns and skips when it cannot. Skips (does not force-kill) a stale-pathed workspace that still has a running container or live process unless `--force-live`; confirms before deleting unless `--dry-run`, `--yes`, or nothing would be removed (required when stdin is not a terminal). |
 | `eph dev [svc] [--clean] [--watch GLOB]... [--skip-hooks]` | Foreground the stack for a preview server: up + seed + foreground the `run=` app; teardown of what it started on stop. Hooks are interleaved exactly like `eph up` (each backing service's `pre-start` runs right before it starts, the foreground app's `pre-start` runs right before it starts, then every service's `post-start` runs once everything is up). `--skip-hooks` skips all four hook phases, matching `eph up --skip-hooks` / `eph down --skip-hooks`. |
-| `eph run <cmd>...` | Run a command in the workspace root with the resolved env + `EPH_*` metadata. Every token after `run` belongs to the command, flag-shaped or not (`eph run -v x`, `eph run -h` pass `-v`/`-h` straight through; no `--` needed). A flag *before* `run` is still eph's own. Exits with the command's code. |
+| `eph run <cmd>...` | Run a command in the workspace root with resolved env + `EPH_*` metadata. Refuses to launch if any top-level reference is unresolved. Every token after `run` belongs to the command, including flag-shaped tokens; no `--` is needed. Exits with the child's native status. |
 | `eph logs [svc] [-f] [-n N]` | Show logs. No svc: all services interleaved, each line tagged `[name]`. One svc: raw. Works even for stopped services. `-f` follows. |
 | `eph status` | Running services and ports. |
-| `eph env [-f export\|fish\|powershell\|json]` | Print resolved top-level env vars (stdout). A variable with an unresolved reference is omitted and warned about on stderr instead of printed with a raw placeholder; exit code stays 0. `--format json` keys follow declaration order. |
+| `eph env [-f export\|fish\|powershell\|json]` | Print resolved top-level env vars. Unresolved shell variables are explicitly unset before the emitted script fails; JSON omits them. Both forms warn on stderr and exit non-zero. `--format json` keys follow declaration order. |
 | `eph check` | Validate `.eph` (no Docker). |
 | `eph info` | Workspace id / prefix / paths (no Docker). |
 | `eph skills install` | Install this guidance as a discoverable agent skill (`.claude/skills`, `.agents/skills`). No Docker. Warns on stderr and installs into the current directory if run outside a git repo. |
@@ -172,7 +173,7 @@ when generating a `.eph` file: `eph check` rejects it and names both fixes
 |-----|---------|
 | `image=` | Run a Docker image. |
 | `dockerfile=` (+ `context=`) | Build a local image (paths from workspace root). |
-| `compose=` (+ `expose.<name>=`) | Delegate to a Compose file. `port=`/`port.<name>=` are illegal here. |
+| `compose=` (+ `expose.<alias>=`) | Delegate to a Compose file. Use `<compose-service>:<port>` when the target differs from the alias. `port=` and `port.<name>=` are illegal here. |
 | `run=` | Host process via the platform shell. Numeric ports are NOT remapped (declared value reported as-is); `port=auto` makes eph allocate and inject the port. |
 
 ### Properties
@@ -181,11 +182,11 @@ when generating a `.eph` file: `eph check` rejects it and names both fixes
 |-----|-------|
 | `port=` / `port.<name>=` | Single / named ports. `auto` is valid for `run=` services only. Illegal on `compose=` (use `expose.<name>=`). |
 | `env.<KEY>=` | Container env (not shell env). One value per distinct `KEY`. May contain `${service.property}`, resolved against running services for every source (`image`, `dockerfile`, `compose`, `run`) at the moment that service starts. |
-| `volume=` | `name:/path` = named volume; `./host:/path` or `/abs:/path` = bind mount. Repeatable. |
+| `volume=` | `name:/path` = named volume; `./host:/path` or `/abs:/path` = bind mount. Repeatable; only legal for `image=` and `dockerfile=`. |
 | `role=` | Tier name for roles mode; requires a `roles_order` listing every role. |
 | `command=` | Override container CMD (shell-word split, no shell). Only legal for `image=`/`dockerfile=`; a parse error on `run=`/`compose=`. |
 | `healthcheck=` | image/dockerfile: no shell. run/compose: platform shell (`sh -c` / `cmd /C`). |
-| `ready-timeout=` | Seconds (default 30; compose 60). |
+| `ready-timeout=` | Non-zero seconds (default 30; compose 60); requires `healthcheck=`. |
 | `pre-start=` / `post-start=` / `pre-stop=` / `post-stop=` | Lifecycle hooks. Host platform shell in workspace root; repeatable; run with the resolved env + `EPH_*` metadata + the service's `env.X` injected. `pre-start` runs just before its service is created (no own port yet); `post-start` after all services are healthy. Both run on every `up`; failures abort. `pre-stop` runs before a stop (failure aborts, service left running); `post-stop` after (failure aborts the rest of teardown). |
 
 Every property above except the four marked repeatable is single-valued: a
@@ -201,13 +202,12 @@ empty value (everything except `env.<KEY>=`, where empty is legal).
 | `${svc.port.name}` | Named port. |
 | `${svc.host}` | `localhost`. |
 
-Unresolved refs (stopped service, typo) are left verbatim for hooks, `eph run`,
-and a service's own `env.*`. `eph env` is the one exception: a variable with an
-unresolved ref is omitted from its output and warned about on stderr instead
-(exit code still 0), since that output is meant for direct `eval`. All running
-services resolve, including `compose` (tracked by the
-`com.docker.compose.project` label); reference a compose service's
-`expose.<name>=` port as `${svc.port.<name>}`.
+Unknown services, unknown properties, missing named ports, and ambiguous bare
+ports are parse errors. A valid reference to a stopped service fails closed at
+runtime: hooks, `eph run`, and service startup do not receive a raw placeholder.
+`eph env` unsets affected shell variables and fails; JSON omits them and fails.
+Compose aliases use `expose.<alias>=<compose-service>:<port>` and resolve as
+`${svc.port.<alias>}`.
 
 Resolved values are **host-facing** (`${svc.port}` is the host's loopback
 port). That is correct for a hook, `eph run`, or a `run=` process, all of
@@ -220,20 +220,23 @@ interpolation.
 
 ## Behaviors that matter
 
-- **Idempotent up** (image/dockerfile): running is reused,
-  stopped-but-present is restarted, absent is created fresh. `run` reuses a
-  live PID or respawns; `compose` delegates to `docker compose up -d`.
-  Regardless of path, hooks run for every service on **every** `eph up`; keep
-  hooks idempotent, or use `eph run` for one-off work.
+- **Idempotent up reconciles configuration.** A resource is reused or restarted
+  only when its canonical runtime fingerprint still matches. Source, immutable
+  image, port, resolved environment, volume, health, build, and command drift
+  removes the old backend and recreates it. Dockerfile sources build through
+  Docker's cache on every `up`. Reused services rerun declared health checks;
+  failed starts are removed. Hooks still run on every `up`.
 - **Ports are random and change per create.** Never hardcode; always go
   through `eph env`.
 - **Image health checks have no shell**: one whitespace-split command, no
   pipes / `&&` / `$VAR` / quoted spaces. The binary must exist in the image.
+- **Unresolved runtime references fail closed.** Hooks, services, health
+  checks, and `eph run` never receive a raw eph placeholder.
 - **Isolation by path**: two checkouts = different containers, volumes,
   ports.
 - **`compose` is thin** but tracked (by project label): `down` and
-  `down --rm` both fully tear it down; `clean` removes only `.eph` `volume=`
-  named volumes, not Compose-internal ones.
+  `down --rm` both fully tear it down. Compose services cannot declare `.eph`
+  volumes, and `clean` does not remove volumes defined inside the Compose file.
 - **No `eph init`**: author `.eph` by hand.
 - **Windows runs natively**: `run=`, hooks, and shell health checks go
   through `cmd /C` (vs `sh -c` on Unix), so command strings may need a

@@ -175,15 +175,20 @@ will not run that `post-stop` again. If a broken hook is wedging teardown:
 
 ## A port reference did not resolve
 
-If `eph env` leaves a literal `${service.port}` in its output:
+`eph check` rejects unknown services, unknown properties, missing named ports,
+and ambiguous bare port references. A valid reference can still be unavailable
+at runtime when its service is stopped. In that case, `eph env` unsets the
+affected shell variable or omits the JSON key, warns on stderr, and exits
+non-zero. Other execution paths fail before launching a child.
 
 - **The service is not running.** Interpolation only resolves against running
   services. Run `eph up` first, and check with `eph status`.
-- **The name is wrong.** `${db.port}` only resolves if the section is `[db]`.
-- **It is a multi-port service.** `${minio.port}` is not well-defined when a
-  service declares several ports; use the named form `${minio.port.api}`. The
-  same applies to `compose` services: reference each `expose.<name>=` port as
-  `${service.port.<name>}`.
+- **The name is wrong.** `${db.port}` only resolves if the section is `[db]`;
+  `eph check` reports this before runtime.
+- **It is a multi-port service.** `${minio.port}` is rejected when a service
+  declares several ports; use `${minio.port.api}`. Compose mappings use
+  `expose.<alias>=<compose-service>:<port>` and resolve as
+  `${service.port.<alias>}`.
 
 ## A `run=` service is on the wrong port
 
@@ -235,12 +240,12 @@ command wedged.
 
 ## `docker compose down` failed during `eph down` or `eph clean`
 
-A compose service's teardown failure (a broken compose file, a missing
-`docker compose` plugin) is a real error and stops the rest of the teardown,
-rather than being silently treated as success. Fix the underlying problem
-(`docker compose -f <file> -p eph-<short_id>-<service> down` reproduces it
-directly) and re-run `eph down` or `eph clean`. `--skip-hooks` does not help
-here: it only skips lifecycle hooks, not the compose command itself.
+A compose service's teardown failure, such as a missing `docker compose`
+plugin, is a real error and stops the rest of the teardown. eph tears down by
+recorded project name without rereading the Compose file:
+`docker compose -p eph-<short_id>-<service> down` reproduces the command.
+Fix the underlying problem and rerun `eph down` or `eph clean`. `--skip-hooks`
+does not help here; it only skips lifecycle hooks.
 
 If the workspace directory itself was deleted, run `eph system prune` from
 anywhere. It scans all eph state directories and removes resources for

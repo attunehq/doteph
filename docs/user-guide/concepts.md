@@ -36,12 +36,12 @@ of the same repository. That is the point of the tool: run the same project in
 several directories at once, with no shared ports and no shared data.
 
 Isolation is keyed on a **workspace ID**: the SHA-256 hash of the workspace's
-absolute (canonicalized) path. The first 8 hex characters (the **short ID**)
-namespace everything `eph` creates:
+absolute (canonicalized) path. New workspaces use the first 16 hex characters
+as the **short ID** that namespaces everything `eph` creates:
 
 ```
-~/projects/app/      ->  short ID a1b2c3d4  ->  eph-a1b2c3d4-postgres
-~/projects/app-v2/   ->  short ID e5f6g7h8  ->  eph-e5f6g7h8-postgres
+~/projects/app/      ->  short ID a1b2c3d4e5f60718  ->  eph-a1b2c3d4e5f60718-postgres
+~/projects/app-v2/   ->  short ID e5f60718293a4b5c  ->  eph-e5f60718293a4b5c-postgres
 ```
 
 | Resource | Name |
@@ -52,8 +52,11 @@ namespace everything `eph` creates:
 | Compose project (`compose=`) | `eph-<short_id>-<service>` |
 
 Because the ID comes from the path, the two checkouts above get different
-container names, different volumes, and different ports. They never see each
-other's data.
+container names, different volumes, and different ports. A workspace with
+verified state from an older eight-character release keeps that namespace
+until `eph clean`; the next command then adopts the 16-character form. Eph
+blocks if legacy state exists but cannot be verified, instead of starting a
+second namespace beside unknown resources.
 
 Run `eph info` to see the ID, short ID, container prefix, and paths for the
 current workspace.
@@ -105,13 +108,11 @@ running** services:
 | `${service.port.name}` | A named port (multi-port services) |
 | `${service.host}` | Always `localhost` |
 
-If a service is not running, `eph env` **omits** the affected variable
-entirely and warns on stderr instead, since its output is `eval`'d directly
-and a raw `${...}` would break the shell. The command still exits `0`. (Hooks,
-`eph run`, and a service's own `env.*` values keep the older behavior of
-leaving an unresolved reference untouched; see
-[The `.eph` File](eph-file.md#interpolation).) Run `eph up` before `eph env`
-so everything resolves.
+If a service is not running, `eph env` clears the affected variable in shell
+formats, appends a failing shell statement, warns on stderr, and exits nonzero.
+JSON omits the affected key and also exits nonzero. `eph run` refuses to launch
+with an incomplete top-level environment. Run `eph up` first so every
+reference resolves.
 
 All four service types resolve once running: `eph` finds `image` and
 `dockerfile` services by container name, `run` services by their tracked
@@ -130,10 +131,10 @@ beside it:
 | macOS | `~/Library/Application Support/eph/<short_id>/state.json` |
 | Windows | `%LOCALAPPDATA%\eph\<short_id>\state.json` |
 
-Set `EPH_STATE_ROOT` to override the parent directory (the `eph` above
-`<short_id>`) for every workspace, in place of the platform default: useful
-for relocating eph's state off the default disk, or for a test harness that
-wants a throwaway state root instead of touching your real one.
+Set `EPH_STATE_ROOT` to an absolute path to override the parent directory (the
+`eph` above `<short_id>`) for every workspace. Relative values are rejected so
+state cannot move when a command runs from a different directory. The override
+is useful for relocating state or giving a test harness a throwaway root.
 
 State is why `eph status` and `eph env` answer instantly, why assigned ports
 survive a terminal restart, and why `eph` knows which containers and volumes
@@ -171,19 +172,27 @@ unnoticed until you happen to run prune yourself.
 
 ## The service lifecycle
 
-Bringing a service up is **idempotent**. `eph up` takes whichever of three
-paths applies:
+Bringing a service up is **idempotent when its effective configuration still
+matches**. `eph up` fingerprints the source, immutable image, ports, resolved
+environment, volumes, health settings, build context, and command before it
+chooses a path:
 
-1. **Already running**: the service is reused. Nothing restarts.
-2. **Stopped but still present** (after `eph down`): the existing container is
-   restarted. Fast, and the data is still there.
+1. **Already running and matching**: the service is reused, then any declared
+   health check is rerun.
+2. **Stopped but still present and matching** (after `eph down`): the existing
+   resource is restarted and checked. Fast, and the data is still there.
 3. **Not present**: a fresh container is created, pulling or building the image
    if needed.
+4. **Configuration drifted**: the old resource is removed through the backend
+   type that created it, then the requested configuration is created. This also
+   handles source changes such as `run=` to `image=`.
 
 That is the container story (`image` and `dockerfile`). The other two sources
-have their own idempotency: a `run` service is reused if its tracked process is
-alive and respawned otherwise, and a `compose` service delegates to
-`docker compose up -d`, which is itself idempotent.
+have the same fingerprint gate: a `run` service includes its complete resolved
+process environment, and Compose includes its exact delegated configuration.
+Dockerfile services build through Docker's cache on every `up`, then use the
+resulting image ID to detect effective context changes. A failed start is
+removed before `up` returns, so the next attempt cannot adopt a broken leftover.
 
 ### Hooks bracket the lifecycle
 

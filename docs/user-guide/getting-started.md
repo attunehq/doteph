@@ -132,7 +132,7 @@ eph status
 
 ```
 Workspace: /home/you/projects/myapp
-ID: a1b2c3d4
+ID: a1b2c3d4e5f60718
 
 Running services:
   postgres -> localhost:54321

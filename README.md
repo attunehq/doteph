@@ -9,8 +9,8 @@ workspace its own isolated services, started on demand, with host ports
 assigned automatically:
 
 ```
-~/projects/app/      ->  eph-a1b2c3d4-postgres (localhost:54321)
-~/projects/app-v2/   ->  eph-e5f6g7h8-postgres (localhost:54322)
+~/projects/app/      ->  eph-a1b2c3d4e5f60718-postgres (localhost:54321)
+~/projects/app-v2/   ->  eph-e5f60718293a4b5c-postgres (localhost:54322)
 ```
 
 You describe the services in a `.eph` file, run `eph up`, and load the
