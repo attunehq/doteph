@@ -1,6 +1,6 @@
 ---
 name: names-are-not-type-safety
-description: Apply Alexis King's "Names are not type safety" advice in Homeport. Use when adding, reviewing, or refactoring Rust newtypes, wrapper structs, ID/name/path/text types, type aliases, domain enums, smart constructors, or APIs that rely on naming conventions for correctness.
+description: Apply Alexis King's "Names are not type safety" advice in eph. Use when adding, reviewing, or refactoring Rust newtypes, wrapper structs, workspace or process identities, service names, paths, command text, state records, domain enums, smart constructors, or APIs that rely on naming conventions for correctness.
 ---
 
 # Names Are Not Type Safety
@@ -17,9 +17,9 @@ Use Rust types to encode functional differences and invariants. Do not add wrapp
 6. Prefer correct-by-construction datatypes over wrappers with comments when Rust can express the shape directly.
 7. Run `cargo fmt --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, and targeted tests.
 
-## Homeport Rules
+## eph rules
 
-- Do not add `pub struct FooId(pub String);`-style public transparent domain wrappers. Use a private field plus a parser/smart constructor, or use a type alias if it is only a label.
+- Do not add `pub struct FooId(pub String);`-style public transparent domain wrappers. Use a private field plus a parser or smart constructor, or use a type alias if it is only a label.
 - Avoid deriving broad conversion or serde traits on checked wrappers unless that does not weaken the invariant.
 - Avoid `DerefMut` for checked wrappers unless mutation preserves the invariant or reparses before reuse.
 - Do not make taxonomy types just because the real-world concepts have different names. Split types when they behave differently or rule out different states.

@@ -3,10 +3,12 @@
 `eph` is a developer tool that, by design, executes commands and manages Docker
 containers based on the contents of a workspace's `.eph` file. Specifically, it:
 
-- runs shell commands from `.eph` (`run=`, the `pre-start=` / `post-start=` /
-  `pre-stop=` / `post-stop=` lifecycle hooks, and `healthcheck=`) on your machine,
+- runs `run=` services and lifecycle hooks through the host platform shell,
+- runs `run=` and Compose health checks through the host platform shell and
+  image or Dockerfile health checks inside their containers without a shell,
 - starts, stops, and removes Docker containers and named volumes,
-- publishes container ports (bound to `127.0.0.1`), and
+- publishes image and Dockerfile service ports on `127.0.0.1`; Compose port
+  bindings follow the referenced Compose file,
 - reads and prints environment values (`eph env`) and persists service state to
   your platform's local-data directory.
 

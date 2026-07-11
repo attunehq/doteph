@@ -18,7 +18,7 @@ integration tests.
 git clone https://github.com/attunehq/doteph.git
 cd doteph
 make dev        # debug build
-make test       # unit + doctests + Docker integration tests
+make test       # unit + doctests + standard Docker integration tests
 ```
 
 Optional: enable the repo's pre-commit hook so formatting and lints run before
@@ -54,8 +54,9 @@ cargo test -- --test-threads=1   # needs a running Docker daemon
 CI runs these on every push and pull request, and additionally runs the
 heavyweight stress suite (`cargo test --test stress -- --ignored
 --test-threads=1`). The integration tests start real containers, so they are run
-single-threaded to avoid host-port contention. `make precommit` runs the format
-and lint steps; `make test` runs the standard suite. See the
+single-threaded to avoid host-port contention. `make precommit` applies lint
+fixes, formats the code, and refreshes checked-in bundled skill copies;
+`make test` runs the standard suite. See the
 [Developer Guide](docs/developer-guide/building-and-testing.md) for the full
 breakdown.
 

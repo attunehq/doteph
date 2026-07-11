@@ -98,10 +98,10 @@ volumes, health settings, build context, and command override. A `run=` service
 also includes its final top-level and metadata environment, so a dependency's
 host-port change restarts dependents that consumed it.
 
-When the fingerprint differs, eph tears down the old resource through its
-recorded backend type and creates the new one. This applies to stopped resources
-too, and to source changes such as `run=` to `image=`. Legacy state without a
-fingerprint is reconciled once rather than trusted. Reused services rerun their
+When the fingerprint differs, eph tears down the recorded resource through its
+backend type and creates the requested one. This applies to stopped resources
+and to source changes such as `run=` to `image=`. A state record without a
+fingerprint is reconciled rather than trusted. Reused services rerun their
 declared health check, and a failed start is removed before `up` returns.
 
 ## `compose=`: delegate to Docker Compose
@@ -186,7 +186,10 @@ The essentials:
 - `eph down` stops the process gracefully, waits, then force-kills, and it
   targets the **whole process tree** the command spawned, so a compound
   command (`run=build && serve`, a pipeline, a backgrounded child) is torn
-  down completely. Starting an already-running `run` service again is a no-op.
+  down completely. eph captures process identity at launch and verifies it
+  before any lifecycle command signals the recorded PID.
+- A matching process is reused by `eph up`; its health check and selected
+  startup hooks still run under the ordinary `up` contract.
 
 `run=` services work natively on Linux, macOS, and Windows. On Windows the
 command goes through `cmd`, so a command string written for `sh` may need a

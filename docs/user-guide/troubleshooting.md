@@ -80,12 +80,12 @@ catches it before any `eph up`. Two shapes show up in practice:
   ```
   'HEALTHCHECK' at line 5 looks like an environment variable, but it is
   inside service 'postgres' (sections do not end at blank lines). To set it
-  in the container, write env.HEALTHCHECK=...; to export it from `eph env`,
+  for the service, write env.HEALTHCHECK=...; to export it from `eph env`,
   move it into an [env] section or above the first section
   ```
 
   The error names both possible intents so you can pick the right fix: prefix
-  it with `env.` if it belongs in the container, or move it into an `[env]`
+  it with `env.` if it belongs to the service, or move it into an `[env]`
   section (or above the first section) if it belongs to your shell. See
   [Where to put top-level variables](eph-file.md#where-to-put-top-level-variables).
 
@@ -129,8 +129,7 @@ value are validated at parse time, before any `eph up`:
   this is always a genuine typo or a missing section.
 
 These are different from [a port reference that does not resolve](#a-port-reference-did-not-resolve):
-that is a well-formed reference to a real service that just is not running
-right now.
+that is a well-formed reference to a real service that is not running.
 
 ## An inline comment broke a value
 
@@ -224,8 +223,8 @@ broken file aside to `state.json.corrupt`, and continues as if the workspace
 had no recorded state, rather than aborting. Containers and compose projects
 are found again from Docker by name on the next `eph up` or `eph status`; a
 `run=` service's PID is the one thing this cannot recover, since the PID lived
-only in the corrupted file, so stop a leftover `run=` process by hand
-(`docker ps` will not show it) if `eph status` still reports it running.
+only in the corrupted file. Inspect the host process table and stop a leftover
+process by hand; `eph status` and `docker ps` cannot discover it.
 
 ## "another eph command is running in this workspace; waiting for it"
 
@@ -249,10 +248,9 @@ does not help here; it only skips lifecycle hooks.
 
 If the workspace directory itself was deleted, run `eph system prune` from
 anywhere. It scans all eph state directories and removes resources for
-recorded workspace paths that are missing or are now empty folders. Use
-`eph system prune --dry-run` first to see the plan. State written by eph
-v0.4.2 and earlier has no recorded workspace path and is skipped unless you
-pass `--compatibility-v042`.
+recorded workspace paths that are missing or empty folders. Use `eph system
+prune --dry-run` first to see the plan. An 8-character state directory without
+workspace metadata is skipped unless you pass `--compatibility-v042`.
 
 For `run=` services, system prune stops only a recorded PID whose live process
 still matches the identity eph captured at launch; PIDs can be reused, so a
@@ -262,17 +260,16 @@ still leave processes behind after that tree exits; stop those manually.
 
 ## `run=` teardown says the PID has no recorded process identity
 
-State from an older eph version may contain a `run=` PID without the process
-identity needed to distinguish it from a reused PID. `eph down`, `eph clean`,
-and config reconciliation refuse to signal a live PID in that state. Inspect
-the process, stop it manually if it still belongs to the workspace, and rerun
-the eph command. New launches fail and stop the child immediately if eph cannot
-capture a stable identity, so they do not create more unverified state.
+A `run=` state entry without process identity cannot distinguish its PID from a
+reused PID. `eph down`, `eph clean`, and config reconciliation refuse to signal
+a live PID in that state. Inspect the process, stop it manually if it belongs to
+the workspace, and rerun the eph command. Every launch must capture a stable
+identity; startup stops the child and fails when capture is unavailable.
 
 ## Windows
 
-`eph` runs natively on Linux, macOS, and Windows. The Docker-backed sources
-(`image=`, `dockerfile=`, `compose=`) behave identically everywhere.
+`eph` runs natively on Linux, macOS, and Windows. Docker-backed sources use the
+local Docker daemon and platform path conventions.
 
 The shell-based features (`run=` services, lifecycle hooks, and `run`/
 `compose` health checks) run through the platform shell: `sh -c` on Unix and
@@ -301,30 +298,11 @@ path. The `%LOCALAPPDATA%` location applies only to a native Windows build.
 ### Relative bind mounts on Windows
 
 A relative host bind mount (`volume=./seed:/docker-entrypoint-initdb.d`)
-resolves against the workspace root, which eph stores as a plain `C:\...`
-path. Builds up to v0.3.1 stored the canonical path in Windows'
-extended-length `\\?\C:\...` form and forwarded it to Docker as the bind
-source, which the daemon rejects with a garbled error:
-
-```
-Error: failed to create container
-Caused by:
-    Docker responded with status code 500: \?\C%!(EXTRA string=is not a valid Windows path)
-```
-
-If you hit this, update eph; relative binds now resolve to a source Docker
-accepts. Two knock-on notes:
-
-- **Workspace IDs changed on Windows.** The ID is derived from the workspace
-  path, and dropping the `\\?\` prefix changed it. Containers, named volumes,
-  and state from an older build live under the previous ID, so eph no longer
-  sees them. Remove any leftover `eph-<old-short-id>-*` containers and volumes
-  by hand (`docker ps -a`, `docker volume ls`), then `eph up` fresh. This
-  cleanup only matters if you had services running under an older build.
-- **Very long workspace paths.** If the workspace sits so deep that it has no
-  ordinary `C:\...` representation, the path keeps the `\\?\` prefix and eph
-  rejects the bind mount up front with a clear message rather than passing an
-  unusable source to Docker. Move the workspace to a shorter path.
+resolves against the workspace root and is passed to Docker as a plain
+`C:\...` path. Absolute drive-letter paths (`C:\...`, `C:/...`) and UNC paths
+are accepted. Docker does not accept an extended-length `\\?\...` bind source;
+eph rejects that form before container creation. Move a workspace whose
+resolved path requires that prefix to a shorter path.
 
 ## Getting more detail
 

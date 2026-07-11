@@ -16,28 +16,28 @@ Source: Alexis King, "Names are not type safety" (2020-11-01), https://lexi-lamb
 Prefer a private-field checked wrapper when there is an invariant:
 
 ```rust
-pub struct CheckedSyncPlan(SyncPlan);
+pub struct CommandOverride(Vec<String>);
 
-pub fn parse_sync_plan(plan: SyncPlan) -> Result<CheckedSyncPlan> {
-    // check every invariant, then return CheckedSyncPlan(plan)
+pub fn parse_command_override(input: &str) -> Result<CommandOverride> {
+    // Parse shell words and require a non-empty executable before construction.
 }
 ```
 
 Avoid a public transparent wrapper that only names a role:
 
 ```rust
-pub struct SurfaceId(pub String);
+pub struct ServiceName(pub String);
 ```
 
 If there is no invariant, use a field name, module, doc comment, or type alias:
 
 ```rust
-type SurfaceId = String;
+type ServiceName = String;
 ```
 
-## Homeport Examples
+## eph examples
 
-- `HomeportProfile` is justified because it proves schema version, unique skill IDs, and MCP transport requirements before adapter translation.
-- A future `CheckedSyncPlan` would be justified if it proves no raw auth, cookie, or transcript files are scheduled for sync.
-- A hypothetical `SurfaceName(String)` with public inner access would not prove much. If all strings are accepted, prefer a field name or alias; if only known surfaces are accepted, use an enum or hide the field and parse from the supported surface list.
+- `CommandOverride` is justified because its private field contains parsed, non-empty argv. Runtime code can consume `argv()` without repeating shell-word parsing or checking for an executable.
+- `PortMapping` is an enum because fixed, auto-allocated, and Compose ports carry different valid data and require different runtime behavior.
+- A hypothetical public `ServiceName(String)` would not enforce eph's service-name grammar. Keep validation at the `.eph` parse boundary, or hide the field and construct it only through that parser.
 - Avoid `DerefMut` on checked wrappers unless mutation cannot break the proof or the value is reparsed before reuse.

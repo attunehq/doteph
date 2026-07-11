@@ -3,10 +3,10 @@
 Ephemeral services per workspace. Like `.env` files, but for services.
 
 When you work on multiple projects, or multiple checkouts of the same project,
-you need local services like Postgres, Redis, or MinIO without ports colliding,
-data getting mixed up, or containers running all the time. `eph` gives each
-workspace its own isolated services, started on demand, with host ports
-assigned automatically:
+you need local services like Postgres, Redis, or MinIO without shared data or
+fixed Docker ports. `eph` gives each workspace its own namespaced services,
+starts them on demand, and assigns host ports for direct containers
+automatically:
 
 ```
 ~/projects/app/      ->  eph-a1b2c3d4e5f60718-postgres (localhost:54321)
@@ -58,10 +58,10 @@ cargo install --path .
 make install
 ```
 
-`eph` runs natively on Linux, macOS, and Windows. The Docker-backed services
-(`image=`, `dockerfile=`, `compose=`) behave identically everywhere. The
-shell-based features (`run=` services, lifecycle hooks, and shell health
-checks) run through the platform shell (`sh -c` on Unix, `cmd /C` on
+`eph` runs natively on Linux, macOS, and Windows. Docker-backed services use
+the local Docker daemon and each platform's path conventions. The shell-based
+features (`run=` services, lifecycle hooks, and shell health checks) run
+through the platform shell (`sh -c` on Unix, `cmd /C` on
 Windows), so a command string written for `sh` may need a `cmd`-compatible
 form; to keep writing POSIX command strings on Windows, run eph inside
 [WSL](docs/user-guide/troubleshooting.md#windows).

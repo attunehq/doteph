@@ -154,8 +154,8 @@ Load them into your current shell:
 eval "$(eph env)"              # bash / zsh / sh
 ```
 
-Now `$DATABASE_URL` points at your running Postgres, and your app can connect.
-fish and JSON formats are covered in
+`$DATABASE_URL` points at your running Postgres, and your app can connect.
+fish, PowerShell, and JSON formats are covered in
 [Shell Integration](shell-integration.md).
 
 ## Stop your services
@@ -191,6 +191,6 @@ eph down               # stop when you are done
 
 ## Next
 
-You have the mechanics. Now read [Core Concepts](concepts.md) to understand
+You have the mechanics. Read [Core Concepts](concepts.md) to understand
 *why* it works this way (workspaces, isolation, ports, and the lifecycle),
 which makes everything else in the guide fall into place.
