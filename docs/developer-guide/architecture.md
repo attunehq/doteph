@@ -117,10 +117,13 @@ recorded path that no longer resolves could mean the workspace was moved or
 renamed rather than deleted, so prune first checks for any running container
 or live `run=` process under that namespace and skips (reports, does not
 remove) a workspace that still has either, unless `--force-live` is passed.
-For `run=` services it signals only PIDs whose current process identity
-matches the identity saved at launch; legacy process entries are warned about
-and left alone. A real (non-dry-run) prune also asks for confirmation before
-removing anything, unless `--yes` is passed or there is nothing to remove;
+For `run=` services every lifecycle command signals only PIDs whose current
+process identity matches the identity saved at launch. A new process is stopped
+and startup fails if eph cannot capture that identity. Legacy process entries
+are left alone; workspace-local teardown reports how to stop them manually, and
+system prune reports a warning. A real (non-dry-run) prune also asks for
+confirmation before removing anything, unless `--yes` is passed or there is
+nothing to remove;
 off a non-interactive terminal without `--yes` it refuses rather than
 guessing.
 

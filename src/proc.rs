@@ -63,7 +63,7 @@ pub(crate) struct ProcessIdentity {
 impl ProcessIdentity {
     /// Snapshot whatever the OS exposes about `process`, however little that
     /// is. Callers that need the snapshot to actually distinguish a PID reuse
-    /// apply [`Self::has_distinguishing_fields`] on top (see [`identity`]).
+    /// apply [`Self::is_recordable`] on top (see [`identity`]).
     fn from_process_raw(process: &Process) -> Self {
         ProcessIdentity {
             start_time: process.start_time(),
@@ -186,8 +186,8 @@ fn raw_identity(pid: NonZeroU32) -> Option<ProcessIdentity> {
 /// Return the current identity for `pid`, when the platform exposes enough
 /// process metadata to distinguish the entry from a later PID reuse.
 ///
-/// This is the *recording* side, used when eph launches a `run=` service: an
-/// A just-spawned process can briefly expose metadata that conflicts with every
+/// This is the recording side, used when eph launches a `run=` service. A
+/// just-spawned process can briefly expose metadata that conflicts with every
 /// later snapshot. Persisting that transient view makes eph treat its own live
 /// service as a reused PID forever. Recording therefore requires two consecutive
 /// compatible snapshots with a real start time and at least one distinguishing

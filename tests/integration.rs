@@ -1464,18 +1464,9 @@ DATABASE_URL=postgres://test:test@localhost:${postgres.port}/test
 "#,
     );
 
-    // Start - should wait for pg_isready
-    let start = std::time::Instant::now();
+    // A successful `up` proves pg_isready passed: readiness failures and the
+    // configured timeout are surfaced as command errors.
     ws.eph_ok(&["up", "postgres"]).await;
-    let elapsed = start.elapsed();
-
-    // Should have taken at least a moment for postgres to be ready
-    // but not too long (timeout is 30s)
-    assert!(
-        elapsed.as_secs() < 30,
-        "Took too long to start: {:?}",
-        elapsed
-    );
 
     // Service should be running and healthy
     let status = ws.eph_ok(&["status"]).await;
