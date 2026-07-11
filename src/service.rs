@@ -396,8 +396,8 @@ pub(crate) enum Backend {
 
 impl Backend {
     /// True if a recorded `Process` backend still refers to the process it
-    /// tracked: the PID is alive and, when an identity was recorded at spawn
-    /// time, that identity still matches. Guards every liveness probe against
+    /// tracked: the PID is alive and its identity recorded at spawn time still
+    /// matches. Guards every liveness probe against
     /// PID reuse; a bare `is_alive` would happily claim an unrelated process
     /// that inherited the number after a reboot, and teardown would then
     /// signal that innocent process. Backends other than `Process` return
@@ -409,12 +409,9 @@ impl Backend {
         if !proc::is_alive(*pid) {
             return false;
         }
-        match identity {
-            Some(expected) => proc::identity_matches(*pid, expected),
-            // Legacy state (written before identities were recorded): PID
-            // presence is the best signal available.
-            None => true,
-        }
+        identity
+            .as_ref()
+            .is_some_and(|expected| proc::identity_matches(*pid, expected))
     }
 
     /// Parse a pre-typed-`Backend` state id back into a [`Backend`].
@@ -888,15 +885,32 @@ fn has_auto_port(declared: &[PortMapping]) -> bool {
     declared.iter().any(PortMapping::is_auto)
 }
 
-fn process_backend(name: &str, pid: NonZeroU32) -> Backend {
-    let identity = proc::identity(pid);
-    if identity.is_none() {
-        warn!(
-            "could not record process identity for run= service {}; `eph system prune` will skip PID {}",
-            name, pid
-        );
+/// Capture the proof needed to manage a process by PID after this invocation
+/// exits. A bare PID is not durable authority because the OS may reuse it.
+fn process_backend(name: &str, pid: NonZeroU32) -> Result<Backend> {
+    let identity = proc::identity(pid).with_context(|| {
+        format!("could not record a stable identity for run= service '{name}' (PID {pid})")
+    })?;
+    Ok(Backend::Process {
+        pid,
+        identity: Some(identity),
+    })
+}
+
+/// Stop a just-spawned child that cannot be represented safely in durable
+/// state. The child handle is still authoritative even though its PID is not.
+async fn stop_spawned_process(
+    name: &str,
+    pid: NonZeroU32,
+    child: &mut tokio::process::Child,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match child.kill().await {
+        Ok(()) => error.context(format!("stopped run= service '{name}' (PID {pid})")),
+        Err(cleanup_error) => error.context(format!(
+            "also failed to stop untracked run= service '{name}' (PID {pid}): {cleanup_error}"
+        )),
     }
-    Backend::Process { pid, identity }
 }
 
 /// The byte length of a leading Windows drive prefix in `spec`, or `None` when
@@ -2265,7 +2279,12 @@ impl ServiceManager {
     /// Remove a resource using the backend that actually created it.
     async fn discard_backend(&self, name: &str, backend: &Backend) -> Result<()> {
         match backend {
-            Backend::Process { pid, .. } => {
+            Backend::Process { pid, identity } => {
+                if identity.is_none() && proc::is_alive(*pid) {
+                    bail!(
+                        "cannot safely replace run= service '{name}': PID {pid} has no recorded process identity; stop that process manually, then retry"
+                    );
+                }
                 if backend.process_is_alive() {
                     proc::terminate(*pid);
                     sleep(Duration::from_secs(2)).await;
@@ -2294,7 +2313,12 @@ impl ServiceManager {
         remove: bool,
     ) -> Result<bool> {
         match backend {
-            Backend::Process { pid, .. } => {
+            Backend::Process { pid, identity } => {
+                if identity.is_none() && proc::is_alive(*pid) {
+                    bail!(
+                        "cannot safely stop run= service '{name}': PID {pid} has no recorded process identity; stop that process manually, then retry"
+                    );
+                }
                 if !backend.process_is_alive() {
                     return Ok(false);
                 }
@@ -2778,20 +2802,9 @@ impl ServiceManager {
                 .map(std::num::NonZeroU64::get);
 
             let (mut child, pid) = self.spawn_command(name, cmd, &env, false)?;
-            let backend = process_backend(name, pid);
             info!(
                 "Started {} with PID {} (attempt {}/{})",
                 name, pid, attempt, max_attempts
-            );
-
-            // Record PID and ports now so `eph status` / `eph env` reflect the
-            // service even while we wait for it to become ready.
-            self.state.services.insert(
-                name.to_string(),
-                ServiceStateEntry {
-                    backend: backend.clone(),
-                    ports: ports.clone(),
-                },
             );
 
             let readiness = self
@@ -2807,12 +2820,20 @@ impl ServiceManager {
             let outcome = match readiness {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    self.discard_failed_start(name, &backend).await?;
-                    return Err(error);
+                    return Err(stop_spawned_process(name, pid, &mut child, error).await);
                 }
             };
             match outcome {
                 ReadyOutcome::Ready => {
+                    // Readiness gives the process table time to settle and keeps
+                    // early exits on the normal classification path. Only a
+                    // stable identity may cross into durable state.
+                    let backend = match process_backend(name, pid) {
+                        Ok(backend) => backend,
+                        Err(error) => {
+                            return Err(stop_spawned_process(name, pid, &mut child, error).await);
+                        }
+                    };
                     // Remember the auto ports so the next `up` reuses them for a
                     // stable URL, even across `eph down`.
                     if has_auto {
@@ -2843,12 +2864,8 @@ impl ServiceManager {
                         attempt + 1,
                         max_attempts
                     );
-                    // Drop the dead entry so a stale PID is not left behind; the
-                    // next attempt records a fresh one.
-                    self.state.services.remove(name);
                 }
                 ReadyOutcome::PortConflict => {
-                    self.state.services.remove(name);
                     bail!(
                         "service '{}' kept exiting on a port conflict after {} attempts; \
                          see `eph logs {}`",
@@ -2858,7 +2875,6 @@ impl ServiceManager {
                     );
                 }
                 ReadyOutcome::Exited => {
-                    self.state.services.remove(name);
                     bail!(
                         "service '{}' exited during startup; see `eph logs {}`",
                         name,
@@ -3679,19 +3695,10 @@ impl ServiceManager {
                 })
                 .transpose()?;
             let (mut child, pid) = self.spawn_command(name, cmd, &env, true)?;
-            let backend = process_backend(name, pid);
             info!(
                 "Started {} (foreground) with PID {} (attempt {}/{})",
                 name, pid, attempt, max_attempts
             );
-            self.state.services.insert(
-                name.to_string(),
-                ServiceStateEntry {
-                    backend: backend.clone(),
-                    ports: ports.clone(),
-                },
-            );
-
             let readiness = self
                 .await_command_ready(
                     name,
@@ -3708,6 +3715,19 @@ impl ServiceManager {
                 .await;
             match readiness {
                 Ok(ReadyOutcome::Ready) => {
+                    let backend = match process_backend(name, pid) {
+                        Ok(backend) => backend,
+                        Err(error) => {
+                            return Err(stop_spawned_process(name, pid, &mut child, error).await);
+                        }
+                    };
+                    self.state.services.insert(
+                        name.to_string(),
+                        ServiceStateEntry {
+                            backend: backend.clone(),
+                            ports: ports.clone(),
+                        },
+                    );
                     if has_auto {
                         self.state
                             .auto_ports
@@ -3744,16 +3764,13 @@ impl ServiceManager {
                         attempt + 1,
                         max_attempts
                     );
-                    self.state.services.remove(name);
                 }
                 Ok(ReadyOutcome::PortConflict | ReadyOutcome::Exited) => {
-                    self.state.services.remove(name);
                     self.state.save(&self.workspace).await?;
                     bail!("service '{}' exited during startup", name);
                 }
                 Err(error) => {
-                    self.discard_failed_start(name, &backend).await?;
-                    return Err(error);
+                    return Err(stop_spawned_process(name, pid, &mut child, error).await);
                 }
             }
         }
@@ -4896,6 +4913,16 @@ mod tests {
     fn backend_process_rejects_zero_pid() {
         let err = serde_json::from_str::<Backend>(r#"{"process":{"pid":0}}"#);
         assert!(err.is_err(), "PID 0 must not deserialize: {err:?}");
+    }
+
+    #[test]
+    fn process_backend_without_identity_is_never_authoritative() {
+        let backend = Backend::Process {
+            pid: NonZeroU32::new(std::process::id()).expect("the test process has a nonzero PID"),
+            identity: None,
+        };
+
+        assert!(!backend.process_is_alive());
     }
 
     /// A full state entry round-trips, confirming `backend` and `ports` are the

@@ -260,6 +260,15 @@ mismatch is skipped with a warning rather than killed. A command that
 deliberately detached grandchildren outside the shell tree eph launched can
 still leave processes behind after that tree exits; stop those manually.
 
+## `run=` teardown says the PID has no recorded process identity
+
+State from an older eph version may contain a `run=` PID without the process
+identity needed to distinguish it from a reused PID. `eph down`, `eph clean`,
+and config reconciliation refuse to signal a live PID in that state. Inspect
+the process, stop it manually if it still belongs to the workspace, and rerun
+the eph command. New launches fail and stop the child immediately if eph cannot
+capture a stable identity, so they do not create more unverified state.
+
 ## Windows
 
 `eph` runs natively on Linux, macOS, and Windows. The Docker-backed sources
