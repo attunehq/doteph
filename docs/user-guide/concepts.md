@@ -31,13 +31,14 @@ the command.
 
 ## Isolation
 
-Each workspace is isolated from every other workspace, including two checkouts
-of the same repository. That is the point of the tool: run the same project in
-several directories at once, with no shared ports and no shared data.
+Each workspace gets its own eph-managed resource namespace, including two
+checkouts of the same repository. Direct containers receive separate names,
+volumes, and automatic host ports. Fixed `run=` ports and bindings declared in
+a Compose file remain explicit configuration and can still conflict.
 
 Isolation is keyed on a **workspace ID**: the SHA-256 hash of the workspace's
-absolute (canonicalized) path. New workspaces use the first 16 hex characters
-as the **short ID** that namespaces everything `eph` creates:
+absolute (canonicalized) path. The first 16 hex characters form the **short
+ID** that namespaces everything `eph` creates:
 
 ```
 ~/projects/app/      ->  short ID a1b2c3d4e5f60718  ->  eph-a1b2c3d4e5f60718-postgres
@@ -52,10 +53,10 @@ as the **short ID** that namespaces everything `eph` creates:
 | Compose project (`compose=`) | `eph-<short_id>-<service>` |
 
 Because the ID comes from the path, the two checkouts above get different
-container names, different volumes, and different ports. A workspace with
-verified state from an older eight-character release keeps that namespace
-until `eph clean`; the next command then adopts the 16-character form. Eph
-blocks if legacy state exists but cannot be verified, instead of starting a
+container names, different volumes, and different ports. If the state root
+contains an 8-character namespace whose metadata matches the full workspace
+ID, eph uses that namespace until `eph clean`. An 8-character state directory
+that cannot be verified blocks workspace construction so eph cannot start a
 second namespace beside unknown resources.
 
 Run `eph info` to see the ID, short ID, container prefix, and paths for the
@@ -63,12 +64,12 @@ current workspace.
 
 ## Automatic ports
 
-You never pick host ports. For each `port=` you declare, `eph` asks Docker to
+For each `port=` you declare, `eph` asks Docker to
 publish the container port on a **random free host port**, bound to
 `127.0.0.1`. This means:
 
-- **No port conflicts, ever.** Not between workspaces, and not with other
-  software on your machine.
+- **Direct container services avoid fixed host-port conflicts.** Each creation
+  asks Docker for an available port.
 - **Nothing is exposed to your local network.** Services are bound to loopback
   only.
 - **The real port changes between container creations**, so never hardcode it.
@@ -79,6 +80,10 @@ One exception: `run=` (non-container) services bind whatever port their process
 binds. With a numeric `port=`, `eph` reports the declared value as-is; with
 `port=auto`, `eph` allocates a free port and injects it into the process. See
 [Running Your App](run-your-app.md#portauto).
+
+Compose services own their port publishing rules. An `expose.<alias>=` entry
+discovers the host port selected by the Compose file; eph does not change its
+bind address.
 
 ## Interpolation: connecting your app to the ports
 
@@ -144,7 +149,8 @@ belong to this workspace.
 the end of `eph up`: if a later service's `pre-start` hook or creation fails,
 whatever already started is still on disk, so `eph down` can find and stop
 it instead of leaking it. The write itself is atomic (a temp file, renamed
-over the real one), so a crash mid-write can never leave a truncated file
+over the real one), so an interrupted write does not replace state with a
+truncated file
 behind. If `state.json` is still unreadable (hand-edited, corrupted by
 something outside eph), the next command quarantines it to
 `state.json.corrupt`, warns, and continues with empty state rather than
@@ -204,7 +210,7 @@ seeds). Deferring `post-start` this way means a hook can reference any other
 service's assigned port. Teardown mirrors it: `pre-stop` before a service stops
 (backup, drain), `post-stop` after.
 
-Two things to internalize now; the full rules live in
+Two rules matter here; the full contract lives in
 [The `.eph` File](eph-file.md#lifecycle-hooks):
 
 - **`pre-start` and `post-start` run on every `eph up`**, not only on fresh
@@ -232,8 +238,8 @@ Three footnotes to the table:
 - Bind mounts (host paths like `./seed` or `C:\data`) are never deleted by
   `eph clean`. Only Docker named volumes are.
 - `compose` services are torn down with `docker compose down` in every case, so
-  `--rm` makes no difference for them, and `eph clean` removes only the named
-  volumes declared in your `.eph` file, not volumes internal to the Compose
+  `--rm` makes no difference for them. Compose services cannot declare `.eph`
+  volumes, and `eph clean` does not remove volumes defined inside the Compose
   file. See [Defining Services](services.md#how-compose-services-differ).
 - Teardown works from **recorded state**, not just the sections currently in
   your `.eph` file. A bare `eph down` (no service names) and `eph clean` both
@@ -268,8 +274,8 @@ depends on dep". You get two things:
   session-start hook without launching the app. `eph up --role app` starts the
   app and pulls its dependencies up with it.
 
-Roles are opt-in. A file with no `role=` and no `roles_order` behaves as it
-always has: services start in declaration order with `run=` services last.
+Roles are opt-in. A file with no `role=` and no `roles_order` uses implicit
+ordering: services start in declaration order with `run=` services last.
 The full rules are in [The `.eph` File](eph-file.md#roles-and-ordering), and
 the prewarming workflow is in
 [Recipes](recipes.md#prewarm-dependency-services-on-claude-code-session-start).

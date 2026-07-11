@@ -74,9 +74,10 @@ before crossing an execution boundary.
 ## workspace
 
 `Workspace::from_path` canonicalizes the workspace path and hashes it with
-SHA-256. New workspaces use the first 16 hex characters as `short_id`. Verified
-legacy state keeps its 8-character namespace until `eph clean`; unverified
-legacy state blocks the switch so resources cannot be orphaned silently.
+SHA-256. The first 16 hex characters form `short_id`. If an 8-character state
+directory carries metadata for the same full workspace ID, eph uses that
+namespace until `eph clean`; an unverifiable 8-character directory blocks
+workspace construction.
 
 Naming helpers derive container, image, volume, and Compose project namespaces
 from `short_id`. `state_root()` uses the platform local-data directory unless
@@ -110,13 +111,13 @@ fingerprints.
 
 Dockerfile services build on every `up` through Docker's cache; the resulting
 image ID enters the fingerprint. Reconciliation discards a mismatched backend,
-legacy state without a fingerprint, and orphan config records. Matching reused
+state without a fingerprint, and orphan config records. Matching reused
 resources rerun declared health checks.
 
 ### Startup and failure cleanup
 
 `start_services` walks services in role-topological order, or declaration order
-with `run=` last in legacy mode. Each `pre-start` runs immediately before its
+with `run=` last when the file has no role graph. Each `pre-start` runs immediately before its
 service. After every selected service is healthy, `post-start` runs in the same
 order.
 
@@ -171,16 +172,16 @@ stays raw for piping.
 
 Unix shells lead a process group so teardown can signal the group. Windows uses
 a `sysinfo` descendant snapshot because a daemonless later invocation cannot
-reattach to a named Job Object. Prune never kills a PID unless its current
-identity matches the recorded one.
+reattach to a named Job Object. Every lifecycle path refuses to signal a PID
+unless its current identity matches the recorded one.
 
 ## prune
 
-`prune` scans state directories with current 16-hex or legacy 8-hex names,
+`prune` scans state directories with 16-hex or 8-hex names,
 classifies missing or empty workspace paths, and discovers namespaced Docker and
 process resources. Live resources block removal unless `--force-live` is set.
-Legacy v0.4.2 state without workspace metadata requires the explicit
-compatibility flag. A global lock prevents concurrent prune runs.
+An 8-hex state directory without workspace metadata requires
+`--compatibility-v042`. A global lock prevents concurrent prune runs.
 
 ## env
 

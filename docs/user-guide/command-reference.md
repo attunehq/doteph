@@ -27,7 +27,7 @@ Logging always goes to **stderr**; command output goes to **stdout**.
 ## `eph up [SERVICE...]`
 
 Start services. With no arguments, starts every service in the `.eph` file.
-Outside roles mode, names select exactly those services. In roles mode, a name
+Without a role graph, names select exactly those services. With roles, a name
 also pulls in every service from the roles it depends on, but not peer services
 from the named service's own role. An unknown service name is an error.
 
@@ -79,8 +79,8 @@ Behavior:
 
 ## `eph down [--rm] [SERVICE...]`
 
-Stop services. With no arguments, stops all. Outside roles mode, names stop
-exactly those services. In roles mode, a name also stops every service in
+Stop services. With no arguments, stops all. Without a role graph, names stop
+exactly those services. With roles, a name also stops every service in
 roles that depend on its role, but not peer services from the named service's
 own role.
 
@@ -110,8 +110,8 @@ Behavior:
 - **`--role` takes the dependent closure**: the role plus every role that
   transitively depends on it, because a dependency cannot go away while the
   roles that need it are up. With `roles_order=dep,app`,
-  `eph down --role dep` stops both `app` and `dep`. Otherwise `eph down` is
-  absolute outside roles mode: it stops exactly what it targets.
+  `eph down --role dep` stops both `app` and `dep`. Without a role graph,
+  `eph down` stops exactly what it targets.
 - **A positional service also protects dependents.** If `db` belongs to `dep`,
   `eph down db` stops `db` and every service in roles above `dep`. Another
   service in `dep` remains running. Use `--role dep` to stop the whole role.
@@ -185,12 +185,12 @@ are deleted (finished worktrees, removed clones). It scans the eph state root
 (the platform default, or `EPH_STATE_ROOT` when set; see
 [Persisted state](concepts.md#persisted-state)), reads each workspace's
 recorded path, and removes resources for workspaces whose path is gone or is
-now an empty directory.
+an empty directory.
 
 | Flag | Description |
 |------|-------------|
 | `--dry-run` | Print what would be removed without deleting anything, and without prompting. |
-| `--compatibility-v042` | Also prune state directories written by eph v0.4.2 and earlier, which did not record workspace paths. |
+| `--compatibility-v042` | Also prune 8-character state directories that have no workspace metadata. |
 | `--force-live` | Remove a stale workspace's resources even if it still has running containers or a live `run=` process. |
 | `-y`, `--yes` | Skip the removal confirmation prompt. |
 
@@ -241,8 +241,8 @@ Behavior:
   warning. If any container is running, or a recorded `run=` process is alive
   under the identity eph captured at launch, the workspace is reported under
   "Skipped" instead ("stop them or re-run with --force-live") and left
-  untouched. `--force-live` restores the old, unguarded behavior of removing
-  it anyway. `--dry-run` applies the same check, so its preview always
+  untouched. `--force-live` authorizes removing it anyway. `--dry-run` applies
+  the same check, so its preview always
   matches what a real run would do.
 - Unless `--dry-run`, prune prints what it is about to remove and then asks
   `Remove these resources? [y/N]` before deleting anything, the same way
@@ -258,14 +258,13 @@ Behavior:
   `.eph` or compose file is gone. The workspace state directory is deleted
   last.
 - For `run=` services, only a PID whose current process identity matches the
-  identity eph recorded at launch is killed. Legacy state has no identity, and
-  a mismatched PID may be a reused PID, so both are skipped with a warning. A
+  identity eph recorded at launch is killed. A process entry without identity,
+  and a mismatched PID that may have been reused, are skipped with a warning. A
   command that detached grandchildren outside the shell tree eph launched
   leaves processes prune cannot discover; stop those manually.
-- State from v0.4.2 and earlier records no workspace path, so it is skipped by
-  default. `--compatibility-v042` prunes it by `short_id` namespace alone
-  (directory names must still be 8 hex digits). Run
-  `--dry-run --compatibility-v042` first if you have old state on disk.
+- An 8-character state directory without `workspace.json` is skipped by
+  default. `--compatibility-v042` prunes that directory by `short_id` namespace
+  alone. Preview this path with `--dry-run --compatibility-v042`.
 - Prune holds an OS-level lock file (`prune.lock` in the state root) for its
   whole run, so two prunes never operate at once. The lock is released the
   instant the holding process exits, crash included, so a second prune
@@ -403,7 +402,7 @@ eph run sh -c 'psql "$DATABASE_URL" < dump.sql'   # sh -c for shell features
   `eph run --foo` all pass `-v`/`-h`/`--foo` straight through as the command's
   own arguments, with no `--` separator needed. A flag placed *before* `run`
   (`eph -v run ...`) is still eph's own: only the tokens before `run` on the
-  command line are eph's flags today (just `-v`/`--verbose`).
+  command line are eph's flags (`-v`/`--verbose`).
 
 ## `eph logs [SERVICE] [-f] [-n N]`
 
@@ -518,8 +517,8 @@ Commit these files so your agents discover them on checkout.
 - A file that already matches what the binary would write is reported as
   `unchanged`. One that differs is left untouched and reported as `skipped`
   unless you pass `--force`, so a local edit is never clobbered silently.
-- Commit the written files, and re-run `eph skills install` after upgrading
-  `eph` to pull in updated skill text.
+- Commit the written files. `eph skills check` reports whether they match the
+  installed binary; `eph skills install --force` replaces drifted copies.
 
 ## `eph skills check [--dir DIR]`
 
@@ -536,10 +535,9 @@ eph skills check
   up to date: .agents/skills/using-eph/SKILL.md
 ```
 
-The rendered skill is deterministic and version-independent, so a checked-in
-copy stays byte-stable across `eph` upgrades that do not change the skill
-text. The check goes red only on a real drift (a hand edit, or a stale install
-after the skill source changed), not on every release.
+The rendered skill contains no build version, so matching text is byte-stable.
+The check fails only when a file is missing or its content differs from the
+binary's embedded source.
 
 ## `eph skills list`
 

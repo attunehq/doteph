@@ -12,8 +12,8 @@ Matklad's durable points:
 - Describe boundaries and cross-cutting concerns.
 - Use the doc as a chance to notice when source layout and conceptual layout have drifted.
 
-Homeport adaptation:
+eph adaptation:
 
-- `docs/architecture.md` is already the right home.
-- The doc should stay focused on runtime boundaries, module map, adapter contract, skill bundles, local artifact generation, and secret-handling exclusions.
-- Detailed product research belongs in `docs/research.md`; implementation-level churn belongs in code comments or narrower docs.
+- `docs/developer-guide/architecture.md` holds durable rationale and invariants.
+- `docs/developer-guide/internals.md` is the codemap for the parser, workspace identity, service lifecycle, process control, pruning, environment rendering, bundled skills, updates, and command adapter.
+- User workflows and format details belong in `docs/user-guide`; implementation-level churn belongs in code comments or narrower docs.

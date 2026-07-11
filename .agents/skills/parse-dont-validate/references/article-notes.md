@@ -17,22 +17,22 @@ Source: Alexis King, "Parse, don't validate" (2019-11-05), https://lexi-lambda.g
 Prefer:
 
 ```rust
-pub fn parse_profile(raw: RawProfile) -> Result<HomeportProfile>;
-pub fn plan_sync(profile: &HomeportProfile) -> SyncPlan;
+pub fn parse(input: &str) -> Result<EphFile>;
+pub fn start_services(config: &EphFile) -> Result<()>;
 ```
 
 Avoid:
 
 ```rust
-pub fn validate_profile(raw: &RawProfile) -> Result<()>;
-pub fn plan_sync(raw: &RawProfile) -> SyncPlan;
+pub fn validate(input: &str) -> Result<()>;
+pub fn start_services(raw: &str) -> Result<()>;
 ```
 
-The first shape makes parsing mandatory for sync planning. The second shape allows a caller to forget validation and still compile.
+The first shape makes parsing mandatory for lifecycle work. The second shape allows a caller to forget validation and still compile.
 
-## Homeport Examples
+## eph examples
 
-- Config TOML should parse into `AppConfig` with checked path and profile fields, not deserialize and then discard a `validate()` result.
-- Profile TOML should parse into `HomeportProfile` before adapter translation or sync planning.
-- Drafting/editing tools may manipulate raw serde structs while the human is editing, but save/apply paths must parse first.
-- Build-time or checked-in data should use construction helpers that fail early and centrally, not repeated `expect("valid")` calls throughout runtime code.
+- `.eph` text parses into `EphFile`, whose services always have exactly one source and whose role graph is complete and acyclic.
+- Port declarations parse into `PortMapping`, so auto-allocated ports cannot carry an invalid fixed number and Compose mappings retain both alias and target service.
+- `command=` parses into `CommandOverride` before startup, so runtime code receives argv rather than reparsing command text.
+- Persisted state may deserialize through a compatibility representation, but lifecycle code should consume the typed `Backend` variants.

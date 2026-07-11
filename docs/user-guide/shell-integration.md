@@ -15,7 +15,7 @@ them into bash and zsh, fish, JSON-consuming tools, your editor, and your app.
 `eph env` prints the **top-level** environment variables from your `.eph`
 file, with every `${service.property}` resolved against the **currently
 running** services. It does **not** print service `env.*` values; those belong
-to the containers, not your shell.
+to the service runtime, not your shell.
 
 ```sh
 $ eph up

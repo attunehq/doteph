@@ -183,7 +183,9 @@ calls inherit `DATABASE_URL` and the rest:
 # .claude/hooks/eph-prewarm.sh
 # SessionStart hook: prewarm dependency services and inject their env.
 eph up --role dep >/dev/null 2>&1 || exit 0
-[ -n "$CLAUDE_ENV_FILE" ] && eph env >> "$CLAUDE_ENV_FILE"
+if [ -n "$CLAUDE_ENV_FILE" ] && resolved_env=$(eph env); then
+  printf '%s\n' "$resolved_env" >> "$CLAUDE_ENV_FILE"
+fi
 ```
 
 Make it executable (`chmod +x .claude/hooks/eph-prewarm.sh`) and wire it in
@@ -215,6 +217,11 @@ How it behaves:
 - **Seeding is included.** The plain `eph up --role dep` runs each
   dependency's `post-start` (migrations, seeds). Add `--skip-hooks` to prewarm
   without seeding.
+- **Environment injection is all-or-nothing.** `eph env` exits nonzero if any
+  top-level variable references a service outside the prewarmed closure. The
+  command substitution above discards that partial shell program. Keep exported
+  prewarm variables dependent only on prewarmed services; put app-only values
+  in the app's `env.*` or load the full environment after the app starts.
 - **No install command.** Roles are names you choose, so there is deliberately
   no `eph hooks install`. Copy the recipe and substitute your dependency role
   name. For a personal version that follows you across repos, put the same
@@ -252,9 +259,10 @@ git clone git@github.com:you/app.git app-experiment
 ```
 
 Run `eph up` in each. Because the workspace ID is derived from the path, each
-checkout gets its own containers, its own volumes, and its own ports: no
-conflicts, no shared data. `eph status` in either directory shows only that
-checkout's services, and `eph info` shows the differing short IDs.
+checkout gets its own managed resource names, named volumes, and automatic
+ports. Fixed `run=` ports and Compose bindings still follow their declarations.
+`eph status` in either directory shows only that checkout's services, and
+`eph info` shows the differing short IDs.
 
 When you later delete a checkout (a finished worktree, an abandoned
 experiment), its containers and volumes do not die with the directory. Run

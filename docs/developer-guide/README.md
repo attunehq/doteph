@@ -13,8 +13,9 @@ see the [User Guide](../user-guide/README.md) instead.
    test suite (including the Docker-backed integration tests), linting, and
    the pre-commit checks CI enforces.
 3. [Internals](internals.md): a module-by-module map of the source: the
-   parser, workspace resolution, the Docker-backed service manager, state
-   persistence, and env rendering. Start here to find where a change belongs.
+   parser, workspace resolution, lifecycle manager, process control, state,
+   environment rendering, pruning, bundled skills, and updates. Start here to
+   find where a change belongs.
 
 See also [CONTRIBUTING.md](../../CONTRIBUTING.md) at the repo root for working
 style, pull-request expectations, and the release process.

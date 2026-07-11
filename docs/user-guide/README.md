@@ -53,8 +53,8 @@ reference material comes last.
 
 Each directory that contains a `.eph` file is a *workspace*. `eph up` starts
 the services that workspace defines (Docker containers, Compose projects, or
-plain processes), names them after a hash of the workspace path so two
-checkouts never collide, and lets Docker pick free host ports so nothing
-conflicts. `eph env` prints the resolved connection strings for your shell to
+plain processes), names managed resources after a hash of the workspace path,
+and lets Docker pick free host ports for direct container services. `eph env`
+prints the resolved connection strings for your shell to
 load. `eph down` stops the services, and `eph clean` removes them and their
 data entirely.

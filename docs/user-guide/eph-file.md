@@ -97,8 +97,8 @@ These are the variables `eph env` emits for your shell to load. They may
 contain `${service.property}` references (see [Interpolation](#interpolation)).
 
 > Do not confuse these with `env.KEY=` *inside* a service section. Top-level
-> variables go to **your shell**; `env.KEY=` goes **into the container**. They
-> are separate namespaces.
+> variables are emitted by `eph env`; `env.KEY=` configures that service's
+> container, Compose invocation, or host process. They are separate namespaces.
 
 A top-level variable name must be a valid shell identifier:
 `^[A-Za-z_][A-Za-z0-9_]*$` (letters, digits, and underscores, not starting
@@ -139,14 +139,9 @@ variable is legal in exactly two places:
   ```
 
 A bare `KEY=VALUE` written directly after a service section, with no `[env]`,
-is a **hard parse error**:
-
-```
-'DATABASE_URL' at line 5 looks like an environment variable, but it is inside
-service 'postgres' (sections do not end at blank lines). To set it in the
-container, write env.DATABASE_URL=...; to export it from `eph env`, move it
-into an [env] section or above the first section
-```
+is a **hard parse error**. The diagnostic names the open service and directs
+you to either prefix the key with `env.` for that service's runtime or move the
+variable into an `[env]` section (or above the first section) for `eph env`.
 
 The conventional layout is variables first, then services, then a trailing
 `[env]` section for anything that needs to reference a service:
@@ -219,7 +214,7 @@ service metadata and are rejected in top-level variables, `[env]`, and
 | `command=` | no | Override the container's default command. Only legal for `image=`/`dockerfile=` services: a `run=` service's command *is* its `run=` value, and a compose service's command lives in the compose file, so `command=` there is a parse error. |
 | `port=` | no (one per service) | A container port to publish on a random host port. For `run=` services, `port=auto` makes eph allocate the port (see [Running Your App](run-your-app.md#portauto)). Illegal on `compose=` services; use `expose.<name>=` there instead. |
 | `port.<name>=` | one per distinct name | A **named** port, for multi-port services. `port.<name>=auto` is allowed for `run=` services. Same restrictions as `port=`. |
-| `env.<KEY>=` | one per distinct key | An environment variable passed into the container. |
+| `env.<KEY>=` | one per distinct key | An environment variable passed to the service runtime. For Compose it is exported to the Compose CLI; for `run=` it is injected into the host process. |
 | `volume=` | yes | A volume mount: `name:/path` (named) or `./host:/path` (bind). Only legal for `image=` and `dockerfile=` services. |
 | `healthcheck=` | no | Command that must succeed before the service counts as ready. |
 | `ready-timeout=` | no | Non-zero seconds to wait for the `healthcheck` (default 30; 60 for compose). Requires `healthcheck=`. |
@@ -452,16 +447,15 @@ role=app
 port=auto
 ```
 
-### Legacy mode vs roles mode
+### Implicit ordering and role ordering
 
-A file is in **legacy mode** when no service declares a `role=` and there is no
-`roles_order`. Services start in declaration order with `run=` services
-deferred to the end, and teardown reverses that. Existing `.eph` files need no
-changes.
+A file with no `role=` declarations and no `roles_order` uses **implicit
+ordering**. Services start in declaration order with `run=` services deferred
+to the end, and teardown reverses that order.
 
-A file is in **roles mode** the moment any service declares a `role=` or a
-`roles_order` appears. Roles mode then requires all of the following, checked
-at parse time (by `eph check` and before any `eph up`):
+A file uses **role ordering** when any service declares a `role=` or a
+`roles_order` appears. Role ordering requires all of the following, checked at
+parse time (by `eph check` and before any `eph up`):
 
 - a `roles_order` is present (linear or DAG form);
 - every service declares a `role`;
@@ -514,14 +508,14 @@ top-level variables outside the section. A misspelled section name
 (`[role_order]`, `[roles-order]`, `[roles]`, and similar) is rejected with a
 hint pointing at `[roles_order]`.
 
-### Ordering in roles mode
+### Ordering with roles
 
-In roles mode the role graph is the single source of truth for order. Bring-up
+With roles, the role graph is the single source of truth for order. Bring-up
 follows the topological order of the graph (dependencies first), with services
 grouped by role and declaration order preserved within a role. Teardown is the
 exact reverse.
 
-The legacy "`run=` services start last" heuristic is off in roles mode. A
+The implicit "`run=` services start last" heuristic does not apply. A
 `run=` service tagged as a dependency role comes up before the app that needs
 it, exactly where the graph places it. The role, not the source type, decides
 order.

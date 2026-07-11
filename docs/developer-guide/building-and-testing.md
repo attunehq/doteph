@@ -38,7 +38,9 @@ The `Makefile` wraps the common Cargo invocations (`make help` lists them):
 | `make check` | `cargo clippy`. |
 | `make check-fix` | `cargo clippy --fix` (allows dirty/staged). |
 | `make cargo-sort` | Sort dependencies in `Cargo.toml` (`cargo sort`). |
-| `make precommit` | `check-fix` then `format`: the pre-commit gate. |
+| `make skills` | Regenerate `.claude/skills` and `.agents/skills` from `skills/`. |
+| `make skills-check` | Verify generated skill copies match the bundled source. |
+| `make precommit` | `check-fix`, `format`, then `skills`: the pre-commit gate. |
 | `make test` | `cargo test` (unit + doctests + integration; stress is skipped). |
 | `make test-unit` | `cargo test --lib` (pure, no Docker). |
 | `make test-integration` | `cargo test --test integration` (needs Docker). |
@@ -60,9 +62,10 @@ Three layers, plus a heavyweight fourth:
 - **Doctests**: the public-API examples in `///` docs are compiled and run,
   so they cannot drift from the code. Included in `cargo test`.
 - **Integration tests** (`tests/integration.rs`, with helpers in
-  `tests/common/mod.rs`): the happy path, one service at a time. Starts real
-  redis and postgres containers and checks port mapping, interpolation,
-  hooks, and health checks. Needs Docker. Run with `make test-integration`.
+  `tests/common/mod.rs`): CLI and live lifecycle behavior. They cover Docker
+  services, host processes, roles, hooks, health checks, environment formats,
+  reconciliation, state recovery, logs, skill installation, and `eph dev`.
+  Needs Docker for the container cases. Run with `make test-integration`.
 - **Stress tests** (`tests/stress.rs`): the end-to-end suite. It stands up a
   full multi-service environment (postgres + redis + minio), talks to each
   backend over its real wire protocol on the mapped host ports, runs many
@@ -91,10 +94,11 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-`make precommit` applies fixes and formatting locally (`check-fix` +
-`format`); `make test` runs the standard suite. CI runs on every push **and**
+`make precommit` applies lint fixes, formats the code, and regenerates bundled
+skills; `make test` runs the standard suite. CI runs on every push **and**
 pull request: `cargo fmt --all --check`, then
 `cargo clippy --all-targets -- -D warnings`, then
+`cargo run --quiet -- skills check`, then
 `cargo test --verbose -- --test-threads=1` (single-threaded so the
 Docker-backed integration tests do not contend for host ports), and finally
 the stress suite. The crate opts into stricter clippy groups at the crate

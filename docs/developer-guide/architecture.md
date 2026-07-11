@@ -40,6 +40,9 @@ via `killpg`), `fd-lock` (the per-workspace and prune advisory file locks; see
 `eph update` adds `ureq` (rustls HTTPS, no system TLS), `flate2`/`tar`
 (pure-Rust archive extraction), `self-replace` (the platform-correct in-place
 binary swap), and `semver` (version comparison).
+`dunce` supplies Docker-compatible canonical Windows paths. `indexmap`
+preserves `.eph` declaration order. `notify` and `globset` implement
+`eph dev --watch`; `socket2` configures the preview gate for reliable rebinding.
 
 ## Core concepts
 
@@ -54,15 +57,18 @@ short ID) namespace everything `eph` creates:
 /Users/grace/projects/myapp2  ->  eph-e5f6a7b8c9d00112-postgres
 ```
 
-This guarantees that two checkouts of the same repo, or two developers on one
-machine, never collide on container names, volume names, or ports.
-Canonicalizing the path first makes the ID stable across symlinks and
-relative addressing.
+This keeps eph-managed container, image, volume, and Compose project names
+separate across checkouts. Direct container ports are assigned by Docker, and
+`run=` services can request `port=auto`. Fixed host-process ports and bindings
+declared inside a Compose file remain the configuration author's responsibility.
+Canonicalizing the path makes the ID stable across symlinks and relative
+addressing.
 
-Verified workspaces created by older eph versions retain their 8-character
-namespace until `eph clean`, which prevents an upgrade from orphaning live
-resources. Unverifiable legacy state blocks a namespace switch and requires an
-explicit cleanup.
+If the state root contains an 8-character namespace whose workspace metadata
+matches the full workspace ID, eph continues using that namespace until
+`eph clean`. An 8-character state directory that cannot be verified blocks
+workspace construction so eph cannot create a second namespace beside unknown
+resources.
 
 ### Auto port assignment
 
@@ -74,8 +80,9 @@ through interpolation, so configuration never hardcodes a host port.
 `run=` (non-container) services are the exception: the process binds its own
 port, so `eph` reports a numeric declared port as-is. With `port=auto`, eph
 allocates a free host port itself, injects it through the process
-environment, and relaunches on a fresh port when the process dies to an
-"address already in use" conflict.
+environment. An auto-port process that exits during startup is relaunched on a
+fresh port, for up to four attempts. Fixed-port and portless processes fail on
+an early exit.
 
 ### Service state
 
@@ -101,8 +108,8 @@ drift, including source-type and resolved dependency-port changes, and tear down
 the old resource through recorded backend truth before creating the new one.
 Writes are atomic (a temp file, renamed over the real
 one) so a crash mid-write cannot leave a truncated `state.json`; a file that
-still fails to parse (corruption predating atomic writes, or manual editing)
-is quarantined to `state.json.corrupt` rather than treated as fatal, and eph
+still fails to parse is quarantined to `state.json.corrupt` rather than treated
+as fatal, and eph
 continues with fresh empty state. Every command that mutates state (`up`,
 `down`, `clean`) holds an OS advisory lock scoped to the workspace (a file
 next to the state directory, released automatically if the process dies) for
@@ -118,9 +125,9 @@ renamed rather than deleted, so prune first checks for any running container
 or live `run=` process under that namespace and skips (reports, does not
 remove) a workspace that still has either, unless `--force-live` is passed.
 For `run=` services every lifecycle command signals only PIDs whose current
-process identity matches the identity saved at launch. A new process is stopped
-and startup fails if eph cannot capture that identity. Legacy process entries
-are left alone; workspace-local teardown reports how to stop them manually, and
+process identity matches the identity saved at launch. Startup stops the child
+and fails if that identity cannot be captured. Process entries without an
+identity are left alone; workspace-local teardown reports how to stop them manually, and
 system prune reports a warning. A real (non-dry-run) prune also asks for
 confirmation before removing anything, unless `--yes` is passed or there is
 nothing to remove;
@@ -129,7 +136,7 @@ guessing.
 
 ## File format
 
-The `.eph` format was designed to be:
+The `.eph` format is designed to be:
 
 1. **Familiar**: it looks like the `.env` and INI files developers already
    know. A valid `.env` file is a valid `.eph` file.
@@ -211,9 +218,8 @@ that constraint splits the two platforms:
   whole descendant tree. A child spawned after that snapshot can escape; that
   is the accepted limit of snapshot-based teardown.
 
-The same `sysinfo` descendant walk is the Unix fallback for a service recorded
-before eph grouped its shells (legacy on-disk state, where the wrapper leads
-no group).
+The same `sysinfo` descendant walk is the Unix fallback when the recorded shell
+does not lead its own process group.
 
 ### Reconciling compose services
 
@@ -253,8 +259,8 @@ change restarts consumers.
 
 Dockerfile sources build on every `up` through Docker's cache and fingerprint
 the resulting image ID. A matching live or stopped resource can be reused, but
-its declared health check is rerun. A mismatch, missing legacy fingerprint, or
-source-type change discards the recorded backend before creation. Failed starts
+its declared health check is rerun. A mismatch, a state record without a
+fingerprint, or a source-type change discards the recorded backend before creation. Failed starts
 are discarded and persisted immediately, preventing a later `up` from adopting
 an unhealthy container, Compose project, or process.
 

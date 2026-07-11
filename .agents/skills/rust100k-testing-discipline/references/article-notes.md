@@ -17,10 +17,9 @@ Matklad's durable points:
 - Avoid sleep-based concurrency tests. Preserve causality with join handles, receivers, or observable side channels.
 - Use tests as automation for project invariants.
 
-Homeport decisions:
+eph decisions:
 
-- Prefer Matklad on test layout. Homeport does not use mocks.
-- Prefer real executable doctests from `rust-skills` because Homeport is not currently large enough for doctest build cost to dominate.
-- Use real `sqlx::test` databases for client/server behavior, fixture
-  directories under `tests/testdata` for backup inputs, and `tempfile` for
-  restore targets.
+- Prefer unit tests for pure internal behavior. eph does not use mocks.
+- Keep executable doctests.
+- `tests/integration.rs` covers CLI and live lifecycle behavior with temporary workspaces and the real Docker daemon.
+- `tests/stress.rs` holds ignored heavyweight concurrency, isolation, and all-backend scenarios, including real protocol checks.

@@ -62,7 +62,9 @@ friends:
 #!/usr/bin/env bash
 # SessionStart hook: prewarm dependency services and inject their env.
 eph up --role dep >/dev/null 2>&1 || exit 0
-[ -n "$CLAUDE_ENV_FILE" ] && eph env >> "$CLAUDE_ENV_FILE"
+if [ -n "$CLAUDE_ENV_FILE" ] && resolved_env=$(eph env); then
+  printf '%s\n' "$resolved_env" >> "$CLAUDE_ENV_FILE"
+fi
 ```
 
 Wire it in `.claude/settings.json` (project scope, so everyone opening the
@@ -89,6 +91,10 @@ Notes:
 - `--role dep` brings up the dependency role and its dependency closure only,
   never the `app`. Add `--skip-hooks` to prewarm without running `post-start`
   seeding; the plain form above runs it.
+- `eph env` succeeds only when every top-level interpolation resolves. Keep
+  exported prewarm variables dependent only on services in the selected
+  closure; put app-only values in the app's `env.*` or load the full environment
+  after the app starts. The command substitution above discards partial output.
 - There is no `eph hooks install`: roles are user-defined names, so
   substitute your own. For a personal, cross-repo version put the same block
   in `~/.claude/settings.json` instead.
@@ -115,14 +121,15 @@ for the full write-up.
 | `eph info` | Workspace id / prefix / paths (no Docker). |
 | `eph skills install` | Install this guidance as a discoverable agent skill (`.claude/skills`, `.agents/skills`). No Docker. Warns on stderr and installs into the current directory if run outside a git repo. |
 | `eph skills check` | Verify the installed skill is current (non-zero exit on drift). No Docker. |
-| `eph update [--check]` | Self-update to the latest release (checksum-verified). |
+| `eph skills list` | List the skills embedded in the binary. No Docker. |
+| `eph update [--check] [--force]` | Self-update to the latest release (checksum-verified); `--check` is read-only and `--force` reinstalls the selected release. |
 | `-v` / `--verbose` | Debug logging to stderr. |
 
 To persist this guidance as a skill your agent discovers automatically on
 every checkout, run `eph skills install` and commit the written files. It
-bundles a `using-eph` skill (the same material as this page) into
-`.claude/skills/` and `.agents/skills/`. Re-run it after upgrading `eph` to
-refresh the text.
+bundles a `using-eph` skill into `.claude/skills/` and `.agents/skills/`.
+`eph skills check` reports missing or drifted copies; `eph skills install
+--force` writes the copies embedded in the installed binary.
 
 Output is on stdout; logs on stderr. Unknown service or format names are
 errors.
@@ -148,8 +155,8 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 ```
 
 Line by line: `image=` is the source (one of image/dockerfile/compose/run);
-`port=` is a container port published on a random host port; `env.X` is set
-**inside the container**; `volume=name:/path` is a per-workspace named
+`port=` is a container port published on a random host port; `env.X` is passed
+to the service runtime; `volume=name:/path` is a per-workspace named
 volume; `healthcheck` for an image service runs without a shell
 (whitespace-split, `docker exec`); `post-start` runs on the host via the
 platform shell (`sh -c` on Unix, `cmd /C` on Windows) after every service is
@@ -162,10 +169,10 @@ a service section is a parse error, not a silent trailing variable. Top-level
 variables (what `eph env` prints) only parse in two places: above the first
 section, or inside a reserved `[env]` section (which may repeat). `env.KEY=`
 inside a service section is a different thing entirely: it sets a variable
-**in the container**, not your shell. Writing an UPPERCASE key straight into a
+for that service, not your shell. Writing an UPPERCASE key straight into a
 service section, meaning it for the shell, is the single most common mistake
 when generating a `.eph` file: `eph check` rejects it and names both fixes
-(`env.KEY=` for the container, `[env]` for the shell).
+(`env.KEY=` for the service, `[env]` for the shell).
 
 ### Service sources (exactly one per section; a second one is a parse error)
 
@@ -181,7 +188,7 @@ when generating a `.eph` file: `eph check` rejects it and names both fixes
 | Key | Notes |
 |-----|-------|
 | `port=` / `port.<name>=` | Single / named ports. `auto` is valid for `run=` services only. Illegal on `compose=` (use `expose.<name>=`). |
-| `env.<KEY>=` | Container env (not shell env). One value per distinct `KEY`. May contain `${service.property}`, resolved against running services for every source (`image`, `dockerfile`, `compose`, `run`) at the moment that service starts. |
+| `env.<KEY>=` | Service env (not shell env). One value per distinct `KEY`. May contain `${service.property}`, resolved against running services for every source (`image`, `dockerfile`, `compose`, `run`) at the moment that service starts. |
 | `volume=` | `name:/path` = named volume; `./host:/path` or `/abs:/path` = bind mount. Repeatable; only legal for `image=` and `dockerfile=`. |
 | `role=` | Tier name for roles mode; requires a `roles_order` listing every role. |
 | `command=` | Override container CMD (shell-word split, no shell). Only legal for `image=`/`dockerfile=`; a parse error on `run=`/`compose=`. |
