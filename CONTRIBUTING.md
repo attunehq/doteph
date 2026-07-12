@@ -87,11 +87,9 @@ which:
    (x86_64, arm64), Linux musl (x86_64, arm64), and Windows (x86_64). The
    non-native targets cross-compile with [`cargo-cross`](https://github.com/cross-rs/cross);
    `eph` is pure Rust with no system dependencies, so this needs no extra setup.
-2. Signs and notarizes the macOS binaries (requires the Apple signing secrets
-   below).
-3. Packages each target as a `tar.gz` (binary plus `README.md`, `LICENSE`,
+2. Packages each target as a `tar.gz` (binary plus `README.md`, `LICENSE`,
    `NOTICE`), generates a `checksums.txt`, and publishes a GitHub Release with
-   auto-generated notes.
+   auto-generated notes. The macOS binaries are published unsigned.
 
 The binary's `--version` comes from the tag: [`build.rs`](build.rs) derives it
 from `git describe` (or the `EPH_VERSION` the workflow injects), so `eph
@@ -102,20 +100,6 @@ changelog file.
 
 Every pull request and push to `main` runs the same build matrix as a dry run
 (no release is created), so cross-compilation breakage is caught before tagging.
-
-### macOS signing secrets
-
-Tag releases sign and notarize the macOS binaries using these repository
-secrets. Until they are configured, tag releases fail at the signing step
-(unsigned PR/main dry runs still pass):
-
-| Secret | Purpose |
-| --- | --- |
-| `APPLE_CERTIFICATE_BASE64` | Developer ID Application certificate, base64-encoded `.p12` |
-| `APPLE_CERTIFICATE_PASSWORD` | Password for the `.p12` |
-| `APPLE_TEAM_ID` | Apple Developer Team ID (signing identity) |
-| `APPLE_ID` | Apple ID email used for notarization |
-| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for that Apple ID |
 
 ### Installers
 
