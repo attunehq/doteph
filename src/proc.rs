@@ -424,16 +424,24 @@ mod win {
             if size == 0 {
                 return Err(io::Error::last_os_error());
             }
-            let mut list = AttributeList {
-                buffer: vec![0usize; size.div_ceil(size_of::<usize>())],
-            };
+            let mut buffer = vec![0usize; size.div_ceil(size_of::<usize>())];
             // SAFETY: the buffer is at least `size` bytes and stays alive as
             // long as the list is used (it is owned by the returned value).
-            if unsafe { InitializeProcThreadAttributeList(list.as_ptr(), count, 0, &mut size) } == 0
+            if unsafe {
+                InitializeProcThreadAttributeList(
+                    buffer.as_mut_ptr().cast::<c_void>(),
+                    count,
+                    0,
+                    &mut size,
+                )
+            } == 0
             {
+                // Plain memory at this point: the struct (and with it the
+                // Drop that calls DeleteProcThreadAttributeList, valid only
+                // on an initialized list) is built exclusively on success.
                 return Err(io::Error::last_os_error());
             }
-            Ok(list)
+            Ok(AttributeList { buffer })
         }
 
         fn as_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
