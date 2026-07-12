@@ -298,6 +298,12 @@ enum SkillsCommand {
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
+    // Before anything can spawn: make eph's own std handles non-inheritable
+    // (Windows), so no child tree can hold open the pipes a capturing caller
+    // (`eph up | tee`, a test harness) handed eph and stall that caller's
+    // read past eph's exit. See `eph::disinherit_std_handles`.
+    eph::disinherit_std_handles();
+
     // `eph run`'s own argv must never be intercepted by eph's global `-v`, nor
     // its auto `-h`/`--help`/`-V`/`--version`: split it out of clap's view
     // entirely before parsing, rather than trying to fight clap's `global =

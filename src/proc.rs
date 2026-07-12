@@ -39,9 +39,37 @@
 //! On Unix the same descendant walk is the fallback for a service recorded
 //! before eph grouped its shells (legacy on-disk state, where the wrapper leads
 //! no group).
+//!
+//! # Handle inheritance (Windows)
+//!
+//! A detached `run=` service must receive **only** its three stdio handles.
+//! Unix gets this for free: Rust opens every descriptor `O_CLOEXEC`, so a
+//! `fork`/`exec` child sees nothing but the remapped fds 0-2. Windows does
+//! not: `std::process` (and tokio on top of it) calls `CreateProcess` with
+//! `bInheritHandles=TRUE` whenever stdio is redirected, which copies *every*
+//! inheritable handle in eph into the child, and the shell passes them on to
+//! the whole service tree. The worst of those are the stdin/stdout/stderr
+//! pipe handles eph's own caller created inheritable and passed in: a
+//! long-lived service tree then holds the caller's pipe write-ends open, so
+//! anything capturing eph's output (`eph up | tee`, a PowerShell pipeline, a
+//! test harness's `.output()`) blocks waiting for EOF long after eph exited.
+//!
+//! Two layers close this:
+//!
+//! - [`spawn_captured`] spawns the detached service through raw
+//!   `CreateProcessW` with a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` naming
+//!   exactly the three stdio handles, so nothing else can be inherited no
+//!   matter what handles exist in eph's process. (Rust std does not expose
+//!   the attribute list on stable, hence the raw call; see [`win`].)
+//! - [`disinherit_std_handles`] clears `HANDLE_FLAG_INHERIT` on eph's own
+//!   std handles once at startup, so shorter-lived children spawned through
+//!   std/tokio (hooks, health checks, the update worker) cannot re-leak them
+//!   either, including to grandchildren their shells leave behind.
 
+use std::fs::File;
+use std::io;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, Signal, System};
@@ -151,6 +179,600 @@ pub fn prepare_detached(command: &mut TokioCommand) {
     command.process_group(0);
     #[cfg(not(unix))]
     let _ = command;
+}
+
+/// The small surface eph's startup path needs from a live `run=` child.
+///
+/// Two spawn shapes implement it: the foreground (`eph dev`) child is a plain
+/// [`tokio::process::Child`], while the detached background child is a
+/// [`CapturedChild`], which on Windows is not a std/tokio child at all (see
+/// [`spawn_captured`]). Startup only ever asks "has it exited yet?" while
+/// waiting for readiness and "kill it" when a fresh spawn cannot be recorded
+/// safely, so that is the whole trait.
+pub(crate) trait SpawnedChild {
+    /// Whether the process has exited (non-blocking).
+    fn has_exited(&mut self) -> bool;
+
+    /// Terminate the process and wait until it is gone. A process that
+    /// already exited is a success, matching `tokio::process::Child::kill`.
+    async fn kill(&mut self) -> io::Result<()>;
+}
+
+impl SpawnedChild for tokio::process::Child {
+    fn has_exited(&mut self) -> bool {
+        matches!(self.try_wait(), Ok(Some(_)))
+    }
+
+    async fn kill(&mut self) -> io::Result<()> {
+        tokio::process::Child::kill(self).await
+    }
+}
+
+/// A detached background `run=` child: a [`tokio::process::Child`] on Unix, a
+/// raw handle-owning child on Windows (see [`win::RawChild`]).
+///
+/// Deliberately **not** killed on drop: a detached service's whole point is to
+/// outlive the `eph up` that spawned it, and the startup path drops this
+/// handle once the service is recorded in state.
+pub(crate) struct CapturedChild {
+    #[cfg(not(windows))]
+    inner: tokio::process::Child,
+    #[cfg(windows)]
+    inner: win::RawChild,
+}
+
+impl SpawnedChild for CapturedChild {
+    fn has_exited(&mut self) -> bool {
+        #[cfg(not(windows))]
+        {
+            matches!(self.inner.try_wait(), Ok(Some(_)))
+        }
+        #[cfg(windows)]
+        {
+            self.inner.has_exited()
+        }
+    }
+
+    async fn kill(&mut self) -> io::Result<()> {
+        #[cfg(not(windows))]
+        {
+            self.inner.kill().await
+        }
+        #[cfg(windows)]
+        {
+            // Termination completes fast enough that blocking the runtime
+            // thread for it is fine; see `RawChild::kill`.
+            self.inner.kill()
+        }
+    }
+}
+
+/// Spawn `cmd` through the platform shell as a detached background service:
+/// stdin from the null device, stdout/stderr to the provided log files,
+/// working directory `cwd`, and `env` overlaid on eph's own environment.
+///
+/// On Unix this is the ordinary tokio spawn plus [`prepare_detached`]'s
+/// process group. On Windows it is a raw `CreateProcessW` that restricts
+/// handle inheritance to exactly the three stdio handles; see the module docs
+/// for why the std/tokio spawn cannot be used for a long-lived child there.
+pub(crate) fn spawn_captured(
+    cmd: &str,
+    cwd: &Path,
+    env: &[(String, String)],
+    stdout: File,
+    stderr: File,
+) -> io::Result<(CapturedChild, NonZeroU32)> {
+    #[cfg(not(windows))]
+    {
+        let mut command = shell_command(cmd);
+        command
+            .current_dir(cwd)
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(stdout))
+            .stderr(std::process::Stdio::from(stderr));
+        prepare_detached(&mut command);
+        let child = command.spawn()?;
+        // A freshly spawned child always has a PID; `id()` only returns `None`
+        // after it has been awaited to completion.
+        let pid = child
+            .id()
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| io::Error::other("spawned process has no PID"))?;
+        Ok((CapturedChild { inner: child }, pid))
+    }
+    #[cfg(windows)]
+    {
+        let child = win::spawn_captured(cmd, cwd, env, stdout, stderr)?;
+        let pid = child.pid();
+        Ok((CapturedChild { inner: child }, pid))
+    }
+}
+
+/// Make eph's own standard handles non-inheritable. Windows only; a no-op
+/// elsewhere. Called once at process startup, before anything spawns.
+///
+/// When eph's output is captured (`eph up | tee`, a test harness's
+/// `.output()`), the caller hands eph *inheritable* pipe handles as its std
+/// handles. Any child spawned through std/tokio with redirected stdio then
+/// receives copies of them (`bInheritHandles=TRUE` copies every inheritable
+/// handle), and a long-lived grandchild -- a daemon a hook's shell leaves
+/// behind, say -- keeps the caller's pipe open after eph exits. Clearing
+/// `HANDLE_FLAG_INHERIT` on the originals removes that whole class.
+///
+/// Clearing permanently (never toggling around a spawn, which would race
+/// concurrent spawns) is safe because no child needs the *originals* to be
+/// inheritable: for `Stdio::inherit`, std duplicates the current handle into
+/// a fresh inheritable copy at spawn time, so interactive children (`eph
+/// run`, `eph dev`) still receive working consoles. Failures are ignored;
+/// this is hardening, and there is nothing useful to do if the OS declines.
+pub fn disinherit_std_handles() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+
+        for std_id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: `GetStdHandle` is a pure lookup with no preconditions.
+            let handle = unsafe { GetStdHandle(std_id) };
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            // SAFETY: clearing a flag on a handle this process owns; the
+            // handle was just returned by the OS as live.
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
+}
+
+/// Raw `CreateProcessW` spawn for detached `run=` services.
+///
+/// Exists because `std::process` cannot express "inherit only these handles"
+/// on stable Rust: it passes `bInheritHandles=TRUE` whenever stdio is
+/// redirected, leaking every inheritable handle in the process (module docs
+/// have the full story). The one std facility that fixes this,
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` via `STARTUPINFOEX`, is only reachable
+/// through `CreateProcessW` directly, so this module re-implements the small
+/// slice of `Command` the detached spawn needs: `cmd /C <string>` with an
+/// environment overlay, a working directory, and file-backed stdio. Quoting
+/// and environment-merge semantics deliberately mirror std's so `run=`
+/// strings behave exactly as they did through tokio.
+#[cfg(windows)]
+mod win {
+    use std::ffi::{OsStr, OsString, c_void};
+    use std::fs::File;
+    use std::io;
+    use std::num::NonZeroU32;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::path::{Path, PathBuf};
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, INFINITE, InitializeProcThreadAttributeList,
+        LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+        WaitForSingleObject,
+    };
+
+    /// A process spawned by [`spawn_captured`], tracked by its owned process
+    /// handle. Dropping it closes the handle only; the process keeps running.
+    pub(crate) struct RawChild {
+        pid: NonZeroU32,
+        process: OwnedHandle,
+    }
+
+    impl RawChild {
+        pub(crate) fn pid(&self) -> NonZeroU32 {
+            self.pid
+        }
+
+        /// Non-blocking exit probe: a process handle is signaled exactly when
+        /// the process has exited.
+        pub(crate) fn has_exited(&self) -> bool {
+            // SAFETY: the owned handle is open, and a zero timeout makes this
+            // a pure state query.
+            unsafe { WaitForSingleObject(self.process.as_raw_handle() as HANDLE, 0) == WAIT_OBJECT_0 }
+        }
+
+        /// Terminate the process and wait for the termination to complete,
+        /// mirroring `tokio::process::Child::kill` (which kills, then reaps).
+        pub(crate) fn kill(&self) -> io::Result<()> {
+            let handle = self.process.as_raw_handle() as HANDLE;
+            // SAFETY: the owned handle is open; exit code 1 marks a forced
+            // stop, the same code tokio's kill produces on Windows.
+            if unsafe { TerminateProcess(handle, 1) } == 0 {
+                // TerminateProcess fails (ERROR_ACCESS_DENIED) on a process
+                // that already exited; that is this call's success state.
+                if self.has_exited() {
+                    return Ok(());
+                }
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the owned handle is open. Termination is asynchronous;
+            // waiting (it completes in milliseconds) means the caller
+            // observes the process actually gone, like tokio's kill().await.
+            unsafe { WaitForSingleObject(handle, INFINITE) };
+            Ok(())
+        }
+    }
+
+    /// Owned attribute-list storage that is always deleted, even on an early
+    /// error return between initialization and `CreateProcessW`.
+    struct AttributeList {
+        // `usize` elements keep the opaque list pointer-aligned; it stores
+        // pointers internally.
+        buffer: Vec<usize>,
+    }
+
+    impl AttributeList {
+        /// Allocate and initialize a list with room for `count` attributes.
+        fn new(count: u32) -> io::Result<Self> {
+            let mut size = 0usize;
+            // SAFETY: the sizing call takes a null list and reports the
+            // required buffer size; it "fails" by design.
+            unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut size) };
+            if size == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut list = AttributeList {
+                buffer: vec![0usize; size.div_ceil(size_of::<usize>())],
+            };
+            // SAFETY: the buffer is at least `size` bytes and stays alive as
+            // long as the list is used (it is owned by the returned value).
+            if unsafe { InitializeProcThreadAttributeList(list.as_ptr(), count, 0, &mut size) } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(list)
+        }
+
+        fn as_ptr(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+            self.buffer.as_mut_ptr().cast::<c_void>()
+        }
+    }
+
+    impl Drop for AttributeList {
+        fn drop(&mut self) {
+            // SAFETY: `new` only returns initialized lists, and deletion is
+            // the documented teardown for them.
+            unsafe { DeleteProcThreadAttributeList(self.as_ptr()) };
+        }
+    }
+
+    /// Spawn `cmd /C <cmd>` detached, with `env` overlaid on eph's
+    /// environment, `cwd` as the working directory, stdin from `NUL`, and
+    /// stdout/stderr bound to the given log files -- inheriting **only**
+    /// those three handles.
+    pub(super) fn spawn_captured(
+        cmd: &str,
+        cwd: &Path,
+        env: &[(String, String)],
+        stdout: File,
+        stderr: File,
+    ) -> io::Result<RawChild> {
+        // The null device mirrors `Stdio::null()`: a service that reads stdin
+        // sees EOF instead of blocking on a console it may not have.
+        let stdin = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("NUL")?;
+
+        let comspec = comspec();
+        let application = wide_nul(comspec.as_os_str())?;
+        let mut command_line = build_command_line(&comspec, cmd)?;
+        let cwd_wide = wide_nul(cwd.as_os_str())?;
+        let environment = environment_block(env)?;
+
+        // The attribute list restricts inheritance to the listed handles, but
+        // each listed handle must itself carry HANDLE_FLAG_INHERIT. These are
+        // handles this spawn just created, so flagging them exposes nothing
+        // else (and eph never spawns concurrently anyway).
+        let handles: [HANDLE; 3] = [
+            stdin.as_raw_handle() as HANDLE,
+            stdout.as_raw_handle() as HANDLE,
+            stderr.as_raw_handle() as HANDLE,
+        ];
+        for &handle in &handles {
+            // SAFETY: each handle is owned by a live `File` in this scope.
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+                == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        let mut attributes = AttributeList::new(1)?;
+        // SAFETY: `handles` outlives the CreateProcessW call below (the
+        // attribute list stores the pointer, not a copy), and the size is the
+        // real byte size of the array.
+        if unsafe {
+            UpdateProcThreadAttribute(
+                attributes.as_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr().cast::<c_void>(),
+                size_of_val(&handles),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: plain-old-data structs the API fills in / reads.
+        let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = handles[0];
+        startup.StartupInfo.hStdOutput = handles[1];
+        startup.StartupInfo.hStdError = handles[2];
+        startup.lpAttributeList = attributes.as_ptr();
+
+        // SAFETY: plain-old-data struct the API fills in.
+        let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+
+        // SAFETY: every pointer is to a live, NUL-terminated wide buffer or
+        // initialized struct owned by this scope; `bInheritHandles=TRUE` is
+        // required for the handle list to take effect, and the list caps what
+        // is actually inherited.
+        let created = unsafe {
+            CreateProcessW(
+                application.as_ptr(),
+                command_line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                environment.as_ptr().cast::<c_void>(),
+                cwd_wide.as_ptr(),
+                &startup.StartupInfo,
+                &mut process_info,
+            )
+        };
+        if created == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: on success both handles are live and owned by us; the
+        // thread handle is not needed, the process handle is adopted.
+        unsafe { CloseHandle(process_info.hThread) };
+        // SAFETY: `hProcess` is an owned, open handle we must close exactly
+        // once; `OwnedHandle` takes over that duty.
+        let process = unsafe { OwnedHandle::from_raw_handle(process_info.hProcess.cast()) };
+        let pid = NonZeroU32::new(process_info.dwProcessId)
+            .ok_or_else(|| io::Error::other("CreateProcessW reported PID 0"))?;
+
+        // The stdin/stdout/stderr `File`s drop here, closing eph's copies of
+        // the handles; the child owns its inherited duplicates.
+        Ok(RawChild { pid, process })
+    }
+
+    /// Absolute path of `cmd.exe`: `%ComSpec%` (the canonical pointer to the
+    /// command interpreter), falling back to `%SystemRoot%\System32\cmd.exe`.
+    ///
+    /// Passing an absolute path as `lpApplicationName` skips `CreateProcessW`'s
+    /// implicit search (application directory, then the *working directory*,
+    /// then PATH), so a `cmd.exe` dropped into a workspace can never hijack a
+    /// `run=` spawn.
+    fn comspec() -> PathBuf {
+        if let Some(comspec) = std::env::var_os("ComSpec") {
+            return PathBuf::from(comspec);
+        }
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
+        Path::new(&root).join(r"System32\cmd.exe")
+    }
+
+    /// Encode `value` as a NUL-terminated UTF-16 buffer, rejecting interior
+    /// NULs (they would silently truncate the string at the API boundary).
+    fn wide_nul(value: &OsStr) -> io::Result<Vec<u16>> {
+        let mut wide: Vec<u16> = value.encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "nul character in process arguments",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    /// Build the `CreateProcessW` command line `<cmd.exe> /C <raw>`, quoting
+    /// each token with the same algorithm std uses for `Command::arg`, so a
+    /// `run=` string reaches `cmd /C` byte-for-byte as it did when this spawn
+    /// went through tokio.
+    fn build_command_line(comspec: &Path, raw: &str) -> io::Result<Vec<u16>> {
+        let mut line: Vec<u16> = Vec::new();
+        append_arg(&mut line, comspec.as_os_str())?;
+        line.push(u16::from(b' '));
+        append_arg(&mut line, OsStr::new("/C"))?;
+        line.push(u16::from(b' '));
+        append_arg(&mut line, OsStr::new(raw))?;
+        line.push(0);
+        Ok(line)
+    }
+
+    /// std's argument-quoting algorithm: quote when the argument is empty or
+    /// contains whitespace, escape `"` with a backslash, and double any run
+    /// of backslashes that ends up before a quote.
+    fn append_arg(line: &mut Vec<u16>, arg: &OsStr) -> io::Result<()> {
+        const QUOTE: u16 = b'"' as u16;
+        const BACKSLASH: u16 = b'\\' as u16;
+
+        if arg.encode_wide().any(|c| c == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "nul character in process arguments",
+            ));
+        }
+        let quote = arg.is_empty()
+            || arg
+                .encode_wide()
+                .any(|c| c == u16::from(b' ') || c == u16::from(b'\t'));
+        if quote {
+            line.push(QUOTE);
+        }
+        let mut backslashes: usize = 0;
+        for c in arg.encode_wide() {
+            if c == BACKSLASH {
+                backslashes += 1;
+            } else {
+                if c == QUOTE {
+                    // One escaping backslash per preceding backslash, plus
+                    // one for the quote itself (2n+1 total).
+                    line.extend((0..=backslashes).map(|_| BACKSLASH));
+                }
+                backslashes = 0;
+            }
+            line.push(c);
+        }
+        if quote {
+            // Double a trailing backslash run so it cannot escape the
+            // closing quote (2n total).
+            line.extend((0..backslashes).map(|_| BACKSLASH));
+            line.push(QUOTE);
+        }
+        Ok(())
+    }
+
+    /// Build the UTF-16 environment block for `CREATE_UNICODE_ENVIRONMENT`:
+    /// eph's own environment with `overlay` applied, entries `KEY=value\0`,
+    /// block closed by an extra NUL.
+    ///
+    /// Matches `Command::envs` on top of an inherited environment: variable
+    /// names compare case-insensitively (an overlay hit keeps the existing
+    /// name's casing and replaces only the value, like a map insert), and the
+    /// block is sorted by uppercased name as the Win32 docs require of a
+    /// manually built block.
+    fn environment_block(overlay: &[(String, String)]) -> io::Result<Vec<u16>> {
+        fn normalized(key: &OsStr) -> String {
+            key.to_string_lossy().to_uppercase()
+        }
+
+        let mut merged: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        for (key, value) in overlay {
+            let target = normalized(OsStr::new(key));
+            match merged.iter_mut().find(|(k, _)| normalized(k) == target) {
+                Some(slot) => slot.1 = OsString::from(value),
+                None => merged.push((OsString::from(key), OsString::from(value))),
+            }
+        }
+        merged.sort_by_cached_key(|(key, _)| normalized(key));
+
+        let mut block: Vec<u16> = Vec::new();
+        for (key, value) in &merged {
+            if key
+                .encode_wide()
+                .chain(value.encode_wide())
+                .any(|c| c == 0)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "nul character in environment",
+                ));
+            }
+            block.extend(key.encode_wide());
+            block.push(u16::from(b'='));
+            block.extend(value.encode_wide());
+            block.push(0);
+        }
+        // An empty block still needs its two terminating NULs.
+        if block.is_empty() {
+            block.push(0);
+        }
+        block.push(0);
+        Ok(block)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn rendered_line(raw: &str) -> String {
+            let wide = build_command_line(Path::new(r"C:\Windows\System32\cmd.exe"), raw).unwrap();
+            let end = wide.len() - 1;
+            assert_eq!(wide[end], 0, "command line must be NUL-terminated");
+            String::from_utf16(&wide[..end]).unwrap()
+        }
+
+        /// The quoting must reproduce what std's `Command::arg` builds, since
+        /// `.eph` files were written against that behavior.
+        #[test]
+        fn command_line_quotes_like_std() {
+            assert_eq!(
+                rendered_line("ping"),
+                r"C:\Windows\System32\cmd.exe /C ping"
+            );
+            assert_eq!(
+                rendered_line("echo hi"),
+                r#"C:\Windows\System32\cmd.exe /C "echo hi""#
+            );
+            // A quote is backslash-escaped, and backslashes before it double.
+            assert_eq!(
+                rendered_line(r#"echo "a b""#),
+                r#"C:\Windows\System32\cmd.exe /C "echo \"a b\"""#
+            );
+            assert_eq!(
+                rendered_line(r#"type c:\dir\"file""#),
+                r#"C:\Windows\System32\cmd.exe /C "type c:\dir\\\"file\"""#
+            );
+            // A trailing backslash in a quoted argument doubles so it cannot
+            // escape the closing quote.
+            assert_eq!(
+                rendered_line(r"dir C:\some path\"),
+                r#"C:\Windows\System32\cmd.exe /C "dir C:\some path\\""#
+            );
+        }
+
+        #[test]
+        fn command_line_rejects_interior_nul() {
+            assert!(build_command_line(Path::new("cmd.exe"), "echo \0 hi").is_err());
+        }
+
+        /// The overlay must *replace* an inherited variable whose name
+        /// differs only by case; appending a second spelling would leave
+        /// which one the child sees up to lookup order.
+        #[test]
+        fn environment_block_overrides_case_insensitively() {
+            // Every Windows process has PATH (usually spelled "Path").
+            let block = environment_block(&[
+                ("path".to_string(), r"C:\replaced".to_string()),
+                ("EPH_ENV_BLOCK_TEST".to_string(), "x".to_string()),
+            ])
+            .unwrap();
+            let text = String::from_utf16(&block).unwrap();
+            let entries: Vec<&str> = text.split('\0').filter(|e| !e.is_empty()).collect();
+
+            let paths: Vec<&&str> = entries
+                .iter()
+                .filter(|e| e.to_uppercase().starts_with("PATH="))
+                .collect();
+            assert_eq!(paths.len(), 1, "case-differing overlay must not duplicate");
+            assert!(paths[0].ends_with(r"=C:\replaced"));
+            assert!(entries.contains(&"EPH_ENV_BLOCK_TEST=x"));
+
+            // Compare by the variable *name*: sorting whole `KEY=value`
+            // entries would rank `(` against `=` and disagree with the
+            // key-only sort the block actually uses.
+            fn key_of(entry: &str) -> String {
+                entry
+                    .split_once('=')
+                    .map_or(entry, |(key, _)| key)
+                    .to_uppercase()
+            }
+            let mut sorted = entries.clone();
+            sorted.sort_by_key(|entry| key_of(entry));
+            assert_eq!(entries, sorted, "block must be sorted by uppercased name");
+        }
+    }
 }
 
 /// Refresh a fresh [`System`] so it knows only about `pid`, returning it
@@ -400,6 +1022,153 @@ mod tests {
                 .stdout(std::process::Stdio::null())
                 .spawn()
                 .unwrap()
+        }
+    }
+
+    /// Poll `child` until it reports exited, failing the test after ~10s.
+    async fn wait_until_exited(child: &mut CapturedChild) {
+        for _ in 0..100 {
+            if child.has_exited() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("captured child did not exit within 10s");
+    }
+
+    /// The detached spawn must deliver the same contract on both platforms:
+    /// the shell runs the command string with the overlay env visible, from
+    /// the requested working directory, with stdout captured to the log file.
+    #[tokio::test]
+    async fn spawn_captured_applies_env_cwd_and_log_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("svc.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let log_err = log.try_clone().unwrap();
+
+        #[cfg(unix)]
+        let cmd = r#"echo "MARKER=$EPH_SPAWN_TEST" && pwd"#;
+        #[cfg(windows)]
+        let cmd = "echo MARKER=%EPH_SPAWN_TEST%& cd";
+
+        let (mut child, pid) = spawn_captured(
+            cmd,
+            dir.path(),
+            &[("EPH_SPAWN_TEST".to_string(), "grace-hopper".to_string())],
+            log,
+            log_err,
+        )
+        .unwrap();
+        assert!(pid.get() > 0);
+        wait_until_exited(&mut child).await;
+
+        let output = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            output.contains("MARKER=grace-hopper"),
+            "overlay env did not reach the child; log:\n{output}"
+        );
+        // `pwd`/`cd` prints the working directory; the temp dir's unique leaf
+        // name avoids canonicalization mismatches (/private on macOS, 8.3
+        // short names on Windows) that full-path equality would trip over.
+        let leaf = dir.path().file_name().unwrap().to_string_lossy();
+        assert!(
+            output.contains(leaf.as_ref()),
+            "child did not run in the requested cwd; log:\n{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_captured_child_reports_liveness_and_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::fs::File::create(dir.path().join("svc.log")).unwrap();
+        let log_err = log.try_clone().unwrap();
+
+        #[cfg(unix)]
+        let cmd = "sleep 30";
+        #[cfg(windows)]
+        let cmd = "ping -n 30 127.0.0.1 >NUL";
+
+        let (mut child, pid) = spawn_captured(cmd, dir.path(), &[], log, log_err).unwrap();
+        assert!(
+            !child.has_exited(),
+            "a just-spawned sleeper should be running"
+        );
+        assert!(is_alive(pid));
+
+        child.kill().await.unwrap();
+        assert!(
+            child.has_exited(),
+            "kill waits for termination, so the child must read as exited"
+        );
+    }
+
+    /// Regression test for the Windows handle-inheritance leak: a long-lived
+    /// `run=` service used to inherit *every* inheritable handle in eph --
+    /// most damagingly the stdout/stderr pipe handles a capturing caller
+    /// (`eph up | tee`, a test harness's `.output()`) handed eph -- so the
+    /// caller's pipe read never saw EOF until the whole service tree died.
+    ///
+    /// An inheritable pipe created here stands in for the caller's capture
+    /// pipe. After spawning a long-lived captured child and closing our write
+    /// end, the read end must see EOF immediately; if the child inherited a
+    /// copy of the write end, the read blocks for the child's lifetime.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn spawn_captured_inherits_only_its_stdio_handles() {
+        use std::io::Read;
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::System::Pipes::CreatePipe;
+
+        let mut read_end: HANDLE = std::ptr::null_mut();
+        let mut write_end: HANDLE = std::ptr::null_mut();
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: std::ptr::null_mut(),
+            bInheritHandle: 1,
+        };
+        // SAFETY: out-pointers to locals; `attrs` requests inheritable ends,
+        // matching how a capturing parent creates the pipe it hands a child.
+        assert_ne!(
+            unsafe { CreatePipe(&mut read_end, &mut write_end, &attrs, 0) },
+            0,
+            "CreatePipe failed"
+        );
+        // SAFETY: CreatePipe returned two owned, open handles; each wrapper
+        // takes over closing exactly one of them.
+        let mut read_end = unsafe { std::fs::File::from_raw_handle(read_end.cast()) };
+        let write_end = unsafe { OwnedHandle::from_raw_handle(write_end.cast()) };
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::fs::File::create(dir.path().join("svc.log")).unwrap();
+        let log_err = log.try_clone().unwrap();
+        let (mut child, _pid) =
+            spawn_captured("ping -n 30 127.0.0.1 >NUL", dir.path(), &[], log, log_err).unwrap();
+
+        // With no writer left, the read must resolve immediately: Ok(0) or
+        // BrokenPipe both mean EOF on an anonymous pipe. A leaked write end
+        // inside the child's tree keeps it unresolved for ~30s instead.
+        drop(write_end);
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            read_end.read(&mut buf)
+        });
+        let started = std::time::Instant::now();
+        while !reader.is_finished() && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let leaked = !reader.is_finished();
+        child.kill().await.unwrap();
+        assert!(
+            !leaked,
+            "pipe read did not see EOF: an unrelated inheritable handle leaked \
+             into the spawned service tree"
+        );
+        match reader.join().unwrap() {
+            Ok(0) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            other => panic!("expected EOF on the probe pipe, got {other:?}"),
         }
     }
 
