@@ -231,6 +231,12 @@ Totals:
 
 Behavior:
 
+- Progress is logged to stderr while prune acquires its lock, inventories
+  Docker, scans state directories, and removes resources. The final report
+  remains on stdout for callers that capture or pipe it. Prune lists each
+  Docker resource type once per pass and matches the resulting snapshot to
+  workspace namespaces in memory, so large state roots do not cause repeated
+  Docker API calls.
 - A workspace's recorded path only decides whether it is *stale*, not whether
   something is still running against it: before removing anything for a
   stale workspace, prune checks that workspace's actual Docker containers and

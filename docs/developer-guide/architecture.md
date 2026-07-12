@@ -119,7 +119,9 @@ workspace serialize instead of racing each other's writes.
 `eph clean` deletes this directory for the current workspace. `eph system
 prune` scans every state directory and removes Docker resources by the
 `eph-<short_id>-` namespace when the recorded workspace path is missing or
-empty, but only once it has confirmed the workspace is actually dead: a
+empty. Each prune pass takes one daemon-wide Docker resource snapshot and
+partitions it by namespace in memory, so state-root size does not multiply
+Docker API calls. Prune acts only once it has confirmed the workspace is actually dead: a
 recorded path that no longer resolves could mean the workspace was moved or
 renamed rather than deleted, so prune first checks for any running container
 or live `run=` process under that namespace and skips (reports, does not

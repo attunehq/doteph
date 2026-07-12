@@ -10,7 +10,7 @@ use crate::workspace::{WORKSPACE_METADATA_FILE, WorkspaceMetadata, state_root};
 use anyhow::{Context, Result};
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
-use bollard::models::{ContainerSummary, ContainerSummaryStateEnum};
+use bollard::models::{ContainerSummary, ContainerSummaryStateEnum, ImageSummary, Network, Volume};
 use bollard::query_parameters::{
     ListContainersOptionsBuilder, ListImagesOptionsBuilder, ListNetworksOptionsBuilder,
     RemoveContainerOptionsBuilder, RemoveImageOptionsBuilder, RemoveVolumeOptionsBuilder,
@@ -19,6 +19,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::sleep;
+use tracing::{debug, info};
 
 /// Options for [`prune`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -185,6 +186,51 @@ pub struct PruneReport {
     pub totals: PruneCounts,
 }
 
+/// One daemon-wide resource listing shared by every workspace in a prune pass.
+///
+/// State roots can contain thousands of workspaces. Listing each Docker
+/// resource type for every stale workspace makes prune time grow with both the
+/// state count and Docker round-trip latency, while resource names already
+/// carry enough information to partition one snapshot in memory.
+struct DockerInventory {
+    containers: Vec<ContainerSummary>,
+    volumes: Vec<Volume>,
+    networks: Vec<Network>,
+    images: Vec<ImageSummary>,
+}
+
+struct PruneDocker<'a> {
+    client: &'a Docker,
+    inventory: &'a DockerInventory,
+}
+
+struct PruneCandidate {
+    state_dir: PathBuf,
+    short_id: String,
+    workspace_path: Option<PathBuf>,
+    reason: StaleReason,
+    metadata: Option<WorkspaceMetadata>,
+}
+
+impl DockerInventory {
+    async fn load(docker: &Docker) -> Result<Self> {
+        let (containers, volumes, networks, images) = tokio::try_join!(
+            docker.list_containers(Some(ListContainersOptionsBuilder::new().all(true).build())),
+            docker.list_volumes(None::<bollard::query_parameters::ListVolumesOptions>),
+            docker.list_networks(Some(ListNetworksOptionsBuilder::default().build())),
+            docker.list_images(Some(ListImagesOptionsBuilder::default().all(true).build())),
+        )
+        .context("failed to inventory Docker resources")?;
+
+        Ok(Self {
+            containers,
+            volumes: volumes.volumes.unwrap_or_default(),
+            networks,
+            images,
+        })
+    }
+}
+
 /// Remove resources for metadata-backed workspaces whose recorded path is gone
 /// or empty.
 ///
@@ -195,6 +241,7 @@ pub struct PruneReport {
 /// are reported as warnings and skipped.
 pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
     let root = state_root()?;
+    info!("Acquiring system prune lock at {}", root.display());
     let mut prune_lock = open_prune_lock(&root)?;
     let _lock = prune_lock.try_write().map_err(|err| {
         let path = root.join("prune.lock");
@@ -212,30 +259,64 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
     })?;
     let docker = Docker::connect_with_local_defaults()
         .context("failed to connect to docker (is docker running?)")?;
+    info!("Connecting to Docker");
     docker
         .ping()
         .await
         .context("failed to ping docker daemon")?;
-
     let mut report = PruneReport {
         dry_run: options.dry_run,
         ..PruneReport::default()
     };
 
     let state_dirs = state_dirs(&root).await?;
-    for state_dir in state_dirs {
-        inspect_state_dir(&docker, &state_dir, options, &mut report).await?;
+    let state_dir_count = state_dirs.len();
+    info!("Inspecting {state_dir_count} eph state directories");
+    let mut candidates = Vec::new();
+    for (index, state_dir) in state_dirs.into_iter().enumerate() {
+        if index > 0 && index % 100 == 0 {
+            info!("Inspected {index} of {state_dir_count} eph state directories");
+        }
+        debug!("Inspecting {}", state_dir.display());
+        if let Some(candidate) = classify_state_dir(state_dir, options, &mut report).await? {
+            candidates.push(candidate);
+        }
     }
+
+    info!(
+        "Found {} stale workspace candidates; inventorying Docker resources",
+        candidates.len()
+    );
+    let inventory = DockerInventory::load(&docker).await?;
+    let prune_docker = PruneDocker {
+        client: &docker,
+        inventory: &inventory,
+    };
+    info!(
+        "Docker inventory contains {} containers, {} volumes, {} networks, and {} images",
+        inventory.containers.len(),
+        inventory.volumes.len(),
+        inventory.networks.len(),
+        inventory.images.len()
+    );
+
+    for candidate in candidates {
+        prune_candidate(&prune_docker, candidate, options, &mut report).await?;
+    }
+    info!(
+        "System prune pass found {} stale workspaces and skipped {} state directories",
+        report.pruned.len(),
+        report.skipped.len()
+    );
 
     Ok(report)
 }
 
-async fn inspect_state_dir(
-    docker: &Docker,
-    state_dir: &Path,
+async fn classify_state_dir(
+    state_dir: PathBuf,
     options: PruneOptions,
     report: &mut PruneReport,
-) -> Result<()> {
+) -> Result<Option<PruneCandidate>> {
     let short_id = state_dir
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -246,26 +327,19 @@ async fn inspect_state_dir(
             workspace_path: None,
             reason: "state directory name is not an eph workspace short ID".to_string(),
         });
-        return Ok(());
+        return Ok(None);
     }
     let metadata_path = state_dir.join(WORKSPACE_METADATA_FILE);
 
     if !metadata_path.exists() {
         if options.compatibility_v042 {
-            if let Some(pruned) = prune_workspace(
-                docker,
+            return Ok(Some(PruneCandidate {
                 state_dir,
                 short_id,
-                None,
-                StaleReason::CompatibilityV042State,
-                options,
-                report,
-            )
-            .await?
-            {
-                report.totals.add(&pruned.counts);
-                report.pruned.push(pruned);
-            }
+                workspace_path: None,
+                reason: StaleReason::CompatibilityV042State,
+                metadata: None,
+            }));
         } else {
             report.skipped.push(SkippedWorkspace {
                 short_id,
@@ -275,10 +349,10 @@ async fn inspect_state_dir(
                         .to_string(),
             });
         }
-        return Ok(());
+        return Ok(None);
     }
 
-    let metadata = match WorkspaceMetadata::load_from_state_dir(state_dir).await {
+    let metadata = match WorkspaceMetadata::load_from_state_dir(&state_dir).await {
         Ok(metadata) => metadata,
         Err(err) => {
             report.skipped.push(SkippedWorkspace {
@@ -286,7 +360,7 @@ async fn inspect_state_dir(
                 workspace_path: None,
                 reason: format!("{err:#}"),
             });
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -299,7 +373,7 @@ async fn inspect_state_dir(
                 metadata.short_id
             ),
         });
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(reason) = classify_workspace_path(&metadata.workspace_path)? else {
@@ -308,13 +382,45 @@ async fn inspect_state_dir(
             workspace_path: Some(metadata.workspace_path),
             reason: "workspace still exists and is not empty".to_string(),
         });
-        return Ok(());
+        return Ok(None);
     };
+    debug!(
+        "Found stale workspace {} at {} ({reason})",
+        metadata.short_id,
+        metadata.workspace_path.display()
+    );
 
-    if !options.dry_run && !metadata_still_stale(state_dir, &metadata).await? {
+    Ok(Some(PruneCandidate {
+        state_dir,
+        short_id: metadata.short_id.clone(),
+        workspace_path: Some(metadata.workspace_path.clone()),
+        reason,
+        metadata: Some(metadata),
+    }))
+}
+
+async fn prune_candidate(
+    docker: &PruneDocker<'_>,
+    candidate: PruneCandidate,
+    options: PruneOptions,
+    report: &mut PruneReport,
+) -> Result<()> {
+    if candidate.metadata.is_none() && gained_workspace_metadata(&candidate.state_dir) {
         report.skipped.push(SkippedWorkspace {
-            short_id: metadata.short_id,
-            workspace_path: Some(metadata.workspace_path),
+            short_id: candidate.short_id,
+            workspace_path: candidate.workspace_path,
+            reason: "workspace metadata appeared during prune".to_string(),
+        });
+        return Ok(());
+    }
+
+    if !options.dry_run
+        && let Some(metadata) = candidate.metadata.as_ref()
+        && !metadata_still_stale(&candidate.state_dir, metadata).await?
+    {
+        report.skipped.push(SkippedWorkspace {
+            short_id: candidate.short_id,
+            workspace_path: candidate.workspace_path,
             reason: "workspace metadata changed during prune".to_string(),
         });
         return Ok(());
@@ -322,10 +428,10 @@ async fn inspect_state_dir(
 
     if let Some(pruned) = prune_workspace(
         docker,
-        state_dir,
-        metadata.short_id,
-        Some(metadata.workspace_path),
-        reason,
+        &candidate.state_dir,
+        candidate.short_id,
+        candidate.workspace_path,
+        candidate.reason,
         options,
         report,
     )
@@ -335,6 +441,14 @@ async fn inspect_state_dir(
         report.pruned.push(pruned);
     }
     Ok(())
+}
+
+/// Detect a legacy candidate that another eph invocation adopted during prune.
+///
+/// Compatibility candidates have no metadata to compare, so the appearance of
+/// the metadata file is the proof that the original classification is stale.
+fn gained_workspace_metadata(state_dir: &Path) -> bool {
+    state_dir.join(WORKSPACE_METADATA_FILE).exists()
 }
 
 /// Remove a stale workspace's resources, or report and skip it when it turns
@@ -353,7 +467,7 @@ async fn inspect_state_dir(
 /// Returns `Ok(None)` when the workspace was skipped for liveness rather than
 /// pruned.
 async fn prune_workspace(
-    docker: &Docker,
+    docker: &PruneDocker<'_>,
     state_dir: &Path,
     short_id: String,
     workspace_path: Option<PathBuf>,
@@ -365,10 +479,14 @@ async fn prune_workspace(
 
     let state = load_state_or_warn(state_dir, &short_id, report).await;
     let live_processes = state.as_ref().map_or(0, count_live_processes);
-    let containers = matching_containers(docker, &prefix).await?;
+    let containers = matching_containers(&docker.inventory.containers, &prefix);
     let running_containers = count_running_containers(&containers);
 
     if blocks_prune(running_containers, live_processes, options.force_live) {
+        info!(
+            "Skipping workspace {short_id}: {} still live",
+            live_resource_summary(running_containers, live_processes)
+        );
         report.skipped.push(SkippedWorkspace {
             short_id,
             workspace_path,
@@ -382,17 +500,42 @@ async fn prune_workspace(
 
     let mut counts = PruneCounts::default();
 
+    if options.dry_run {
+        debug!("Planning removal for workspace {short_id}");
+    } else {
+        info!("Removing resources for workspace {short_id}");
+    }
+
     if let Some(state) = state {
         terminate_live_processes(state, &short_id, options.dry_run, report, &mut counts).await;
     }
-    counts.containers = remove_containers(docker, containers, options.dry_run).await?;
-    counts.volumes = remove_volumes(docker, &prefix, options.dry_run).await?;
-    counts.networks = remove_networks(docker, &prefix, options.dry_run).await?;
-    counts.images = remove_images(docker, &prefix, options.dry_run).await?;
+    counts.containers = remove_containers(docker.client, containers, options.dry_run).await?;
+    counts.volumes = remove_volumes(
+        docker.client,
+        &docker.inventory.volumes,
+        &prefix,
+        options.dry_run,
+    )
+    .await?;
+    counts.networks = remove_networks(
+        docker.client,
+        &docker.inventory.networks,
+        &prefix,
+        options.dry_run,
+    )
+    .await?;
+    counts.images = remove_images(
+        docker.client,
+        &docker.inventory.images,
+        &prefix,
+        options.dry_run,
+    )
+    .await?;
 
     if state_dir.exists() {
         counts.state_dirs = 1;
         if !options.dry_run {
+            info!("Removing state directory {}", state_dir.display());
             tokio::fs::remove_dir_all(state_dir)
                 .await
                 .with_context(|| {
@@ -536,19 +679,10 @@ async fn load_state(state_dir: &Path) -> Result<Option<ServiceState>> {
     Ok(Some(state))
 }
 
-/// List containers whose name carries `prefix`, eph's `eph-<short_id>-`
-/// namespace. Fetched once per workspace and shared by the liveness check
-/// ([`count_running_containers`]) and the actual removal
-/// ([`remove_containers`]), so the two agree on exactly which containers
-/// exist rather than risking a container starting or stopping between two
-/// separate `docker ps` calls.
-async fn matching_containers(docker: &Docker, prefix: &str) -> Result<Vec<ContainerSummary>> {
-    let containers = docker
-        .list_containers(Some(ListContainersOptionsBuilder::new().all(true).build()))
-        .await
-        .context("failed to list containers")?;
-    Ok(containers
-        .into_iter()
+/// Select containers whose name carries `prefix` from the pass-wide snapshot.
+fn matching_containers(containers: &[ContainerSummary], prefix: &str) -> Vec<ContainerSummary> {
+    containers
+        .iter()
         .filter(|container| {
             container.names.as_ref().is_some_and(|names| {
                 names
@@ -556,7 +690,8 @@ async fn matching_containers(docker: &Docker, prefix: &str) -> Result<Vec<Contai
                     .any(|name| docker_name_has_prefix(name, prefix))
             })
         })
-        .collect())
+        .cloned()
+        .collect()
 }
 
 /// Count `containers` currently in Docker's `running` state, the liveness
@@ -583,6 +718,7 @@ async fn remove_containers(
         let Some(id) = container.id else {
             continue;
         };
+        info!("Removing container {id}");
         docker
             .remove_container(
                 &id,
@@ -596,14 +732,15 @@ async fn remove_containers(
     Ok(removed)
 }
 
-async fn remove_volumes(docker: &Docker, prefix: &str, dry_run: bool) -> Result<usize> {
-    let volumes = docker
-        .list_volumes(None::<bollard::query_parameters::ListVolumesOptions>)
-        .await
-        .context("failed to list volumes")?;
+async fn remove_volumes(
+    docker: &Docker,
+    volumes: &[Volume],
+    prefix: &str,
+    dry_run: bool,
+) -> Result<usize> {
     let mut removed = 0;
 
-    for volume in volumes.volumes.unwrap_or_default() {
+    for volume in volumes {
         if !volume.name.starts_with(prefix) {
             continue;
         }
@@ -611,6 +748,7 @@ async fn remove_volumes(docker: &Docker, prefix: &str, dry_run: bool) -> Result<
         if dry_run {
             continue;
         }
+        info!("Removing volume {}", volume.name);
         docker
             .remove_volume(
                 &volume.name,
@@ -624,15 +762,16 @@ async fn remove_volumes(docker: &Docker, prefix: &str, dry_run: bool) -> Result<
     Ok(removed)
 }
 
-async fn remove_networks(docker: &Docker, prefix: &str, dry_run: bool) -> Result<usize> {
-    let networks = docker
-        .list_networks(Some(ListNetworksOptionsBuilder::default().build()))
-        .await
-        .context("failed to list networks")?;
+async fn remove_networks(
+    docker: &Docker,
+    networks: &[Network],
+    prefix: &str,
+    dry_run: bool,
+) -> Result<usize> {
     let mut removed = 0;
 
     for network in networks {
-        let Some(name) = network.name else {
+        let Some(name) = network.name.as_ref() else {
             continue;
         };
         if !name.starts_with(prefix) {
@@ -642,8 +781,9 @@ async fn remove_networks(docker: &Docker, prefix: &str, dry_run: bool) -> Result
         if dry_run {
             continue;
         }
+        info!("Removing network {name}");
         docker
-            .remove_network(&name)
+            .remove_network(name)
             .await
             .or_else(ignore_not_found)
             .with_context(|| format!("failed to remove network {name}"))?;
@@ -652,11 +792,12 @@ async fn remove_networks(docker: &Docker, prefix: &str, dry_run: bool) -> Result
     Ok(removed)
 }
 
-async fn remove_images(docker: &Docker, prefix: &str, dry_run: bool) -> Result<usize> {
-    let images = docker
-        .list_images(Some(ListImagesOptionsBuilder::default().all(true).build()))
-        .await
-        .context("failed to list images")?;
+async fn remove_images(
+    docker: &Docker,
+    images: &[ImageSummary],
+    prefix: &str,
+    dry_run: bool,
+) -> Result<usize> {
     let mut removed = 0;
 
     for image in images {
@@ -677,6 +818,7 @@ async fn remove_images(docker: &Docker, prefix: &str, dry_run: bool) -> Result<u
         if dry_run {
             continue;
         }
+        info!("Removing image {tag}");
         docker
             .remove_image(
                 &tag,
@@ -841,6 +983,16 @@ mod tests {
             classify_workspace_path(&missing).unwrap(),
             Some(StaleReason::Missing)
         );
+    }
+
+    #[test]
+    fn detects_metadata_added_after_legacy_candidate_discovery() {
+        let state_dir = tempfile::tempdir().unwrap();
+        assert!(!gained_workspace_metadata(state_dir.path()));
+
+        std::fs::write(state_dir.path().join(WORKSPACE_METADATA_FILE), "{}").unwrap();
+
+        assert!(gained_workspace_metadata(state_dir.path()));
     }
 
     #[test]
