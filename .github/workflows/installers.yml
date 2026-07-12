@@ -177,7 +177,7 @@ jobs:
                   switch ("${{ matrix.scenario }}") {
                       "help" {
                           # Exercises -Help without installing.
-                          $help = ./scripts/install.ps1 -Help | Out-String
+                          $help = ./scripts/install.ps1 -Help 6>&1 | Out-String
                           $help | Write-Host
                           if ($help -notmatch "Version" -or $help -notmatch "BinDir" -or $help -notmatch "Help") {
                               throw "Installer help did not list expected options"
