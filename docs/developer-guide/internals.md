@@ -117,9 +117,15 @@ resources rerun declared health checks.
 ### Startup and failure cleanup
 
 `start_services` walks services in role-topological order, or declaration order
-with `run=` last when the file has no role graph. Each `pre-start` runs immediately before its
-service. After every selected service is healthy, `post-start` runs in the same
-order.
+with `run=` last when the file has no role graph. Before anything runs, the
+ports of every `run=` service the invocation will start are reserved
+(`reserve_command_ports`): recorded in `auto_ports` as the spawn path's reuse
+candidate and exposed to resolution as provisional running entries, so a
+`${svc.port}` reference to a managed app resolves in hook and container
+environments evaluated before the app spawns. `eph dev` passes its foreground
+app as a reserve-ahead name for the same reason. Each `pre-start` then runs
+immediately before its service. After every selected service is healthy,
+`post-start` runs in the same order.
 
 Image and Dockerfile services use Bollard for container create/start/exec.
 Compose delegates to the Docker CLI and queries the exact

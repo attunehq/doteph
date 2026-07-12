@@ -685,6 +685,121 @@ REDIS_URL=redis://localhost:${{redis.port}}
     ws.eph_ok(&["down"]).await;
 }
 
+/// A `pre-start` hook sees its own `run=` service's port: the port is reserved
+/// before hooks run, so a top-level variable derived from it (the
+/// `APP_URL=http://localhost:${web.port}` pattern) resolves in the hook's
+/// environment and matches the port the app actually binds. This exact shape
+/// used to abort `eph up` with "could not resolve environment" even though the
+/// hook never read the variable.
+///
+/// `#[cfg(unix)]`, like the other long-lived `run=` + env tests
+/// (`run_service_auto_port_is_stable_across_restart` and friends): on Windows
+/// the spawned service inherits copies of eph's own stdout/stderr handles
+/// (`CreateProcess` with `bInheritHandles` leaks every inheritable handle, not
+/// just the redirected stdio), so the harness's piped `eph up` does not see EOF
+/// until the service dies and the test starves. The Docker-backed CI job that
+/// runs this suite is Linux, where the assertion is meaningful.
+#[cfg(unix)]
+#[tokio::test]
+async fn pre_start_hook_sees_own_service_auto_port() {
+    // The app writes the PORT it was handed before parking, so the test can
+    // pin the whole chain: reserved port -> hook environment -> injected
+    // process environment.
+    let ws = TestWorkspace::new(&format!(
+        r#"
+APP_URL=http://localhost:${{web.port}}
+
+[web]
+run=printf '%s' "$PORT" > bound-port; sleep 300
+port=auto
+env.PORT=${{web.port}}
+pre-start={}
+"#,
+        hook_write_var("APP_URL", "pre-start-url")
+    ));
+
+    ws.eph_ok(&["up"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let app_url = ws
+        .env_json()
+        .await
+        .get("APP_URL")
+        .expect("APP_URL not found")
+        .clone();
+    assert!(
+        !app_url.contains("${"),
+        "APP_URL should be fully resolved once the app is up, got: {app_url}"
+    );
+
+    let captured = std::fs::read_to_string(ws.path().join("pre-start-url"))
+        .expect("pre-start hook did not write pre-start-url");
+    let captured = captured.trim_end_matches(['\r', '\n']);
+    // The hook saw the same URL the live environment reports...
+    assert_eq!(
+        captured, app_url,
+        "pre-start hook saw a different port than the app was started on"
+    );
+
+    // ...and the process itself was handed that same port, so the value the
+    // hook captured is the one the app actually serves on.
+    let bound = std::fs::read_to_string(ws.path().join("bound-port"))
+        .expect("the app did not record its injected PORT");
+    let hook_port = extract_port(captured).expect("pre-start-url should contain a port");
+    assert_eq!(
+        bound.trim().parse::<u16>().ok(),
+        Some(hook_port),
+        "the app's injected PORT should match the port the pre-start hook saw"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// An earlier service's `pre-start` hook sees a *later* `run=` service's port:
+/// every managed app's port is reserved before any hook runs, not just the
+/// hook's own service's.
+///
+/// `#[cfg(unix)]` for the same Windows handle-inheritance reason as
+/// `pre_start_hook_sees_own_service_auto_port`.
+#[cfg(unix)]
+#[tokio::test]
+async fn pre_start_hook_sees_later_run_service_port() {
+    let ws = TestWorkspace::new(&format!(
+        r#"
+APP_URL=http://localhost:${{web.port}}
+
+[first]
+run=sleep 300
+pre-start={}
+
+[web]
+run=sleep 300
+port=auto
+"#,
+        hook_write_var("APP_URL", "first-pre-start-url")
+    ));
+
+    ws.eph_ok(&["up"]).await;
+    sleep(Duration::from_secs(1)).await;
+
+    let app_url = ws
+        .env_json()
+        .await
+        .get("APP_URL")
+        .expect("APP_URL not found")
+        .clone();
+
+    let captured = std::fs::read_to_string(ws.path().join("first-pre-start-url"))
+        .expect("first's pre-start hook did not write first-pre-start-url");
+    let captured = captured.trim_end_matches(['\r', '\n']);
+    assert_eq!(
+        captured, app_url,
+        "an earlier service's pre-start hook saw a different port than web got"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
 /// A failing `pre-start` hook aborts `eph up` before the service it precedes is
 /// created, so the service never comes up.
 #[tokio::test]
@@ -2628,6 +2743,9 @@ async fn dev_retries_an_auto_port_app_that_exits_during_startup() {
         .spawn()
         .expect("spawn eph dev");
 
+    // Match the running-services line, not just the name: `eph status` also
+    // lists defined-but-stopped services, so a bare "web" matches while the
+    // app is still down and the relaunch assertion passes spuriously.
     let mut running = false;
     for _ in 0..50 {
         sleep(Duration::from_millis(200)).await;
@@ -2635,7 +2753,7 @@ async fn dev_retries_an_auto_port_app_that_exits_during_startup() {
             break;
         }
         let status = ws.eph(&["status"]).await;
-        if String::from_utf8_lossy(&status.stdout).contains("web") {
+        if String::from_utf8_lossy(&status.stdout).contains("web -> localhost:") {
             running = true;
             break;
         }
@@ -2740,6 +2858,77 @@ async fn dev_gates_injected_port_and_tears_down_on_signal() {
         after.contains("No services running"),
         "services should be torn down after `eph dev` is signalled; got:\n{after}"
     );
+}
+
+/// `eph dev` reserves the foreground app's port before running its `pre-start`
+/// hook, matching `eph up`: a top-level variable derived from the app's own
+/// port resolves in the hook's environment and matches the port the app is
+/// then started on.
+#[cfg(unix)]
+#[tokio::test]
+async fn dev_pre_start_hook_sees_foreground_port() {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let ws = TestWorkspace::new(concat!(
+        "APP_URL=http://localhost:${web.port}\n",
+        "[web]\n",
+        "run=sleep 600\n",
+        "port=auto\n",
+        "pre-start=printf '%s' \"$APP_URL\" > pre-start-url\n",
+    ));
+
+    let eph_binary = env!("CARGO_BIN_EXE_eph");
+    let mut child = Command::new(eph_binary)
+        .arg("dev")
+        .current_dir(ws.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn eph dev");
+
+    // Wait until the app is up so `eph env` resolves APP_URL to the live port.
+    // Match the running-services line, not just the name: `eph status` also
+    // lists defined-but-stopped services, so a bare "web" matches before the
+    // app has started.
+    let mut running = false;
+    for _ in 0..100 {
+        sleep(Duration::from_millis(200)).await;
+        if child.try_wait().expect("poll eph dev").is_some() {
+            break;
+        }
+        let status = ws.eph(&["status"]).await;
+        if String::from_utf8_lossy(&status.stdout).contains("web -> localhost:") {
+            running = true;
+            break;
+        }
+    }
+    assert!(running, "eph dev should bring the app up");
+
+    let app_url = ws
+        .env_json()
+        .await
+        .get("APP_URL")
+        .expect("APP_URL not found")
+        .clone();
+    let captured = std::fs::read_to_string(ws.path().join("pre-start-url"))
+        .expect("pre-start hook did not write pre-start-url");
+    assert_eq!(
+        captured.trim_end_matches(['\r', '\n']),
+        app_url,
+        "the dev pre-start hook saw a different port than the app was started on"
+    );
+
+    let pid = child.id().expect("dev child has a pid") as libc::pid_t;
+    // SAFETY: kill takes plain integers and has no memory-safety preconditions.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("eph dev should stop promptly")
+        .expect("wait for eph dev");
+    assert!(status.success());
 }
 
 /// `eph dev` forwards eph's stdin, stdout, and stderr to the foreground app, so

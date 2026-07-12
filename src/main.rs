@@ -512,7 +512,12 @@ async fn cmd_up(services: Vec<String>, roles: Vec<String>, skip_hooks: bool) -> 
     let mut manager = ServiceManager::new(workspace).await?;
 
     let running = manager
-        .start_services(&eph, &service_filter, Hooks::from_skip_flag(skip_hooks))
+        .start_services(
+            &eph,
+            &service_filter,
+            Hooks::from_skip_flag(skip_hooks),
+            &[],
+        )
         .await?;
 
     // Print summary in declaration order (iterate the .eph definitions rather
@@ -1000,7 +1005,10 @@ async fn dev_bring_up(
     // reference the services already up); post-start is deferred below so it
     // can also reference the foreground app. Then start the app in the
     // foreground, running its own pre-start immediately before it, again
-    // matching `up`. `start_services` with an empty filter would start
+    // matching `up`. The foreground app is named as a reserve-ahead service so
+    // its port is decided before any backing hook runs, keeping references to
+    // it (`${web.port}` in a proxy config, say) resolvable exactly as they are
+    // under `eph up`. `start_services` with an empty filter would start
     // everything, so only call it when there is at least one backing service.
     let backing: Vec<String> = eph
         .services
@@ -1013,8 +1021,11 @@ async fn dev_bring_up(
     } else {
         Hooks::PreStartOnly
     };
+    let reserve_ahead = [foreground.to_string()];
     if !backing.is_empty() {
-        manager.start_services(eph, &backing, hooks).await?;
+        manager
+            .start_services(eph, &backing, hooks, &reserve_ahead)
+            .await?;
     }
     if !skip_hooks {
         manager.run_pre_start_for(eph, foreground).await?;

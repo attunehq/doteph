@@ -194,7 +194,7 @@ when generating a `.eph` file: `eph check` rejects it and names both fixes
 | `command=` | Override container CMD (shell-word split, no shell). Only legal for `image=`/`dockerfile=`; a parse error on `run=`/`compose=`. |
 | `healthcheck=` | image/dockerfile: no shell. run/compose: platform shell (`sh -c` / `cmd /C`). |
 | `ready-timeout=` | Non-zero seconds (default 30; compose 60); requires `healthcheck=`. |
-| `pre-start=` / `post-start=` / `pre-stop=` / `post-stop=` | Lifecycle hooks. Host platform shell in workspace root; repeatable; run with the resolved env + `EPH_*` metadata + the service's `env.X` injected. `pre-start` runs just before its service is created (no own port yet); `post-start` after all services are healthy. Both run on every `up`; failures abort. `pre-stop` runs before a stop (failure aborts, service left running); `post-stop` after (failure aborts the rest of teardown). |
+| `pre-start=` / `post-start=` / `pre-stop=` / `post-stop=` | Lifecycle hooks. Host platform shell in workspace root; repeatable; run with the resolved env + `EPH_*` metadata + the service's `env.X` injected. `pre-start` runs just before its service is created; a `run=` service's port is reserved before hooks run, so `${svc.port}` for the services being started resolves even there (a not-yet-created container's port does not). `post-start` runs after all services are healthy. Both run on every `up`; failures abort. `pre-stop` runs before a stop (failure aborts, service left running); `post-stop` after (failure aborts the rest of teardown). |
 
 Every property above except the four marked repeatable is single-valued: a
 second occurrence is a parse error, as is an unknown property (the error

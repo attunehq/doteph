@@ -252,16 +252,23 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 
 Each hook receives, layered in this order (later wins):
 
-1. the resolved top-level `.eph` variables (exactly what `eph env` prints),
+1. the resolved top-level `.eph` variables (what `eph env` prints, except that
+   during `eph up` a hook also sees the reserved ports of `run=` services
+   being started, which `eph env` cannot show until they are up),
 2. `EPH_*` metadata: `EPH_WORKSPACE_ID`, `EPH_WORKSPACE_ROOT`,
    `EPH_CONTAINER_PREFIX`, and per service `EPH_<SERVICE>_HOST`,
    `EPH_<SERVICE>_PORT`, `EPH_<SERVICE>_PORT_<NAME>` (for named ports),
    `EPH_<SERVICE>_CONTAINER` (service names upper-cased, `-` -> `_`),
 3. the owning service's own `env.X=` values.
 
-`pre-start` runs just before its own service is created, so it cannot see that
-service's own port, but it does see any service already up (backing services
-start before `run=` apps). Use it for prep the service depends on, like codegen.
+`pre-start` runs just before its own service is created. It sees any service
+already up (backing services start before `run=` apps), plus the reserved port
+of every `run=` service the same invocation is starting, its own included: eph
+decides those ports before any hook runs, so a top-level variable like
+`APP_URL=http://localhost:${api.port}` already resolves in the hook's
+environment. Only a container port Docker has not assigned yet (an `image=`
+service later in the start order) is unavailable to it. Use it for prep the
+service depends on, like codegen.
 `post-start` hooks run only after **every** service in the `up` is healthy, so a
 hook may reference any other service's port (`${redis.port}` resolves even if
 redis started after the service whose hook needs it). `post-stop` runs after its

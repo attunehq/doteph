@@ -375,9 +375,12 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 Hooks run with eph's resolved environment injected, layered in this order
 (later entries win where names collide):
 
-1. The resolved top-level `.eph` variables: exactly what `eph env` prints, with
+1. The resolved top-level `.eph` variables: what `eph env` prints, with
    `${service.port}` filled in. `$DATABASE_URL` in the example above is already
-   set; no `eval` needed.
+   set; no `eval` needed. One difference during `eph up`: a hook also sees the
+   reserved ports of the `run=` services being started, which `eph env` (a
+   separate invocation resolving against *running* services) cannot show until
+   they are up.
 2. `EPH_*` metadata variables: `EPH_WORKSPACE_ID`, `EPH_WORKSPACE_ROOT`, and
    `EPH_CONTAINER_PREFIX`, plus per service `EPH_<SERVICE>_HOST`,
    `EPH_<SERVICE>_PORT`, `EPH_<SERVICE>_PORT_<NAME>` (for named ports), and
@@ -396,10 +399,16 @@ with these variables set.
   idempotent: a migration that no-ops when applied, an
   `INSERT ... ON CONFLICT` seed. For one-off or destructive work, use
   [`eph run`](command-reference.md#eph-run-cmd) instead of a hook.
-- **`pre-start` runs before its service exists**, so it cannot reference that
-  service's own port. It does see any service already up at that point: within
-  a single `eph up`, backing services start before `run=` apps (or in role
-  order), so an app's `pre-start` can reach the database's assigned port.
+- **`pre-start` runs before its service exists**, but with the ports of the
+  `run=` services this `eph up` is starting already decided: eph reserves a
+  managed app's port before any hook runs, so a variable derived from the app's
+  own port (`APP_URL=http://localhost:${api.port}`) resolves even in the app's
+  own `pre-start`. It also sees any service already up at that point: within a
+  single `eph up`, backing services start before `run=` apps (or in role
+  order), so an app's `pre-start` can reach the database's assigned port. The
+  one thing it cannot reference is a container port Docker has not assigned
+  yet, i.e. an `image=`/`dockerfile=`/`compose=` service later in the start
+  order (its own included).
 - **`post-start` hooks run in a second phase**, only after **every** service in
   the `up` is healthy. A `post-start` hook can therefore reference any
   service's assigned port, for example a migration whose `DATABASE_URL`
