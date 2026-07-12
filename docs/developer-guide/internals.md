@@ -179,7 +179,9 @@ unless its current identity matches the recorded one.
 
 `prune` scans state directories with 16-hex or 8-hex names,
 classifies missing or empty workspace paths, and discovers namespaced Docker and
-process resources. Live resources block removal unless `--force-live` is set.
+process resources. It lists each Docker resource type once per pass, then
+partitions that snapshot by workspace namespace. Live resources block removal
+unless `--force-live` is set.
 An 8-hex state directory without workspace metadata requires
 `--compatibility-v042`. A global lock prevents concurrent prune runs.
 
