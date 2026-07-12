@@ -252,7 +252,9 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 
 Each hook receives, layered in this order (later wins):
 
-1. the resolved top-level `.eph` variables (exactly what `eph env` prints),
+1. the resolved top-level `.eph` variables (what `eph env` prints, except that
+   during `eph up` a hook also sees the reserved ports of `run=` services
+   being started, which `eph env` cannot show until they are up),
 2. `EPH_*` metadata: `EPH_WORKSPACE_ID`, `EPH_WORKSPACE_ROOT`,
    `EPH_CONTAINER_PREFIX`, and per service `EPH_<SERVICE>_HOST`,
    `EPH_<SERVICE>_PORT`, `EPH_<SERVICE>_PORT_<NAME>` (for named ports),

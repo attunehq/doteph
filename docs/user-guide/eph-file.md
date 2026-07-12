@@ -375,9 +375,12 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 Hooks run with eph's resolved environment injected, layered in this order
 (later entries win where names collide):
 
-1. The resolved top-level `.eph` variables: exactly what `eph env` prints, with
+1. The resolved top-level `.eph` variables: what `eph env` prints, with
    `${service.port}` filled in. `$DATABASE_URL` in the example above is already
-   set; no `eval` needed.
+   set; no `eval` needed. One difference during `eph up`: a hook also sees the
+   reserved ports of the `run=` services being started, which `eph env` (a
+   separate invocation resolving against *running* services) cannot show until
+   they are up.
 2. `EPH_*` metadata variables: `EPH_WORKSPACE_ID`, `EPH_WORKSPACE_ROOT`, and
    `EPH_CONTAINER_PREFIX`, plus per service `EPH_<SERVICE>_HOST`,
    `EPH_<SERVICE>_PORT`, `EPH_<SERVICE>_PORT_<NAME>` (for named ports), and

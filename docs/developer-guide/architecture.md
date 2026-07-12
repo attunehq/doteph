@@ -292,9 +292,11 @@ the workspace directory:
   first. It sees the services already up at that point, plus the reserved
   ports of the `run=` services the invocation is starting (`eph up` decides
   those ports before any hook runs and records them as the spawn path's reuse
-  candidate, so the process later binds the same port). Only a container port
-  Docker has not assigned yet is invisible to it. A failing hook aborts `up`
-  before the service starts.
+  candidate, so the process normally binds the same port; if another process
+  steals the port before spawn, the conflict relaunch moves the app to a
+  fresh one and a hook that captured the reserved value is stale). Only a
+  container port Docker has not assigned yet is invisible to it. A failing
+  hook aborts `up` before the service starts.
 - `post-start` runs in a **second phase** of `eph up`: every targeted service
   is first brought to a healthy state, then every service's `post-start`
   hooks run. Deferring hooks this way lets a hook reference any other

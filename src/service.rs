@@ -826,11 +826,12 @@ const PORT_CONFLICT_MARKERS: &[&str] = &[
 fn allocate_ports(
     declared: &[PortMapping],
     prev: Option<&HashMap<String, u16>>,
+    taken: &HashSet<u16>,
 ) -> Result<HashMap<String, u16>> {
     // Hold every reservation open until the map is fully built so the ports are
     // distinct; dropped on return, just before the process is spawned.
     let mut held: Vec<std::net::TcpListener> = Vec::new();
-    allocate_ports_holding(declared, prev, &mut held, &HashSet::new())
+    allocate_ports_holding(declared, prev, &mut held, taken)
 }
 
 /// The reservation pass behind [`allocate_ports`], with the listener pool and
@@ -840,8 +841,12 @@ fn allocate_ports(
 /// services in one pass; sharing `held` across those calls keeps every
 /// reservation's listener bound until the whole pass is done, so one service's
 /// released candidate cannot be handed to the next service as a fresh
-/// OS-assigned port. `taken` guards the same cross-service collision for fixed
-/// ports, which are never bound and so cannot defend themselves via `held`.
+/// OS-assigned port. `taken` names ports that belong to other services but are
+/// not necessarily bound right now: fixed declarations, and reservations whose
+/// listeners were released by an earlier pass (a spawn-time or retry
+/// allocation runs long after `reserve_command_ports` let go of its pool).
+/// Neither can defend itself via `held`, so both the reuse candidate and the
+/// fresh OS-assigned fallback reject members of `taken`.
 fn allocate_ports_holding(
     declared: &[PortMapping],
     prev: Option<&HashMap<String, u16>>,
@@ -881,14 +886,33 @@ fn allocate_ports_holding(
                 p
             }
             None => {
-                let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
-                    .context("failed to allocate a free host port")?;
-                let p = listener
-                    .local_addr()
-                    .context("failed to read the allocated host port")?
-                    .port();
-                held.push(listener);
-                p
+                // The OS may hand back a member of `taken` (nothing is bound
+                // on it); reject and re-bind, holding each reject so the OS
+                // cannot offer the same port again within this loop.
+                let mut rejected: Vec<std::net::TcpListener> = Vec::new();
+                loop {
+                    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+                        .context("failed to allocate a free host port")?;
+                    let p = listener
+                        .local_addr()
+                        .context("failed to read the allocated host port")?
+                        .port();
+                    if taken.contains(&p) {
+                        rejected.push(listener);
+                        // `taken` is a handful of ports; hitting it repeatedly
+                        // means something is deeply wrong with the ephemeral
+                        // range, so give up rather than spin.
+                        if rejected.len() > 16 {
+                            bail!(
+                                "could not allocate a free host port distinct from \
+                                 other services' assignments"
+                            );
+                        }
+                        continue;
+                    }
+                    held.push(listener);
+                    break p;
+                }
             }
         };
         assigned.insert(name, port);
@@ -901,6 +925,25 @@ fn allocate_ports_holding(
 /// service is a managed app whose process eph may re-launch on a fresh port.
 fn has_auto_port(declared: &[PortMapping]) -> bool {
     declared.iter().any(PortMapping::is_auto)
+}
+
+/// The ports assigned to every service in `running` except `except`, whether
+/// live or provisionally reserved.
+///
+/// Mid-`up` allocations (spawn time, the port-conflict retry) exclude these: a
+/// reservation made by [`ServiceManager::reserve_command_ports`] holds no
+/// listener by then, so without this set a fresh OS-assigned port could land
+/// on a port another service was already promised, and that service's hooks
+/// would have captured a value its process can no longer bind.
+fn ports_assigned_to_others(
+    running: &HashMap<String, RunningService>,
+    except: &str,
+) -> HashSet<u16> {
+    running
+        .iter()
+        .filter(|(name, _)| name.as_str() != except)
+        .flat_map(|(_, svc)| svc.ports.values().copied())
+        .collect()
 }
 
 /// Capture the proof needed to manage a process by PID after this invocation
@@ -2004,9 +2047,17 @@ impl ServiceManager {
     ) -> Result<()> {
         // One listener pool and taken-set across every service in the pass, so
         // two reservations cannot land on the same port (see
-        // `allocate_ports_holding`).
+        // `allocate_ports_holding`). The taken-set starts from the ports of
+        // everything already in `running`: a live service's port is not
+        // necessarily bound right now (a fixed `port=` its process ignores,
+        // say), and the spawn path excludes those same ports, so a reservation
+        // that reused one would be moved at spawn time and every hook that
+        // captured it would go stale.
         let mut held: Vec<std::net::TcpListener> = Vec::new();
-        let mut taken: HashSet<u16> = HashSet::new();
+        let mut taken: HashSet<u16> = running
+            .values()
+            .flat_map(|svc| svc.ports.values().copied())
+            .collect();
         for name in names {
             let service = eph
                 .services
@@ -2362,7 +2413,11 @@ impl ServiceManager {
                     .filter(|entry| entry.backend.process_is_alive())
                     .map(|entry| &entry.ports)
                     .or_else(|| self.state.auto_ports.get(&service.name));
-                let ports = allocate_ports(&service.ports, previous_ports)?;
+                let ports = allocate_ports(
+                    &service.ports,
+                    previous_ports,
+                    &ports_assigned_to_others(running, &service.name),
+                )?;
                 let mut effective_running = running.clone();
                 effective_running.insert(
                     service.name.clone(),
@@ -2890,11 +2945,16 @@ impl ServiceManager {
 
         for attempt in 1..=max_attempts {
             // Reuse the previous ports only on the first attempt; a retry exists
-            // precisely because a port collided, so it allocates fresh ones.
+            // precisely because a port collided, so it allocates fresh ones
+            // (never onto a port another service holds or was promised).
             let ports = if attempt == 1 {
                 first_ports.clone()
             } else {
-                allocate_ports(&service.ports, None)?
+                allocate_ports(
+                    &service.ports,
+                    None,
+                    &ports_assigned_to_others(others, name),
+                )?
             };
 
             // Build the environment with this service's assigned ports visible, so
@@ -3800,7 +3860,11 @@ impl ServiceManager {
             let ports = if attempt == 1 {
                 first_ports.clone()
             } else {
-                allocate_ports(&service.ports, None)?
+                allocate_ports(
+                    &service.ports,
+                    None,
+                    &ports_assigned_to_others(&others, name),
+                )?
             };
             let mut running = others.clone();
             running.insert(
@@ -4562,7 +4626,7 @@ mod tests {
     #[test]
     fn allocate_ports_uses_fixed_ports_verbatim() {
         let declared = vec![port(None, 3000), port(Some("api"), 4000)];
-        let assigned = allocate_ports(&declared, None).unwrap();
+        let assigned = allocate_ports(&declared, None, &HashSet::new()).unwrap();
         assert_eq!(assigned.get("default"), Some(&3000));
         assert_eq!(assigned.get("api"), Some(&4000));
     }
@@ -4575,7 +4639,7 @@ mod tests {
             auto_port(Some("hmr")),
             auto_port(Some("api")),
         ];
-        let assigned = allocate_ports(&declared, None).unwrap();
+        let assigned = allocate_ports(&declared, None, &HashSet::new()).unwrap();
         assert_eq!(assigned.len(), 3);
 
         // Every assigned port is non-zero and they are all distinct.
@@ -4598,7 +4662,7 @@ mod tests {
             .port();
         let prev = HashMap::from([("default".to_string(), free)]);
 
-        let assigned = allocate_ports(&[auto_port(None)], Some(&prev)).unwrap();
+        let assigned = allocate_ports(&[auto_port(None)], Some(&prev), &HashSet::new()).unwrap();
         assert_eq!(assigned.get("default"), Some(&free));
     }
 
@@ -4611,7 +4675,7 @@ mod tests {
         let busy = listener.local_addr().unwrap().port();
         let prev = HashMap::from([("default".to_string(), busy)]);
 
-        let assigned = allocate_ports(&[auto_port(None)], Some(&prev)).unwrap();
+        let assigned = allocate_ports(&[auto_port(None)], Some(&prev), &HashSet::new()).unwrap();
         assert_ne!(assigned.get("default"), Some(&busy));
         assert!(assigned.get("default").is_some_and(|&p| p != 0));
     }

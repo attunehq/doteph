@@ -702,13 +702,17 @@ REDIS_URL=redis://localhost:${{redis.port}}
 #[cfg(unix)]
 #[tokio::test]
 async fn pre_start_hook_sees_own_service_auto_port() {
+    // The app writes the PORT it was handed before parking, so the test can
+    // pin the whole chain: reserved port -> hook environment -> injected
+    // process environment.
     let ws = TestWorkspace::new(&format!(
         r#"
 APP_URL=http://localhost:${{web.port}}
 
 [web]
-run=sleep 300
+run=printf '%s' "$PORT" > bound-port; sleep 300
 port=auto
+env.PORT=${{web.port}}
 pre-start={}
 "#,
         hook_write_var("APP_URL", "pre-start-url")
@@ -731,11 +735,21 @@ pre-start={}
     let captured = std::fs::read_to_string(ws.path().join("pre-start-url"))
         .expect("pre-start hook did not write pre-start-url");
     let captured = captured.trim_end_matches(['\r', '\n']);
-    // Equality against the live environment proves both halves: the hook saw a
-    // resolved URL, and the spawned app kept the reserved port.
+    // The hook saw the same URL the live environment reports...
     assert_eq!(
         captured, app_url,
         "pre-start hook saw a different port than the app was started on"
+    );
+
+    // ...and the process itself was handed that same port, so the value the
+    // hook captured is the one the app actually serves on.
+    let bound = std::fs::read_to_string(ws.path().join("bound-port"))
+        .expect("the app did not record its injected PORT");
+    let hook_port = extract_port(captured).expect("pre-start-url should contain a port");
+    assert_eq!(
+        bound.trim().parse::<u16>().ok(),
+        Some(hook_port),
+        "the app's injected PORT should match the port the pre-start hook saw"
     );
 
     ws.eph_ok(&["down"]).await;
