@@ -52,11 +52,13 @@ jobs:
 
       # The Windows runner has no Docker daemon, so the Docker-backed integration
       # and stress crates cannot run here. This job exists to guard the
-      # native-Windows code paths in src/proc.rs (the `cmd /C` shell and the
-      # sysinfo-based liveness/termination): clippy compiles every target so a
+      # native-Windows code paths in src/proc.rs (the `cmd /C` shell, the
+      # sysinfo-based liveness/termination, and the raw CreateProcessW spawn
+      # that caps handle inheritance): clippy compiles every target so a
       # `cfg(windows)` regression fails the build, and the library unit tests
-      # exercise `proc::` (shell exit codes, is_alive, terminate, force_kill)
-      # directly against real Windows processes.
+      # exercise `proc::` (shell exit codes, is_alive, terminate, force_kill,
+      # spawn_captured and its handle-inheritance regression test) directly
+      # against real Windows processes.
       - name: Clippy (all targets)
         run: cargo clippy --all-targets -- -D warnings
 

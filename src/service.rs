@@ -3144,8 +3144,9 @@ impl ServiceManager {
     ) -> Result<(proc::CapturedChild, NonZeroU32)> {
         let log_path = self.workspace.log_file_path(name)?;
         if let Some(parent) = log_path.parent() {
-            create_private_dir(parent)
-                .with_context(|| format!("failed to create logs directory: {}", parent.display()))?;
+            create_private_dir(parent).with_context(|| {
+                format!("failed to create logs directory: {}", parent.display())
+            })?;
         }
         let log_file = create_private_log_file(&log_path)
             .with_context(|| format!("failed to open log file: {}", log_path.display()))?;

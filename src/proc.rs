@@ -296,8 +296,8 @@ pub(crate) fn spawn_captured(
 /// `.output()`), the caller hands eph *inheritable* pipe handles as its std
 /// handles. Any child spawned through std/tokio with redirected stdio then
 /// receives copies of them (`bInheritHandles=TRUE` copies every inheritable
-/// handle), and a long-lived grandchild -- a daemon a hook's shell leaves
-/// behind, say -- keeps the caller's pipe open after eph exits. Clearing
+/// handle), and a long-lived grandchild (a daemon a hook's shell leaves
+/// behind, say) keeps the caller's pipe open after eph exits. Clearing
 /// `HANDLE_FLAG_INHERIT` on the originals removes that whole class.
 ///
 /// Clearing permanently (never toggling around a spawn, which would race
@@ -379,7 +379,9 @@ mod win {
         pub(crate) fn has_exited(&self) -> bool {
             // SAFETY: the owned handle is open, and a zero timeout makes this
             // a pure state query.
-            unsafe { WaitForSingleObject(self.process.as_raw_handle() as HANDLE, 0) == WAIT_OBJECT_0 }
+            unsafe {
+                WaitForSingleObject(self.process.as_raw_handle() as HANDLE, 0) == WAIT_OBJECT_0
+            }
         }
 
         /// Terminate the process and wait for the termination to complete,
@@ -449,8 +451,8 @@ mod win {
 
     /// Spawn `cmd /C <cmd>` detached, with `env` overlaid on eph's
     /// environment, `cwd` as the working directory, stdin from `NUL`, and
-    /// stdout/stderr bound to the given log files -- inheriting **only**
-    /// those three handles.
+    /// stdout/stderr bound to the given log files. The child inherits
+    /// **only** those three handles.
     pub(super) fn spawn_captured(
         cmd: &str,
         cwd: &Path,
@@ -669,11 +671,7 @@ mod win {
 
         let mut block: Vec<u16> = Vec::new();
         for (key, value) in &merged {
-            if key
-                .encode_wide()
-                .chain(value.encode_wide())
-                .any(|c| c == 0)
-            {
+            if key.encode_wide().chain(value.encode_wide()).any(|c| c == 0) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "nul character in environment",
@@ -1103,9 +1101,9 @@ mod tests {
     }
 
     /// Regression test for the Windows handle-inheritance leak: a long-lived
-    /// `run=` service used to inherit *every* inheritable handle in eph --
-    /// most damagingly the stdout/stderr pipe handles a capturing caller
-    /// (`eph up | tee`, a test harness's `.output()`) handed eph -- so the
+    /// `run=` service used to inherit *every* inheritable handle in eph,
+    /// worst of all the stdout/stderr pipe handles a capturing caller
+    /// (`eph up | tee`, a test harness's `.output()`) handed eph, so the
     /// caller's pipe read never saw EOF until the whole service tree died.
     ///
     /// An inheritable pipe created here stands in for the caller's capture

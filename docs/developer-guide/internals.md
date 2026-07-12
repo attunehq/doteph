@@ -172,6 +172,8 @@ stays raw for piping.
 `proc.rs` centralizes native behavior:
 
 - `shell_command`: `sh -c` on Unix, `cmd /C` on Windows;
+- `spawn_captured`: the detached background `run=` spawn (null stdin, log-file
+  stdout/stderr);
 - direct command spawning for `eph run`;
 - process identity capture and verification;
 - whole-tree termination.
@@ -180,6 +182,17 @@ Unix shells lead a process group so teardown can signal the group. Windows uses
 a `sysinfo` descendant snapshot because a daemonless later invocation cannot
 reattach to a named Job Object. Every lifecycle path refuses to signal a PID
 unless its current identity matches the recorded one.
+
+On Windows, `spawn_captured` calls `CreateProcessW` directly with a
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST` so the service inherits only its three
+stdio handles. The std/tokio spawn passes `bInheritHandles=TRUE`, which copies
+every inheritable handle in eph (including the stdout/stderr pipes a capturing
+caller handed eph) into the long-lived service tree, and the caller's pipe
+read then blocks until the tree dies. `disinherit_std_handles`, called at
+startup by `main`, clears the inherit flag on eph's own std handles so
+shorter-lived std/tokio children (hooks, health checks, the update worker)
+cannot re-leak them either. The `proc` module docs cover the mechanism in
+depth.
 
 ## prune
 
