@@ -396,10 +396,16 @@ with these variables set.
   idempotent: a migration that no-ops when applied, an
   `INSERT ... ON CONFLICT` seed. For one-off or destructive work, use
   [`eph run`](command-reference.md#eph-run-cmd) instead of a hook.
-- **`pre-start` runs before its service exists**, so it cannot reference that
-  service's own port. It does see any service already up at that point: within
-  a single `eph up`, backing services start before `run=` apps (or in role
-  order), so an app's `pre-start` can reach the database's assigned port.
+- **`pre-start` runs before its service exists**, but with the ports of the
+  `run=` services this `eph up` is starting already decided: eph reserves a
+  managed app's port before any hook runs, so a variable derived from the app's
+  own port (`APP_URL=http://localhost:${api.port}`) resolves even in the app's
+  own `pre-start`. It also sees any service already up at that point: within a
+  single `eph up`, backing services start before `run=` apps (or in role
+  order), so an app's `pre-start` can reach the database's assigned port. The
+  one thing it cannot reference is a container port Docker has not assigned
+  yet, i.e. an `image=`/`dockerfile=`/`compose=` service later in the start
+  order (its own included).
 - **`post-start` hooks run in a second phase**, only after **every** service in
   the `up` is healthy. A `post-start` hook can therefore reference any
   service's assigned port, for example a migration whose `DATABASE_URL`

@@ -830,6 +830,24 @@ fn allocate_ports(
     // Hold every reservation open until the map is fully built so the ports are
     // distinct; dropped on return, just before the process is spawned.
     let mut held: Vec<std::net::TcpListener> = Vec::new();
+    allocate_ports_holding(declared, prev, &mut held, &HashSet::new())
+}
+
+/// The reservation pass behind [`allocate_ports`], with the listener pool and
+/// the already-taken set owned by the caller.
+///
+/// [`ServiceManager::reserve_command_ports`] reserves ports for *several*
+/// services in one pass; sharing `held` across those calls keeps every
+/// reservation's listener bound until the whole pass is done, so one service's
+/// released candidate cannot be handed to the next service as a fresh
+/// OS-assigned port. `taken` guards the same cross-service collision for fixed
+/// ports, which are never bound and so cannot defend themselves via `held`.
+fn allocate_ports_holding(
+    declared: &[PortMapping],
+    prev: Option<&HashMap<String, u16>>,
+    held: &mut Vec<std::net::TcpListener>,
+    taken: &HashSet<u16>,
+) -> Result<HashMap<String, u16>> {
     let mut assigned: HashMap<String, u16> = HashMap::new();
 
     for mapping in declared {
@@ -844,12 +862,13 @@ fn allocate_ports(
         }
 
         // Prefer the port this mapping had last time, if it is still bindable and
-        // not already taken by an earlier mapping in this same service, so URLs
-        // stay stable across `eph down` / `eph up`.
+        // not already taken by an earlier mapping in this same service (or by an
+        // earlier service in this same reservation pass), so URLs stay stable
+        // across `eph down` / `eph up`.
         let reused = prev
             .and_then(|p| p.get(&name))
             .copied()
-            .filter(|p| !assigned.values().any(|a| a == p))
+            .filter(|p| !assigned.values().any(|a| a == p) && !taken.contains(p))
             .and_then(|p| {
                 std::net::TcpListener::bind(("127.0.0.1", p))
                     .ok()
@@ -875,7 +894,6 @@ fn allocate_ports(
         assigned.insert(name, port);
     }
 
-    drop(held);
     Ok(assigned)
 }
 
@@ -1945,20 +1963,99 @@ impl ServiceManager {
     /// Returns an error if any service fails to start or if state cannot be
     /// saved.
     pub async fn start_all(&mut self, eph: &EphFile) -> Result<HashMap<String, RunningService>> {
-        self.start_services(eph, &[], Hooks::All).await
+        self.start_services(eph, &[], Hooks::All, &[]).await
+    }
+
+    /// Decide the host ports of not-yet-running `run=` services ahead of their
+    /// start, so `${svc.port}` references to them resolve before the process
+    /// exists.
+    ///
+    /// A managed app's port is eph's own decision (unlike a container's, which
+    /// Docker assigns at create time), so nothing forces that decision to wait
+    /// until spawn. Making it up front lets a top-level variable that derives
+    /// from the app's port (`APP_URL=http://localhost:${server.port}`) resolve
+    /// in every earlier execution environment of the same invocation: the app's
+    /// own `pre-start` hook, other services' hooks, and backing containers'
+    /// `env.X`. Before this, such a variable failed strict resolution until the
+    /// app spawned, which aborted `eph up` at the first `pre-start` hook even
+    /// when the hook never read the variable.
+    ///
+    /// Each reserved service is added to `running` as a provisional entry
+    /// (services already in `running` are skipped -- their live ports win), and
+    /// auto ports are recorded in `state.auto_ports`, which is exactly where
+    /// the spawn path looks for its reuse candidate; the eventual process
+    /// therefore binds the reserved port. The reservation is a decision, not a
+    /// held bind: the backing OS listeners are released when this returns, and
+    /// if another process steals a port before spawn, the spawn path allocates
+    /// a fresh one (the existing conflict-relaunch behavior), leaving any hook
+    /// that captured the provisional value stale. That window has always
+    /// existed between allocation and bind; reservation widens it by the
+    /// pre-start hooks' runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a name is not a defined service or no free port can
+    /// be reserved.
+    fn reserve_command_ports<'a>(
+        &mut self,
+        eph: &EphFile,
+        names: impl IntoIterator<Item = &'a String>,
+        running: &mut HashMap<String, RunningService>,
+    ) -> Result<()> {
+        // One listener pool and taken-set across every service in the pass, so
+        // two reservations cannot land on the same port (see
+        // `allocate_ports_holding`).
+        let mut held: Vec<std::net::TcpListener> = Vec::new();
+        let mut taken: HashSet<u16> = HashSet::new();
+        for name in names {
+            let service = eph
+                .services
+                .get(name)
+                .with_context(|| format!("unknown service: {name}"))?;
+            if running.contains_key(name)
+                || !matches!(service.source, ServiceSource::Command(_))
+                || service.ports.is_empty()
+            {
+                continue;
+            }
+            let ports = allocate_ports_holding(
+                &service.ports,
+                self.state.auto_ports.get(name),
+                &mut held,
+                &taken,
+            )?;
+            taken.extend(ports.values().copied());
+            if has_auto_port(&service.ports) {
+                self.state.auto_ports.insert(name.clone(), ports.clone());
+            }
+            running.insert(
+                name.clone(),
+                RunningService {
+                    name: name.clone(),
+                    ports,
+                },
+            );
+        }
+        Ok(())
     }
 
     /// Start the requested services (or all of them when `filter` is empty),
     /// running `pre-start` hooks before each service comes up and `post-start`
     /// hooks once every service is healthy.
     ///
-    /// Startup happens in two phases:
+    /// Startup happens in two phases, after one preparatory step: the host
+    /// ports of every not-yet-running `run=` target (and of every service named
+    /// in `reserve_ahead`) are reserved up front, so a `${svc.port}` reference
+    /// to a managed app resolves everywhere in this `up` -- including in hooks
+    /// and container environments evaluated before the app itself spawns.
     ///
     /// 1. In start order, each target service runs its `pre-start` hooks and is
     ///    then created (or reused) and waited on until healthy. A `pre-start`
-    ///    hook sees the services already up at that point, but not its own
-    ///    not-yet-assigned port; it is the place for prep the service depends on
-    ///    (codegen, a generated config).
+    ///    hook sees the services already up at that point plus the reserved
+    ///    ports of the `run=` services this invocation will start; only a port
+    ///    Docker has not assigned yet (an `image=`/`dockerfile=`/`compose=`
+    ///    service later in the start order) is unavailable to it. It is the
+    ///    place for prep the service depends on (codegen, a generated config).
     /// 2. Every target service's `post-start` hooks run with the fully-resolved
     ///    environment.
     ///
@@ -1976,17 +2073,26 @@ impl ServiceManager {
     ///
     /// `hooks` selects which hook phases run; see [`Hooks`].
     ///
+    /// `reserve_ahead` names `run=` services this *invocation* will start
+    /// through another path, so their ports should be reserved (and visible to
+    /// hooks) now even though this call does not start them. `eph dev` passes
+    /// its foreground app here while starting the backing services, so a
+    /// backing service's `pre-start` hook resolves the app's port exactly as it
+    /// would under `eph up` -- the two entry points used to drift on precisely
+    /// this kind of hook-visible difference. Plain `eph up` passes no names.
+    ///
     /// # Errors
     ///
-    /// Returns an error if a service name in `filter` is unknown, if a
-    /// `pre-start` hook fails (the service it precedes is not started), if any
-    /// service fails to start, if a `post-start` hook fails, or if state cannot
-    /// be saved.
+    /// Returns an error if a service name in `filter` or `reserve_ahead` is
+    /// unknown, if a `pre-start` hook fails (the service it precedes is not
+    /// started), if any service fails to start, if a `post-start` hook fails,
+    /// or if state cannot be saved.
     pub async fn start_services(
         &mut self,
         eph: &EphFile,
         filter: &[String],
         hooks: Hooks,
+        reserve_ahead: &[String],
     ) -> Result<HashMap<String, RunningService>> {
         // One state-mutating eph command per workspace at a time. Without this,
         // two overlapping `eph up` runs each spawn services and race their
@@ -2026,6 +2132,22 @@ impl ServiceManager {
                 .collect()
         };
 
+        // Reserve the ports of every run= service this invocation will start
+        // (targets and reserve_ahead alike) before anything else happens. A
+        // top-level variable derived from a managed app's own port, like
+        // APP_URL=http://localhost:${server.port}, is part of every hook's and
+        // every container's strictly-resolved environment; without the
+        // reservation it could not resolve until the app spawned, which aborted
+        // the whole `up` at the first pre-start hook -- even one that never
+        // reads the variable.
+        let mut running = HashMap::new();
+        let mut resolved = self.status().await?;
+        self.reserve_command_ports(
+            eph,
+            targets.iter().copied().chain(reserve_ahead),
+            &mut resolved,
+        )?;
+
         // Phase 1: run each target's pre-start hook, then create or reuse it,
         // waiting for health.
         //
@@ -2034,12 +2156,12 @@ impl ServiceManager {
         // compile, a config file a container mounts -- completes before the thing
         // that consumes it boots. Because start_order brings backing services up
         // before run= apps, a run= app's pre-start already sees those services'
-        // ports; it cannot see its own not-yet-assigned port. `resolved` tracks
-        // the live environment as it grows: it starts from services already up
-        // (a filtered `eph up` of one service, say) and each freshly started
-        // service is merged in so later pre-start hooks see earlier ones.
-        let mut running = HashMap::new();
-        let mut resolved = self.status().await?;
+        // ports, and the reservation above lets it see its own port too.
+        // `resolved` tracks the live environment as it grows: it starts from
+        // services already up (a filtered `eph up` of one service, say) plus the
+        // reserved run= ports, and each freshly started service is merged in
+        // (replacing its reserved entry) so later pre-start hooks see earlier
+        // ones' actual ports.
         for name in &targets {
             let service = &eph.services[*name];
             if matches!(hooks, Hooks::All | Hooks::PreStartOnly) {
@@ -2076,9 +2198,11 @@ impl ServiceManager {
     /// running services.
     ///
     /// A no-op when the service declares no hooks. Runs before the service is
-    /// created, so the resolved environment reflects only the services already
-    /// up (never the service's own port). Shared by the `eph up` first phase and
-    /// by [`run_pre_start_for`](Self::run_pre_start_for).
+    /// created, so the resolved environment reflects the services already up
+    /// plus any ports reserved by
+    /// [`reserve_command_ports`](Self::reserve_command_ports) -- including, for
+    /// a `run=` service, its own. Shared by the `eph up` first phase and by
+    /// [`run_pre_start_for`](Self::run_pre_start_for).
     async fn run_service_pre_start(
         &self,
         eph: &EphFile,
@@ -2099,24 +2223,28 @@ impl ServiceManager {
     }
 
     /// Run a single named service's `pre-start` hooks against the services
-    /// currently up.
+    /// currently up, plus the service's own reserved `run=` ports.
     ///
     /// `eph dev` calls this for the foreground app immediately before starting
     /// it, mirroring `eph up`'s interleaving: the hook sees every backing
-    /// service already up (so `${postgres.port}` resolves), never the app's own
-    /// not-yet-assigned port. `eph dev` used to run every service's pre-start
+    /// service already up (so `${postgres.port}` resolves) and, because the
+    /// app's ports are reserved here exactly as `eph up` reserves them, its own
+    /// `${<name>.port}` too. `eph dev` used to run every service's pre-start
     /// up front instead, before anything existed, so the same hook resolved
     /// differently under `dev` than under `up`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the service is unknown or a `pre-start` hook fails.
-    pub async fn run_pre_start_for(&self, eph: &EphFile, name: &str) -> Result<()> {
+    /// Returns an error if the service is unknown, a port cannot be reserved,
+    /// or a `pre-start` hook fails.
+    pub async fn run_pre_start_for(&mut self, eph: &EphFile, name: &str) -> Result<()> {
         let service = eph
             .services
             .get(name)
             .with_context(|| format!("unknown service: {name}"))?;
-        let running = self.status().await?;
+        let mut running = self.status().await?;
+        let owned = name.to_string();
+        self.reserve_command_ports(eph, std::iter::once(&owned), &mut running)?;
         self.run_service_pre_start(eph, &running, service).await
     }
 
@@ -4486,6 +4614,45 @@ mod tests {
         let assigned = allocate_ports(&[auto_port(None)], Some(&prev)).unwrap();
         assert_ne!(assigned.get("default"), Some(&busy));
         assert!(assigned.get("default").is_some_and(|&p| p != 0));
+    }
+
+    #[test]
+    fn allocate_ports_holding_skips_taken_previous_port() {
+        let _guard = PORT_ALLOCATION_TEST_LOCK.lock().unwrap();
+        // A previous port that an earlier service in the same reservation pass
+        // already claimed must not be reused, even when it is bindable (a fixed
+        // port is never bound, so only the taken-set can defend it).
+        let free = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let prev = HashMap::from([("default".to_string(), free)]);
+        let taken = HashSet::from([free]);
+
+        let mut held = Vec::new();
+        let assigned =
+            allocate_ports_holding(&[auto_port(None)], Some(&prev), &mut held, &taken).unwrap();
+        assert_ne!(assigned.get("default"), Some(&free));
+        assert!(assigned.get("default").is_some_and(|&p| p != 0));
+    }
+
+    #[test]
+    fn allocate_ports_holding_keeps_earlier_reservations_bound() {
+        let _guard = PORT_ALLOCATION_TEST_LOCK.lock().unwrap();
+        // Two services reserved through one shared pool: the first service's
+        // listener is still held while the second allocates, so offering the
+        // first's port as the second's previous assignment cannot reuse it.
+        let mut held = Vec::new();
+        let first =
+            allocate_ports_holding(&[auto_port(None)], None, &mut held, &HashSet::new()).unwrap();
+        let first_port = first["default"];
+
+        let prev = HashMap::from([("default".to_string(), first_port)]);
+        let taken = HashSet::from([first_port]);
+        let second =
+            allocate_ports_holding(&[auto_port(None)], Some(&prev), &mut held, &taken).unwrap();
+        assert_ne!(second["default"], first_port);
     }
 
     #[test]
