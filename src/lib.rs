@@ -32,6 +32,7 @@ pub use env::{
     render_powershell, render_with_unsets,
 };
 pub use parser::{EphFile, Service, ServiceSource, parse, resolve_interpolations};
+pub use proc::disinherit_std_handles;
 pub use prune::{ConfirmationOutcome, PruneOptions, PruneReport, confirmation_outcome, prune};
 pub use service::{
     Hooks, LogOptions, RunningService, ServiceManager, UnresolvedEnvVar, UnresolvedEnvironment,

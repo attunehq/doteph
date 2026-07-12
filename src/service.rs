@@ -963,7 +963,7 @@ fn process_backend(name: &str, pid: NonZeroU32) -> Result<Backend> {
 async fn stop_spawned_process(
     name: &str,
     pid: NonZeroU32,
-    child: &mut tokio::process::Child,
+    child: &mut impl proc::SpawnedChild,
     error: anyhow::Error,
 ) -> anyhow::Error {
     match child.kill().await {
@@ -2989,7 +2989,7 @@ impl ServiceManager {
                 .and_then(|hc| hc.timeout_secs)
                 .map(std::num::NonZeroU64::get);
 
-            let (mut child, pid) = self.spawn_command(name, cmd, &env, false)?;
+            let (mut child, pid) = self.spawn_captured_command(name, cmd, &env)?;
             info!(
                 "Started {} with PID {} (attempt {}/{})",
                 name, pid, attempt, max_attempts
@@ -3078,64 +3078,28 @@ impl ServiceManager {
         bail!("service '{}' could not be started", name)
     }
 
-    /// Spawn a `run=` command with `env` overlaid on eph's environment.
+    /// Spawn a `run=` command in the foreground (`eph dev`) with `env` overlaid
+    /// on eph's environment, returning the live child and its PID.
     ///
-    /// Returns the live child -- so the caller can watch for an early exit -- and
-    /// its PID. The child is not killed on drop.
-    ///
-    /// `foreground` selects the stdio wiring. Background services (the `eph up`
-    /// path) get a null stdin and capture stdout/stderr to a per-run file; the
-    /// foreground service (`eph dev`) inherits eph's own stdin/stdout/stderr so it
-    /// is interactive and its output streams straight through. The per-branch
-    /// comments explain why the background path must use a file and why that
-    /// reasoning does not bind `eph dev`.
-    fn spawn_command(
+    /// The app receives eph's own stdin, stdout, and stderr so it is fully
+    /// interactive and its output streams straight to the terminal or the
+    /// preview server. The handle-inheritance hang that forces the background
+    /// path (see [`Self::spawn_captured_command`]) off the std spawn cannot
+    /// happen here: eph stays attached, holding the child until teardown,
+    /// rather than returning while the service keeps eph's stdio open.
+    fn spawn_foreground_command(
         &self,
         name: &str,
         cmd: &str,
         env: &[(String, String)],
-        foreground: bool,
     ) -> Result<(tokio::process::Child, NonZeroU32)> {
         let mut command = proc::shell_command(cmd);
         command
             .current_dir(&self.workspace.path)
-            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-
-        if foreground {
-            // `eph dev` hands the app eph's own stdin, stdout, and stderr so it is
-            // fully interactive and its output streams straight to the terminal or
-            // the preview server. The pipe-inheritance hang that forces the
-            // background path below to a file cannot happen here: eph stays
-            // attached, holding the child until teardown, rather than returning
-            // while the service keeps eph's stdout write-end open.
-            command
-                .stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
-        } else {
-            // Capture stdout/stderr to a per-run file rather than inheriting eph's,
-            // for two reasons: it is what `eph logs` reads, and it avoids a
-            // pipe-inheritance hang where a long-lived service holding eph's
-            // stdout/stderr write-ends would block anything capturing eph's output
-            // after `eph up` returns. The file is truncated per spawn so it
-            // reflects the current run; captured output can contain secrets, so the
-            // dir and file are owner-only (0700/0600) on Unix.
-            let log_path = self.workspace.log_file_path(name)?;
-            if let Some(parent) = log_path.parent() {
-                create_private_dir(parent).with_context(|| {
-                    format!("failed to create logs directory: {}", parent.display())
-                })?;
-            }
-            let log_file = create_private_log_file(&log_path)
-                .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
-            let log_file_err = log_file
-                .try_clone()
-                .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(log_file))
-                .stderr(Stdio::from(log_file_err));
-        }
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
         // Head the shell in its own process group (Unix) so teardown can signal
         // the whole tree it forks, not just this wrapper PID. A compound `run=`
         // command (`a && b`, a pipeline, a backgrounded child) otherwise leaves
@@ -3154,6 +3118,44 @@ impl ServiceManager {
             .and_then(NonZeroU32::new)
             .with_context(|| format!("spawned process for '{}' has no PID", name))?;
         Ok((child, pid))
+    }
+
+    /// Spawn a detached background `run=` service (the `eph up` path) with
+    /// `env` overlaid on eph's environment, returning the live child -- so the
+    /// caller can watch for an early exit -- and its PID. The child is not
+    /// killed on drop.
+    ///
+    /// The service gets a null stdin and captures stdout/stderr to a per-run
+    /// file, for two reasons: the file is what `eph logs` reads, and capture
+    /// avoids the hang where a long-lived service holding eph's stdout/stderr
+    /// would block anything capturing eph's output after `eph up` returns. The
+    /// spawn itself goes through [`proc::spawn_captured`], which on Windows
+    /// additionally caps handle inheritance to exactly these three stdio
+    /// handles; a plain std/tokio spawn there leaks every inheritable handle
+    /// (eph's own stdio pipes included) into the service tree, recreating that
+    /// same hang (see `proc`'s module docs). The log file is truncated per
+    /// spawn so it reflects the current run; captured output can contain
+    /// secrets, so the dir and file are owner-only (0700/0600) on Unix.
+    fn spawn_captured_command(
+        &self,
+        name: &str,
+        cmd: &str,
+        env: &[(String, String)],
+    ) -> Result<(proc::CapturedChild, NonZeroU32)> {
+        let log_path = self.workspace.log_file_path(name)?;
+        if let Some(parent) = log_path.parent() {
+            create_private_dir(parent).with_context(|| {
+                format!("failed to create logs directory: {}", parent.display())
+            })?;
+        }
+        let log_file = create_private_log_file(&log_path)
+            .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
+        let log_file_err = log_file
+            .try_clone()
+            .with_context(|| format!("failed to open log file: {}", log_path.display()))?;
+
+        proc::spawn_captured(cmd, &self.workspace.path, env, log_file, log_file_err)
+            .with_context(|| format!("failed to start command: {}", cmd))
     }
 
     /// Wait for a freshly-spawned `run=` process to become ready.
@@ -3176,14 +3178,14 @@ impl ServiceManager {
         healthcheck: Option<&str>,
         ready_timeout_secs: Option<u64>,
         env: &[(String, String)],
-        child: &mut tokio::process::Child,
+        child: &mut impl proc::SpawnedChild,
         detect_exit: bool,
     ) -> Result<ReadyOutcome> {
         let Some(healthcheck) = healthcheck else {
             // Give the process a moment to start, then (if watching) classify an
             // early exit.
             sleep(Duration::from_millis(500)).await;
-            if detect_exit && matches!(child.try_wait(), Ok(Some(_))) {
+            if detect_exit && child.has_exited() {
                 return Ok(self.classify_exit(name).await);
             }
             return Ok(ReadyOutcome::Ready);
@@ -3193,7 +3195,7 @@ impl ServiceManager {
         wait_until_ready(name, timeout_dur, Duration::from_secs(1), async || {
             // A watched process that has already exited is classified (port
             // conflict vs other failure) rather than probed further.
-            if detect_exit && matches!(child.try_wait(), Ok(Some(_))) {
+            if detect_exit && child.has_exited() {
                 return Ok(Some(self.classify_exit(name).await));
             }
 
@@ -3886,7 +3888,7 @@ impl ServiceManager {
                     )
                 })
                 .transpose()?;
-            let (mut child, pid) = self.spawn_command(name, cmd, &env, true)?;
+            let (mut child, pid) = self.spawn_foreground_command(name, cmd, &env)?;
             info!(
                 "Started {} (foreground) with PID {} (attempt {}/{})",
                 name, pid, attempt, max_attempts

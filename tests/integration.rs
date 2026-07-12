@@ -128,6 +128,109 @@ fn run_append_and_wait(marker: &str, file: &str) -> String {
     format!("echo {marker}>> {file}& ping -n 30 127.0.0.1 >NUL")
 }
 
+/// A `run=` command that just stays alive for roughly `secs` seconds: the
+/// plain long-lived service fixture.
+#[cfg(unix)]
+fn run_sleep(secs: u32) -> String {
+    format!("sleep {secs}")
+}
+
+#[cfg(windows)]
+fn run_sleep(secs: u32) -> String {
+    // ping waits ~1s between its probes; `>NUL` keeps the probe chatter out
+    // of the captured log. There is no bundled `sleep` on Windows.
+    format!("ping -n {} 127.0.0.1 >NUL", secs + 1)
+}
+
+/// A `run=` command that prints `marker` and then stays alive, so the marker
+/// is readable from the captured log while the service still runs.
+#[cfg(unix)]
+fn run_echo_and_wait(marker: &str) -> String {
+    format!("echo {marker} && sleep 300")
+}
+
+#[cfg(windows)]
+fn run_echo_and_wait(marker: &str) -> String {
+    format!("echo {marker}& ping -n 300 127.0.0.1 >NUL")
+}
+
+/// A `run=` command that prints `marker` and then exits with a failure code.
+#[cfg(unix)]
+fn run_echo_then_fail(marker: &str) -> String {
+    format!("echo {marker} && exit 1")
+}
+
+#[cfg(windows)]
+fn run_echo_then_fail(marker: &str) -> String {
+    format!("echo {marker}& exit 1")
+}
+
+/// A `run=` command that reports the injected `$PORT` env var as a
+/// `BOUND_PORT=<n>` log line and stays alive.
+#[cfg(unix)]
+fn run_report_port() -> &'static str {
+    r#"echo "BOUND_PORT=$PORT" && sleep 300"#
+}
+
+#[cfg(windows)]
+fn run_report_port() -> &'static str {
+    "echo BOUND_PORT=%PORT%& ping -n 300 127.0.0.1 >NUL"
+}
+
+/// A healthcheck that passes only when the injected `$PORT` env var equals
+/// the eph-resolved `${web.port}`. The resolved port is never empty, so an
+/// unset `$PORT` also fails the comparison.
+#[cfg(unix)]
+fn healthcheck_port_matches() -> &'static str {
+    r#"test -n "$PORT" && test "${web.port}" = "$PORT""#
+}
+
+#[cfg(windows)]
+fn healthcheck_port_matches() -> &'static str {
+    // Bracket comparison instead of quotes: the command string reaches
+    // `cmd /C` with std's backslash-escaped quoting, which cmd would read
+    // literally.
+    "if [%PORT%]==[${web.port}] (exit /b 0) else (exit /b 1)"
+}
+
+/// A `run=` command that appends the resolved `$DATABASE_URL` to `starts.log`
+/// and stays alive; each (re)start leaves one line to observe.
+#[cfg(unix)]
+fn run_log_database_url() -> &'static str {
+    r#"echo "$DATABASE_URL" >> starts.log; sleep 300"#
+}
+
+#[cfg(windows)]
+fn run_log_database_url() -> &'static str {
+    // Parenthesized so a value ending in a digit cannot turn `>>` into a
+    // numbered-stream redirect (`...5>> file`).
+    "(echo %DATABASE_URL%)>> starts.log& ping -n 300 127.0.0.1 >NUL"
+}
+
+/// A `run=` command that prints `tailline-1` through `tailline-5`, then stays
+/// alive so the log can be tailed while the service runs.
+#[cfg(unix)]
+fn run_five_tail_lines() -> &'static str {
+    "for i in 1 2 3 4 5; do echo tailline-$i; done; sleep 300"
+}
+
+#[cfg(windows)]
+fn run_five_tail_lines() -> &'static str {
+    "(for %i in (1 2 3 4 5) do @echo tailline-%i)& ping -n 300 127.0.0.1 >NUL"
+}
+
+/// A `run=` command that emits `{prefix}-N` lines on a steady cadence (~200ms
+/// on Unix, ~1s on Windows) for long enough that a follow stream sees plenty.
+#[cfg(unix)]
+fn run_counter_lines(prefix: &str) -> String {
+    format!("i=0; while [ $i -lt 100 ]; do echo {prefix}-$i; i=$((i+1)); sleep 0.2; done")
+}
+
+#[cfg(windows)]
+fn run_counter_lines(prefix: &str) -> String {
+    format!("for /L %i in (1,1,100) do @(echo {prefix}-%i& ping -n 2 127.0.0.1 >NUL)")
+}
+
 #[cfg(unix)]
 fn print_env_command(name: &str) -> Vec<&str> {
     vec!["run", "printenv", name]
@@ -1705,7 +1808,6 @@ async fn dockerfile_context_change_rebuilds_and_recreates_the_container() {
     common::docker_remove_image(&container).await;
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn dependency_port_change_restarts_a_run_service_with_resolved_env() {
     let first_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -1715,7 +1817,9 @@ async fn dependency_port_change_restarts_a_run_service_with_resolved_env() {
     drop((first_listener, second_listener));
     let config = |port| {
         format!(
-            "[db]\nrun=sleep 300\nport={port}\n\n[app]\nrun=echo \"$DATABASE_URL\" >> starts.log; sleep 300\nenv.DATABASE_URL=tcp://localhost:${{db.port}}\n"
+            "[db]\nrun={}\nport={port}\n\n[app]\nrun={}\nenv.DATABASE_URL=tcp://localhost:${{db.port}}\n",
+            run_sleep(300),
+            run_log_database_url()
         )
     };
     let ws = TestWorkspace::new(&config(first_port));
@@ -2137,20 +2241,14 @@ pre-start={}
 // Logs Tests
 // ============================================================================
 
-// eph's run= support is cross-platform now, but this fixture's command uses
-// POSIX shell syntax (`echo ... && sleep 300`), so gate the capture test to Unix
-// to match the command string rather than because the feature is unavailable.
-#[cfg(unix)]
 #[tokio::test]
 async fn logs_captures_run_service_output() {
     // The command prints a known marker, then sleeps so the process stays alive
     // long enough for `eph logs` to read its captured output.
-    let ws = TestWorkspace::new(
-        r#"
-[worker]
-run=echo hello-from-run-logs && sleep 300
-"#,
-    );
+    let ws = TestWorkspace::new(&format!(
+        "\n[worker]\nrun={}\n",
+        run_echo_and_wait("hello-from-run-logs")
+    ));
 
     ws.eph_ok(&["up"]).await;
 
@@ -2176,15 +2274,12 @@ run=echo hello-from-run-logs && sleep 300
 // Even after a `run=` service dies, its captured log should remain readable --
 // the core motivation for capturing it (a service that dies on startup must
 // leave a trace).
-#[cfg(unix)]
 #[tokio::test]
 async fn logs_persist_after_run_service_exits() {
-    let ws = TestWorkspace::new(
-        r#"
-[doomed]
-run=echo about-to-die && exit 1
-"#,
-    );
+    let ws = TestWorkspace::new(&format!(
+        "\n[doomed]\nrun={}\n",
+        run_echo_then_fail("about-to-die")
+    ));
 
     // Startup must fail, while preserving the output that explains why.
     let up = ws.eph(&["up"]).await;
@@ -2208,9 +2303,9 @@ run=echo about-to-die && exit 1
     ws.eph_ok(&["down"]).await;
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn fixed_port_run_service_that_exits_during_startup_fails_up() {
+    // `exit N` is spelled the same in both `sh` and `cmd`.
     let ws = TestWorkspace::new("[doomed]\nrun=exit 7\nport=43127\n");
 
     let up = ws.eph(&["up"]).await;
@@ -2223,40 +2318,42 @@ async fn fixed_port_run_service_that_exits_during_startup_fails_up() {
     );
 }
 
-#[cfg(windows)]
+/// Regression test for the Windows handle-inheritance hang: `eph up`'s output
+/// is captured through pipes here (the harness uses `.output()`), and before
+/// the fix in `proc::spawn_captured` the long-lived service tree inherited
+/// eph's stdout/stderr pipe handles, so this capture did not return until the
+/// service died (~5 minutes) even though eph exited immediately. The explicit
+/// timeout turns a regression into a fast failure instead of a stuck suite.
 #[tokio::test]
-async fn fixed_port_run_service_that_exits_during_startup_fails_up() {
-    let ws = TestWorkspace::new("[doomed]\nrun=exit /b 7\nport=43127\n");
+async fn up_output_capture_unblocks_while_run_service_lives() {
+    let ws = TestWorkspace::new(&format!("[web]\nrun={}\n", run_sleep(300)));
 
-    let up = ws.eph(&["up"]).await;
+    tokio::time::timeout(Duration::from_secs(60), ws.eph_ok(&["up"]))
+        .await
+        .expect("`eph up` output capture must not wait for the service to die");
 
-    assert!(!up.status.success(), "fixed-port early exit must fail up");
+    // Unblocking the capture must not have killed the service: it still has
+    // to be running after `up` returned.
+    let status = ws.eph_ok(&["status"]).await;
     assert!(
-        String::from_utf8_lossy(&up.stderr).contains("exited during startup"),
-        "unexpected stderr: {}",
-        String::from_utf8_lossy(&up.stderr)
+        status.contains("Running services") && !status.contains("web (stopped)"),
+        "service should be running after up: {status}"
     );
+
+    ws.eph_ok(&["down"]).await;
 }
 
 // `port=auto` on a run= service: eph allocates a free host port, injects it into
 // the process environment, and resolves it for interpolation -- the core of
 // first-party app port creation.
-#[cfg(unix)]
 #[tokio::test]
 async fn run_service_auto_port_is_allocated_and_injected() {
     // The process echoes the PORT it was handed, then stays alive so its log can
     // be read. `env.PORT=${web.port}` is how the assigned port reaches it.
-    let ws = TestWorkspace::new(
-        r#"
-[web]
-run=echo "BOUND_PORT=$PORT" && sleep 300
-port=auto
-env.PORT=${web.port}
-
-[env]
-APP_URL=http://localhost:${web.port}
-"#,
-    );
+    let ws = TestWorkspace::new(&format!(
+        "\n[web]\nrun={}\nport=auto\nenv.PORT=${{web.port}}\n\n[env]\nAPP_URL=http://localhost:${{web.port}}\n",
+        run_report_port()
+    ));
 
     ws.eph_ok(&["up"]).await;
 
@@ -2279,23 +2376,17 @@ APP_URL=http://localhost:${web.port}
 // An auto-port readiness check must run with the same environment the app gets,
 // and have its ${...} resolved, or `curl -sf http://localhost:$PORT` style
 // checks would never see the allocated port and `eph up` would time out.
-#[cfg(unix)]
 #[tokio::test]
 async fn run_service_auto_port_healthcheck_sees_port() {
     // The check passes only if BOTH the eph-resolved `${web.port}` and the
     // injected `$PORT` env equal the allocated port. If eph ran the healthcheck
     // without the app's env, `$PORT` would be empty; if it didn't resolve the
     // string, `${web.port}` would be a literal -- either way `eph up` would fail.
-    let ws = TestWorkspace::new(
-        r#"
-[web]
-run=sleep 300
-port=auto
-env.PORT=${web.port}
-healthcheck=test -n "$PORT" && test "${web.port}" = "$PORT"
-ready-timeout=10
-"#,
-    );
+    let ws = TestWorkspace::new(&format!(
+        "\n[web]\nrun={}\nport=auto\nenv.PORT=${{web.port}}\nhealthcheck={}\nready-timeout=10\n",
+        run_sleep(300),
+        healthcheck_port_matches()
+    ));
 
     // `eph_ok` panics if `up` times out, so reaching `down` is the assertion.
     ws.eph_ok(&["up"]).await;
@@ -2304,19 +2395,12 @@ ready-timeout=10
 
 // An eph-allocated auto port stays the same across `eph down` / `eph up`, so a
 // managed app's URL is stable for bookmarks and OAuth callbacks.
-#[cfg(unix)]
 #[tokio::test]
 async fn run_service_auto_port_is_stable_across_restart() {
-    let ws = TestWorkspace::new(
-        r#"
-[web]
-run=sleep 300
-port=auto
-
-[env]
-APP_URL=http://localhost:${web.port}
-"#,
-    );
+    let ws = TestWorkspace::new(&format!(
+        "\n[web]\nrun={}\nport=auto\n\n[env]\nAPP_URL=http://localhost:${{web.port}}\n",
+        run_sleep(300)
+    ));
 
     ws.eph_ok(&["up"]).await;
     let first = extract_port(ws.env_json().await.get("APP_URL").unwrap())
@@ -2426,18 +2510,13 @@ port=6379
 }
 
 // `eph logs` with no SERVICE prefixes every line with a `[name]` tag.
-#[cfg(unix)]
 #[tokio::test]
 async fn logs_all_services_tags_each_line() {
-    let ws = TestWorkspace::new(
-        r#"
-[alpha]
-run=echo alpha-marker && sleep 300
-
-[beta]
-run=echo beta-marker && sleep 300
-"#,
-    );
+    let ws = TestWorkspace::new(&format!(
+        "\n[alpha]\nrun={}\n\n[beta]\nrun={}\n",
+        run_echo_and_wait("alpha-marker"),
+        run_echo_and_wait("beta-marker")
+    ));
 
     ws.eph_ok(&["up"]).await;
 
@@ -2491,23 +2570,19 @@ port=6379
 
 // `eph logs -f` with no SERVICE follows every service at once, interleaving
 // their tagged lines as they arrive.
-#[cfg(unix)]
 #[tokio::test]
 async fn logs_follow_all_services_interleaves() {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    // Two services that each emit a tagged line roughly every 200ms, so a
-    // follow-all stream sees output from both within a couple of seconds.
-    let ws = TestWorkspace::new(
-        r#"
-[alpha]
-run=i=0; while [ $i -lt 100 ]; do echo alpha-$i; i=$((i+1)); sleep 0.2; done
-
-[beta]
-run=i=0; while [ $i -lt 100 ]; do echo beta-$i; i=$((i+1)); sleep 0.2; done
-"#,
-    );
+    // Two services that each emit a tagged line on a steady cadence (see
+    // `run_counter_lines`), so a follow-all stream sees output from both well
+    // within the timeout below.
+    let ws = TestWorkspace::new(&format!(
+        "\n[alpha]\nrun={}\n\n[beta]\nrun={}\n",
+        run_counter_lines("alpha"),
+        run_counter_lines("beta")
+    ));
 
     ws.eph_ok(&["up"]).await;
 
@@ -2553,15 +2628,9 @@ run=i=0; while [ $i -lt 100 ]; do echo beta-$i; i=$((i+1)); sleep 0.2; done
 }
 
 // `eph logs -n N` returns exactly the last N lines of a `run=` service's log.
-#[cfg(unix)]
 #[tokio::test]
 async fn logs_tail_returns_last_n_lines() {
-    let ws = TestWorkspace::new(
-        r#"
-[svc]
-run=for i in 1 2 3 4 5; do echo tailline-$i; done; sleep 300
-"#,
-    );
+    let ws = TestWorkspace::new(&format!("\n[svc]\nrun={}\n", run_five_tail_lines()));
 
     ws.eph_ok(&["up"]).await;
 

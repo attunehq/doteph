@@ -95,6 +95,23 @@ ureq = "3"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Windows-only: spawning a detached `run=` service through std/tokio calls
+# CreateProcess with bInheritHandles=TRUE, which leaks every inheritable handle
+# in eph (including the stdout/stderr pipes a capturing caller gave eph) into
+# the service's whole process tree; the caller's pipe read then never sees EOF
+# until the tree dies. std does not expose PROC_THREAD_ATTRIBUTE_HANDLE_LIST on
+# stable, so `proc` spawns that one child through raw CreateProcessW (see
+# src/proc.rs) and needs the Win32 declarations. Console + Pipes cover the
+# startup std-handle hardening and the regression test's leak probe.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 # Heavyweight stress tests (tests/stress.rs) open a real SQL connection to the
 # postgres they start, over its mapped host port. redis (RESP) and minio (HTTP)
