@@ -443,7 +443,8 @@ return, so they run as normal commands.
   entry without identity requires manual process inspection and cleanup.
 - **Deleted workspaces are global state.** `eph system prune --dry-run` lists
   resources for missing or empty workspace paths. A real prune confirms before
-  removal and skips live resources unless `--force-live` is supplied.
+  removal. `--force-non-empty` also selects paths that still contain files, and
+  live resources require `--force-live` regardless of how the path was selected.
 - **Execution fails closed on unresolved references.** Hooks, service startup,
   health checks, and `eph run` stop before launching a child with a raw eph
   placeholder.

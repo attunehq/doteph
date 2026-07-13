@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -623,11 +623,12 @@ impl ServiceState {
 }
 
 /// An exclusive, per-workspace lock over state-mutating commands (`up`,
-/// `down`, `clean`), held for the duration of the operation.
+/// `down`, `clean`, and destructive system prune), held for the duration of
+/// the operation.
 ///
-/// Backed by an OS advisory lock (`flock` / `LockFileEx`) on a file in the
-/// workspace's state directory, so it releases automatically when the process
-/// exits for any reason: a killed `eph up` can never wedge the next command.
+/// Backed by an OS advisory lock (`flock` / `LockFileEx`) on a file beside the
+/// state directory, so it releases automatically when the process exits for
+/// any reason: a killed `eph up` can never wedge the next command.
 /// Two overlapping `eph up` runs used to each spawn services and then race
 /// their `state.json` writes, with the loser's processes leaked untracked;
 /// with the lock the second command simply waits.
@@ -644,6 +645,16 @@ impl WorkspaceLock {
     /// lives in it.
     pub(crate) fn open(workspace: &Workspace) -> Result<Self> {
         let dir = workspace.state_dir()?;
+        Self::open_state_dir(&dir)
+    }
+
+    /// Open the lifecycle lock from a state directory path.
+    ///
+    /// System prune has persisted state but may no longer have a workspace path
+    /// from which [`Workspace`] can be constructed. Deriving the same sibling
+    /// lock from the state directory lets prune serialize with lifecycle
+    /// commands without weakening workspace construction.
+    pub(crate) fn open_state_dir(dir: &Path) -> Result<Self> {
         let parent = dir
             .parent()
             .context("workspace state directory has no parent")?;
@@ -794,6 +805,58 @@ enum ReadyOutcome {
     PortConflict,
     /// The process exited during startup for some other reason.
     Exited,
+}
+
+/// Kills a foreground process tree if its startup future is cancelled before
+/// the process identity reaches durable state.
+struct ForegroundProcessGuard {
+    pid: NonZeroU32,
+    child: Option<tokio::process::Child>,
+    armed: bool,
+}
+
+impl ForegroundProcessGuard {
+    fn new(pid: NonZeroU32, child: tokio::process::Child) -> Self {
+        Self {
+            pid,
+            child: Some(child),
+            armed: true,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child.as_mut().expect("foreground child is present")
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn kill_owned_tree(&mut self) {
+        // An unreaped child handle is stronger authority than a PID snapshot:
+        // `try_wait(None)` proves the original child is still live, including
+        // after a legitimate exec, while an exited child retains its PID until
+        // reaped and therefore cannot race PID reuse here.
+        let child_is_live = self
+            .child
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+        if self.armed && child_is_live {
+            proc::force_kill(self.pid);
+        }
+        self.disarm();
+    }
+
+    fn into_child(mut self) -> tokio::process::Child {
+        self.disarm();
+        self.child.take().expect("foreground child is present")
+    }
+}
+
+impl Drop for ForegroundProcessGuard {
+    fn drop(&mut self) {
+        self.kill_owned_tree();
+    }
 }
 
 /// Substrings (matched case-insensitively against a dead process's captured log)
@@ -1987,7 +2050,6 @@ impl ServiceManager {
     /// persisted state file exists but cannot be read or parsed.
     pub async fn new(workspace: Workspace) -> Result<Self> {
         let docker = DockerClient::connect().await?;
-        workspace.save_metadata().await?;
         let state = ServiceState::load(&workspace).await?;
         Ok(ServiceManager {
             workspace,
@@ -2150,10 +2212,23 @@ impl ServiceManager {
         // state writes, and the loser's processes leak untracked.
         let mut lock = WorkspaceLock::open(&self.workspace)?;
         let _guard = lock.acquire()?;
-        // Re-read state under the lock: another command may have finished
-        // between this manager's construction and lock acquisition.
+        // Metadata and state must move together under the lifecycle lock. A
+        // prune may have completed after manager construction and removed both.
+        self.workspace.save_metadata().await?;
         self.state = ServiceState::load(&self.workspace).await?;
 
+        self.start_services_locked(eph, filter, hooks, reserve_ahead)
+            .await
+    }
+
+    /// Start services while the caller holds this workspace's lifecycle lock.
+    async fn start_services_locked(
+        &mut self,
+        eph: &EphFile,
+        filter: &[String],
+        hooks: Hooks,
+        reserve_ahead: &[String],
+    ) -> Result<HashMap<String, RunningService>> {
         // Resolve the target set: every service, or just the requested ones (in
         // the order requested). post-start hooks run in a second phase once all
         // of these are healthy, so the phase-1 start order does not affect
@@ -2252,8 +2327,8 @@ impl ServiceManager {
     /// created, so the resolved environment reflects the services already up
     /// plus any ports reserved by
     /// [`reserve_command_ports`](Self::reserve_command_ports) -- including, for
-    /// a `run=` service, its own. Shared by the `eph up` first phase and by
-    /// [`run_pre_start_for`](Self::run_pre_start_for).
+    /// a `run=` service, its own. Shared by the `eph up` and `eph dev` startup
+    /// transactions.
     async fn run_service_pre_start(
         &self,
         eph: &EphFile,
@@ -2273,30 +2348,87 @@ impl ServiceManager {
         Ok(())
     }
 
-    /// Run a single named service's `pre-start` hooks against the services
-    /// currently up, plus the service's own reserved `run=` ports.
+    /// Start the backing services and foreground app for `eph dev` as one
+    /// lifecycle transaction.
     ///
-    /// `eph dev` calls this for the foreground app immediately before starting
-    /// it, mirroring `eph up`'s interleaving: the hook sees every backing
-    /// service already up (so `${postgres.port}` resolves) and, because the
-    /// app's ports are reserved here exactly as `eph up` reserves them, its own
-    /// `${<name>.port}` too. `eph dev` used to run every service's pre-start
-    /// up front instead, before anything existed, so the same hook resolved
-    /// differently under `dev` than under `up`.
+    /// Keeping the foreground port reservation, pre-start hook, and durable
+    /// process identity under one lock prevents a concurrent prune from making
+    /// the process bind a different port than its hook observed.
     ///
     /// # Errors
     ///
-    /// Returns an error if the service is unknown, a port cannot be reserved,
-    /// or a `pre-start` hook fails.
-    pub async fn run_pre_start_for(&mut self, eph: &EphFile, name: &str) -> Result<()> {
+    /// Returns an error if a service cannot be started, a hook fails, or state
+    /// cannot be loaded or saved.
+    pub async fn start_dev(
+        &mut self,
+        eph: &EphFile,
+        foreground: &str,
+        skip_hooks: bool,
+        brought_up: &mut Vec<String>,
+    ) -> Result<(RunningService, tokio::process::Child)> {
+        let mut lock = WorkspaceLock::open(&self.workspace)?;
+        let _guard = lock.acquire()?;
+        self.workspace.save_metadata().await?;
+        self.state = ServiceState::load(&self.workspace).await?;
+
         let service = eph
             .services
-            .get(name)
-            .with_context(|| format!("unknown service: {name}"))?;
+            .get(foreground)
+            .with_context(|| format!("unknown service: {foreground}"))?;
+        if !matches!(service.source, ServiceSource::Command(_)) {
+            bail!(
+                "service '{foreground}' is not a run= service, so `eph dev` cannot foreground it"
+            );
+        }
+
+        let already_running = self.status().await?;
+        if already_running.contains_key(foreground) {
+            bail!(
+                "the foreground service '{foreground}' is already running; stop it first \
+                 with `eph down {foreground}` (eph dev starts and attaches to it itself)"
+            );
+        }
+        // Publish ownership before the first side effect so a caller whose
+        // bring-up future is cancelled can still tear down exactly the services
+        // this transaction intended to start.
+        brought_up.clear();
+        brought_up.extend(
+            eph.services
+                .keys()
+                .filter(|name| !already_running.contains_key(name.as_str()))
+                .cloned(),
+        );
+
+        let backing: Vec<String> = eph
+            .services
+            .keys()
+            .filter(|name| name.as_str() != foreground)
+            .cloned()
+            .collect();
+        if !backing.is_empty() {
+            let hooks = if skip_hooks {
+                Hooks::None
+            } else {
+                Hooks::PreStartOnly
+            };
+            let reserve_ahead = [foreground.to_string()];
+            self.start_services_locked(eph, &backing, hooks, &reserve_ahead)
+                .await?;
+        }
+
         let mut running = self.status().await?;
-        let owned = name.to_string();
+        let owned = foreground.to_string();
         self.reserve_command_ports(eph, std::iter::once(&owned), &mut running)?;
-        self.run_service_pre_start(eph, &running, service).await
+        self.state.save(&self.workspace).await?;
+        if !skip_hooks {
+            self.run_service_pre_start(eph, &running, service).await?;
+        }
+
+        let foreground = self.start_foreground_locked(eph, foreground).await?;
+        if !skip_hooks {
+            self.run_all_post_start(eph).await?;
+        }
+        Ok(foreground)
     }
 
     /// Run one service's `post-start` hooks against an already-resolved set of
@@ -3490,8 +3622,7 @@ impl ServiceManager {
     pub async fn stop_all(&mut self, eph: &EphFile, remove: bool, skip_hooks: bool) -> Result<()> {
         let mut lock = WorkspaceLock::open(&self.workspace)?;
         let _guard = lock.acquire()?;
-        // Re-read state under the lock: it was loaded when this manager was
-        // constructed, and another command may have finished in between.
+        self.workspace.save_metadata().await?;
         self.state = ServiceState::load(&self.workspace).await?;
 
         // Snapshot the running services once, before any teardown, so every
@@ -3537,7 +3668,7 @@ impl ServiceManager {
     ) -> Result<()> {
         let mut lock = WorkspaceLock::open(&self.workspace)?;
         let _guard = lock.acquire()?;
-        // Re-read state under the lock (see stop_all).
+        self.workspace.save_metadata().await?;
         self.state = ServiceState::load(&self.workspace).await?;
 
         let wanted: HashSet<&str> = targets.iter().map(String::as_str).collect();
@@ -3577,7 +3708,7 @@ impl ServiceManager {
     /// `image`/`dockerfile` service, if `docker compose down` fails for a
     /// compose service that was up, or if a `post-stop` hook fails (the service
     /// is already stopped by then).
-    pub async fn stop_service(
+    async fn stop_service(
         &mut self,
         name: &str,
         service: &Service,
@@ -3716,7 +3847,7 @@ impl ServiceManager {
     pub async fn clean(&mut self, eph: &EphFile, skip_hooks: bool) -> Result<CleanSummary> {
         let mut lock = WorkspaceLock::open(&self.workspace)?;
         let _guard = lock.acquire()?;
-        // Re-read state under the lock (see stop_all).
+        self.workspace.save_metadata().await?;
         self.state = ServiceState::load(&self.workspace).await?;
 
         let mut summary = CleanSummary::default();
@@ -3807,16 +3938,6 @@ impl ServiceManager {
         Ok(summary)
     }
 
-    /// Save the current in-memory service state to disk.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the state directory cannot be created or the state
-    /// file cannot be serialized or written.
-    pub async fn save_state(&self) -> Result<()> {
-        self.state.save(&self.workspace).await
-    }
-
     /// Start the foreground `run=` service for `eph dev`, inheriting eph's stdio.
     ///
     /// Unlike the backing `run=` path
@@ -3835,7 +3956,7 @@ impl ServiceManager {
     ///
     /// Returns an error if `name` is not a `run=` service, the process cannot be
     /// spawned, or it fails its healthcheck within the ready timeout.
-    pub async fn start_foreground(
+    async fn start_foreground_locked(
         &mut self,
         eph: &EphFile,
         name: &str,
@@ -3888,7 +4009,8 @@ impl ServiceManager {
                     )
                 })
                 .transpose()?;
-            let (mut child, pid) = self.spawn_foreground_command(name, cmd, &env)?;
+            let (child, pid) = self.spawn_foreground_command(name, cmd, &env)?;
+            let mut process_guard = ForegroundProcessGuard::new(pid, child);
             info!(
                 "Started {} (foreground) with PID {} (attempt {}/{})",
                 name, pid, attempt, max_attempts
@@ -3903,16 +4025,29 @@ impl ServiceManager {
                         .and_then(|check| check.timeout_secs)
                         .map(std::num::NonZeroU64::get),
                     &env,
-                    &mut child,
+                    process_guard.child_mut(),
                     true,
                 )
                 .await;
+            if matches!(
+                readiness,
+                Ok(ReadyOutcome::PortConflict | ReadyOutcome::Exited)
+            ) {
+                process_guard.disarm();
+            }
             match readiness {
                 Ok(ReadyOutcome::Ready) => {
                     let backend = match process_backend(name, pid) {
                         Ok(backend) => backend,
                         Err(error) => {
-                            return Err(stop_spawned_process(name, pid, &mut child, error).await);
+                            process_guard.kill_owned_tree();
+                            return Err(stop_spawned_process(
+                                name,
+                                pid,
+                                process_guard.child_mut(),
+                                error,
+                            )
+                            .await);
                         }
                     };
                     self.state.services.insert(
@@ -3940,6 +4075,7 @@ impl ServiceManager {
                         },
                     );
                     self.state.save(&self.workspace).await?;
+                    let child = process_guard.into_child();
                     return Ok((
                         RunningService {
                             name: name.to_string(),
@@ -3964,7 +4100,10 @@ impl ServiceManager {
                     bail!("service '{}' exited during startup", name);
                 }
                 Err(error) => {
-                    return Err(stop_spawned_process(name, pid, &mut child, error).await);
+                    process_guard.kill_owned_tree();
+                    return Err(
+                        stop_spawned_process(name, pid, process_guard.child_mut(), error).await,
+                    );
                 }
             }
         }

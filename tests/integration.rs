@@ -81,6 +81,19 @@ fn hook_sleep(secs: u32) -> String {
     format!("ping -n {} 127.0.0.1 >NUL", secs + 1)
 }
 
+#[cfg(unix)]
+fn hook_mark_and_wait(marker: &str, release: &str) -> String {
+    format!("touch {marker}; while [ ! -f {release} ]; do sleep 0.05; done")
+}
+
+#[cfg(windows)]
+fn hook_mark_and_wait(marker: &str, release: &str) -> String {
+    format!(
+        "type nul > {marker} & powershell -NoProfile -Command \
+         \"while (-not (Test-Path '{release}')) {{ Start-Sleep -Milliseconds 50 }}\""
+    )
+}
+
 /// A hook that writes the resolved value of env var `name` to `file`, so a test
 /// can compare what a lifecycle hook saw against what `eph env` resolves.
 #[cfg(unix)]
@@ -152,6 +165,83 @@ fn run_echo_and_wait(marker: &str) -> String {
 #[cfg(windows)]
 fn run_echo_and_wait(marker: &str) -> String {
     format!("echo {marker}& ping -n 300 127.0.0.1 >NUL")
+}
+
+#[cfg(unix)]
+fn foreground_wait_fixture(marker: &str, release: &str, exit: &str) -> (&'static str, String) {
+    (
+        "sh dev-wait.sh",
+        format!(
+            "touch {marker}\nwhile [ ! -f {release} ]; do sleep 0.05; done\n\
+             while [ ! -f {exit} ]; do sleep 0.05; done\n"
+        ),
+    )
+}
+
+#[cfg(windows)]
+fn foreground_wait_fixture(marker: &str, release: &str, exit: &str) -> (&'static str, String) {
+    (
+        "powershell -NoProfile -ExecutionPolicy Bypass -File dev-wait.ps1",
+        format!(
+            "$null = New-Item -ItemType File '{marker}'\n\
+             while (-not (Test-Path '{release}')) {{ Start-Sleep -Milliseconds 50 }}\n\
+             while (-not (Test-Path '{exit}')) {{ Start-Sleep -Milliseconds 50 }}\n"
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn healthcheck_file_exists(path: &str) -> String {
+    format!("test -f {path}")
+}
+
+#[cfg(windows)]
+fn healthcheck_file_exists(path: &str) -> String {
+    format!("if exist {path} (exit /b 0) else exit /b 1")
+}
+
+async fn wait_for_file(path: &std::path::Path) -> bool {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !path.exists() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+async fn wait_for_file_text(path: &std::path::Path, needle: &str) -> bool {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if std::fs::read_to_string(path).is_ok_and(|contents| contents.contains(needle)) {
+                return;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+fn spawn_force_non_empty_prune(
+    workspace: &std::path::Path,
+    state_root: &str,
+    stdout_path: &std::path::Path,
+    stderr_path: &std::path::Path,
+) -> tokio::process::Child {
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_eph"))
+        .args(["system", "prune", "--force-non-empty", "--yes"])
+        .current_dir(workspace)
+        .env("EPH_STATE_ROOT", state_root)
+        .stdout(std::process::Stdio::from(
+            std::fs::File::create(stdout_path).expect("failed to create prune stdout capture"),
+        ))
+        .stderr(std::process::Stdio::from(
+            std::fs::File::create(stderr_path).expect("failed to create prune stderr capture"),
+        ))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to run system prune")
 }
 
 /// A `run=` command that prints `marker` and then exits with a failure code.
@@ -712,6 +802,30 @@ pre-start={}
         "pre-start hook did not run"
     );
 
+    ws.eph_ok(&["down"]).await;
+}
+
+/// Read-only eph commands invoked by a hook must not contend with the parent
+/// lifecycle transaction. Hooks commonly inspect the environment they are
+/// preparing, and waiting for the parent's lock would deadlock both processes.
+#[tokio::test]
+async fn pre_start_hook_can_run_eph_status() {
+    let eph = env!("CARGO_BIN_EXE_eph");
+    let ws = TestWorkspace::new(&format!(
+        "[app]\nrun={}\npre-start={eph} status > hook-status\n",
+        run_sleep(300)
+    ));
+
+    tokio::time::timeout(Duration::from_secs(30), ws.eph_ok(&["up"]))
+        .await
+        .expect("a read-only eph command in a hook must not wait on the lifecycle lock");
+
+    let hook_status = std::fs::read_to_string(ws.path().join("hook-status"))
+        .expect("the pre-start hook did not capture eph status");
+    assert!(
+        hook_status.contains("No services running"),
+        "the hook should inspect the pre-start state: {hook_status}"
+    );
     ws.eph_ok(&["down"]).await;
 }
 
@@ -2237,6 +2351,250 @@ pre-start={}
     ws.eph_ok(&["down"]).await;
 }
 
+/// The foreground liveness check belongs inside the same transaction as its
+/// spawn. An `up` that wins the workspace lock must make a queued `dev` reject
+/// the now-running app instead of spawning a duplicate and orphaning one PID.
+#[tokio::test]
+async fn concurrent_up_prevents_dev_from_duplicating_the_foreground() {
+    let held = "up-holds-lock-before-dev";
+    let release = "release-up-before-dev";
+    let ws = TestWorkspace::new(&format!(
+        "[web]\nrun={}\npre-start={}\n",
+        run_sleep(300),
+        hook_mark_and_wait(held, release)
+    ));
+    let eph_binary = env!("CARGO_BIN_EXE_eph");
+
+    let mut up = tokio::process::Command::new(eph_binary)
+        .arg("up")
+        .current_dir(ws.path())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn eph up");
+    assert!(
+        wait_for_file(&ws.path().join(held)).await,
+        "eph up never reached its locked pre-start hook"
+    );
+
+    let dev_stderr_path = ws.path().join("dev-lock-wait.stderr");
+    let mut dev = tokio::process::Command::new(eph_binary)
+        .arg("dev")
+        .current_dir(ws.path())
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(
+            std::fs::File::create(&dev_stderr_path).expect("failed to capture eph dev stderr"),
+        ))
+        .spawn()
+        .expect("failed to spawn eph dev");
+    assert!(
+        wait_for_file_text(
+            &dev_stderr_path,
+            "another eph command is running in this workspace; waiting for it",
+        )
+        .await,
+        "eph dev never contended on eph up's workspace lock"
+    );
+    std::fs::write(ws.path().join(release), "release").unwrap();
+
+    let up_status = up.wait().await.expect("failed to wait for eph up");
+    assert!(up_status.success(), "the winning eph up should succeed");
+    let dev_status = tokio::time::timeout(Duration::from_secs(20), dev.wait())
+        .await
+        .expect("eph dev spawned a duplicate foreground process")
+        .expect("failed to wait for eph dev");
+    let dev_stderr = std::fs::read_to_string(&dev_stderr_path).unwrap_or_default();
+    assert!(!dev_status.success(), "eph dev should reject the live app");
+    assert!(
+        dev_stderr.contains("already running"),
+        "eph dev should explain the locked liveness rejection: {dev_stderr}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
+/// A destructive force-non-empty prune must share the lifecycle lock with
+/// `up`. The marker proves `up` is inside its lock before prune starts; prune
+/// must wait, refresh Docker inventory, and then preserve the running service
+/// unless `--force-live` was also supplied.
+#[tokio::test]
+async fn force_non_empty_prune_serializes_with_up_before_inventory() {
+    let state_root = tempfile::tempdir().unwrap();
+    let state_root_str = state_root.path().to_string_lossy().into_owned();
+    let held = "up-holds-workspace-lock";
+    let release = "release-up-workspace-lock";
+    let ws = TestWorkspace::new(&format!(
+        "[redis]\nimage=redis:7-alpine\nport=6379\npre-start={}\n",
+        hook_mark_and_wait(held, release)
+    ));
+    let eph_binary = env!("CARGO_BIN_EXE_eph");
+
+    let mut up = tokio::process::Command::new(eph_binary)
+        .arg("up")
+        .current_dir(ws.path())
+        .env("EPH_STATE_ROOT", &state_root_str)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn eph up");
+
+    let held_observed = wait_for_file(&ws.path().join(held)).await;
+    let prune_stdout_path = ws.path().join("prune.stdout");
+    let prune_stderr_path = ws.path().join("prune.stderr");
+    let mut prune = spawn_force_non_empty_prune(
+        &ws.path(),
+        &state_root_str,
+        &prune_stdout_path,
+        &prune_stderr_path,
+    );
+    let prune_waited = wait_for_file_text(
+        &prune_stderr_path,
+        "another eph command is running in this workspace; waiting for it",
+    )
+    .await;
+    std::fs::write(ws.path().join(release), "release").unwrap();
+
+    let up_status = up.wait().await.expect("failed to wait for eph up");
+    let prune_status = prune.wait().await.expect("failed to wait for system prune");
+    let prune_stdout = std::fs::read_to_string(&prune_stdout_path).unwrap_or_default();
+    let prune_stderr = std::fs::read_to_string(&prune_stderr_path).unwrap_or_default();
+
+    let cleanup = ws
+        .eph_with_envs(
+            &["clean", "--skip-hooks"],
+            &[("EPH_STATE_ROOT", &state_root_str)],
+        )
+        .await;
+    let cleanup_stderr = String::from_utf8_lossy(&cleanup.stderr).into_owned();
+
+    assert!(
+        held_observed,
+        "pre-start marker should appear while up holds the workspace lock"
+    );
+    assert!(
+        prune_waited,
+        "prune should report waiting for up's workspace lock: {prune_stderr}"
+    );
+    assert!(up_status.success(), "eph up should succeed");
+    assert!(
+        prune_status.success(),
+        "system prune should succeed: {prune_stderr}"
+    );
+    assert!(
+        prune_stdout.contains("Skipped:") && prune_stdout.contains("running container"),
+        "prune should preserve the service started before inventory: {prune_stdout}"
+    );
+    assert!(
+        cleanup.status.success(),
+        "cleanup should succeed: {cleanup_stderr}"
+    );
+}
+
+/// Foreground `eph dev` startup writes process state, so it must hold the same
+/// lifecycle lock as prune until the process identity is persisted. The
+/// healthcheck waits on an explicit release file to keep that transition open
+/// without relying on elapsed time.
+#[tokio::test]
+async fn force_non_empty_prune_serializes_with_foreground_dev_startup() {
+    let state_root = tempfile::tempdir().unwrap();
+    let state_root_str = state_root.path().to_string_lossy().into_owned();
+    let held = "dev-holds-workspace-lock";
+    let release = "release-dev-workspace-lock";
+    let exit = "exit-dev-foreground-process";
+    let (run_command, wait_script) = foreground_wait_fixture(held, release, exit);
+    let ws = TestWorkspace::new(&format!(
+        "[web]\nrun={}\nhealthcheck={}\nready-timeout=20\n",
+        run_command,
+        healthcheck_file_exists(release)
+    ));
+    #[cfg(unix)]
+    ws.write_file("dev-wait.sh", &wait_script);
+    #[cfg(windows)]
+    ws.write_file("dev-wait.ps1", &wait_script);
+    let eph_binary = env!("CARGO_BIN_EXE_eph");
+    let dev_stdout_path = ws.path().join("dev.stdout");
+    let dev_stderr_path = ws.path().join("dev.stderr");
+
+    let mut dev = tokio::process::Command::new(eph_binary)
+        .args(["dev", "--skip-hooks"])
+        .current_dir(ws.path())
+        .env("EPH_STATE_ROOT", &state_root_str)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(
+            std::fs::File::create(&dev_stdout_path).unwrap(),
+        ))
+        .stderr(std::process::Stdio::from(
+            std::fs::File::create(&dev_stderr_path).unwrap(),
+        ))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn eph dev");
+
+    let held_observed = wait_for_file(&ws.path().join(held)).await;
+    let prune_stdout_path = ws.path().join("dev-prune.stdout");
+    let prune_stderr_path = ws.path().join("dev-prune.stderr");
+    let mut prune = spawn_force_non_empty_prune(
+        &ws.path(),
+        &state_root_str,
+        &prune_stdout_path,
+        &prune_stderr_path,
+    );
+    let prune_waited = wait_for_file_text(
+        &prune_stderr_path,
+        "another eph command is running in this workspace; waiting for it",
+    )
+    .await;
+    std::fs::write(ws.path().join(release), "release").unwrap();
+
+    let prune_status = prune.wait().await.expect("failed to wait for system prune");
+    let prune_stdout = std::fs::read_to_string(&prune_stdout_path).unwrap_or_default();
+    let prune_stderr = std::fs::read_to_string(&prune_stderr_path).unwrap_or_default();
+    std::fs::write(ws.path().join(exit), "exit").unwrap();
+    let dev_exited = matches!(
+        tokio::time::timeout(Duration::from_secs(20), dev.wait()).await,
+        Ok(Ok(_))
+    );
+    if !dev_exited {
+        dev.kill().await.ok();
+        dev.wait().await.ok();
+    }
+
+    let cleanup = ws
+        .eph_with_envs(
+            &["clean", "--skip-hooks"],
+            &[("EPH_STATE_ROOT", &state_root_str)],
+        )
+        .await;
+    let cleanup_stderr = String::from_utf8_lossy(&cleanup.stderr).into_owned();
+    let dev_stderr = std::fs::read_to_string(&dev_stderr_path).unwrap_or_default();
+
+    assert!(
+        held_observed,
+        "foreground process should start while dev holds the workspace lock: {dev_stderr}"
+    );
+    assert!(
+        prune_waited,
+        "prune should report waiting for dev's workspace lock: {prune_stderr}"
+    );
+    assert!(
+        prune_status.success(),
+        "system prune should succeed: {prune_stderr}"
+    );
+    assert!(
+        dev_exited,
+        "foreground process should exit after its explicit test release"
+    );
+    assert!(
+        prune_stdout.contains("Skipped:") && prune_stdout.contains("live run= process"),
+        "prune should preserve the foreground process recorded before inventory: {prune_stdout}"
+    );
+    assert!(
+        cleanup.status.success(),
+        "cleanup should succeed: {cleanup_stderr}"
+    );
+}
+
 // ============================================================================
 // Logs Tests
 // ============================================================================
@@ -2794,6 +3152,130 @@ async fn skills_install_and_check_round_trip() {
 /// Unix-only: it delivers `SIGTERM`, the signal a Claude Desktop preview server
 /// uses to stop the dev command. Windows has no equivalent a test harness can
 /// deliver, and that gap (a hard kill skips teardown) is documented behavior.
+#[cfg(unix)]
+#[tokio::test]
+async fn dev_signal_during_foreground_readiness_kills_the_process_tree() {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let ws = TestWorkspace::new(
+        "[web]\nrun=printf '%s' $$ > foreground-pid; sleep 1; exec sh -c 'echo exec > foreground-exec; sleep 600'\nhealthcheck=exit 1\nready-timeout=60\n",
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_eph"))
+        .arg("dev")
+        .current_dir(ws.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn eph dev");
+
+    let pid_path = ws.path().join("foreground-pid");
+    assert!(
+        wait_for_file(&pid_path).await,
+        "the foreground process never entered readiness"
+    );
+    assert!(
+        wait_for_file(&ws.path().join("foreground-exec")).await,
+        "the foreground process never exec'd during readiness"
+    );
+    let foreground_pid: libc::pid_t = std::fs::read_to_string(&pid_path)
+        .expect("failed to read the foreground PID")
+        .trim()
+        .parse()
+        .expect("foreground PID was not numeric");
+
+    let dev_pid = child.id().expect("dev child has a pid") as libc::pid_t;
+    // SAFETY: kill takes plain integers and has no memory-safety preconditions.
+    unsafe {
+        libc::kill(dev_pid, libc::SIGTERM);
+    }
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("eph dev should stop promptly during readiness")
+        .expect("failed to wait for eph dev");
+    assert!(status.success(), "a signalled eph dev should exit cleanly");
+
+    let process_gone = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            // SAFETY: signal 0 only probes whether the PID still exists.
+            if unsafe { libc::kill(foreground_pid, 0) } == -1 {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        process_gone,
+        "foreground PID {foreground_pid} survived cancellation during readiness"
+    );
+    let after = ws.eph_ok(&["status"]).await;
+    assert!(
+        after.contains("No services running"),
+        "cancelled foreground startup should leave no live service: {after}"
+    );
+}
+
+/// The cancellation guard captures the shell wrapper immediately, while the
+/// durable backend identity is captured after readiness so a later `exec` of
+/// the real app remains visible to status and teardown.
+#[cfg(unix)]
+#[tokio::test]
+async fn dev_tracks_foreground_identity_after_shell_exec() {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let ws = TestWorkspace::new(
+        "[web]\nrun=sleep 1; exec sleep 600\nhealthcheck=sleep 2; exit 0\nready-timeout=10\n",
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_eph"))
+        .arg("dev")
+        .current_dir(ws.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn eph dev");
+
+    let tracked = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let status = ws.eph_ok(&["status"]).await;
+            if status.contains("web") && !status.contains("web (stopped)") {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        tracked,
+        "status lost the foreground process after shell exec"
+    );
+
+    let dev_pid = child.id().expect("dev child has a pid") as libc::pid_t;
+    // SAFETY: kill takes plain integers and has no memory-safety preconditions.
+    unsafe {
+        libc::kill(dev_pid, libc::SIGTERM);
+    }
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("eph dev should stop promptly")
+        .expect("failed to wait for eph dev");
+    assert!(status.success(), "a signalled eph dev should exit cleanly");
+    let after = ws.eph_ok(&["status"]).await;
+    assert!(
+        after.contains("No services running"),
+        "teardown should stop the exec'd foreground process: {after}"
+    );
+}
+
+/// An auto-port foreground app that loses its first port race is relaunched and
+/// remains attached to `eph dev` until shutdown.
 #[cfg(unix)]
 #[tokio::test]
 async fn dev_retries_an_auto_port_app_that_exits_during_startup() {

@@ -256,6 +256,11 @@ enum SystemCommand {
         #[arg(long)]
         compatibility_v042: bool,
 
+        /// Remove resources for recorded workspace paths that still contain
+        /// files. Live resources still require --force-live.
+        #[arg(long)]
+        force_non_empty: bool,
+
         /// Remove a stale workspace's resources even if it still has running
         /// containers or a live `run=` process. Without this, a workspace
         /// whose recorded path is gone only because it was moved or renamed
@@ -352,11 +357,18 @@ async fn main() -> Result<ExitCode> {
             SystemCommand::Prune {
                 dry_run,
                 compatibility_v042,
+                force_non_empty,
                 force_live,
                 yes,
-            } => cmd_system_prune(dry_run, compatibility_v042, force_live, yes)
-                .await
-                .map(|()| ExitCode::SUCCESS),
+            } => cmd_system_prune(
+                dry_run,
+                compatibility_v042,
+                force_non_empty,
+                force_live,
+                yes,
+            )
+            .await
+            .map(|()| ExitCode::SUCCESS),
         },
         Commands::Dev {
             service,
@@ -639,12 +651,14 @@ async fn cmd_clean(skip_hooks: bool) -> Result<()> {
 async fn cmd_system_prune(
     dry_run: bool,
     compatibility_v042: bool,
+    force_non_empty: bool,
     force_live: bool,
     yes: bool,
 ) -> Result<()> {
     let options = PruneOptions {
         dry_run: true,
         compatibility_v042,
+        force_non_empty,
         force_live,
     };
 
@@ -685,6 +699,7 @@ async fn cmd_system_prune(
     let report = eph::prune(PruneOptions {
         dry_run: false,
         compatibility_v042,
+        force_non_empty,
         force_live,
     })
     .await?;
@@ -799,32 +814,7 @@ async fn cmd_dev(
     let foreground = select_foreground_service(&eph, service.as_deref())?;
 
     let mut manager = ServiceManager::new(workspace).await?;
-
-    let already_running = manager.status().await?;
-    // `eph dev` spawns and attaches to the foreground app itself (see
-    // `start_foreground`, which never adopts an existing process). It therefore
-    // cannot foreground one that is already running: doing so would spawn a second
-    // copy and overwrite the original's state entry, orphaning it beyond eph's
-    // reach. Fail fast with a clear message instead. A prewarmed dependency tier
-    // is fine; only the app being foregrounded is the conflict.
-    if already_running.contains_key(foreground.as_str()) {
-        anyhow::bail!(
-            "the foreground service '{foreground}' is already running; stop it first \
-             with `eph down {foreground}` (eph dev starts and attaches to it itself)"
-        );
-    }
-    // Services already running now (a SessionStart hook's prewarmed dependency
-    // tier, typically) are adopted and left running on teardown. Everything else,
-    // including the foreground just guaranteed not to be running, eph dev brings up
-    // and is responsible for tearing back down. Snapshotting here, before the first
-    // bring-up, is the whole ownership model: no persisted refcount required.
-    // `--clean` overrides this and bulldozes everything, as an explicit full reset.
-    let brought_up: Vec<String> = eph
-        .services
-        .keys()
-        .filter(|name| !already_running.contains_key(name.as_str()))
-        .cloned()
-        .collect();
+    let mut brought_up = Vec::new();
 
     // A preview server (Claude Desktop) assigns a host port, passes it as $PORT,
     // then polls it and reveals the app the instant it accepts a connection. We
@@ -857,7 +847,14 @@ async fn cmd_dev(
         // for signals. Closing that window prevents SIGTERM from taking the
         // process's default non-zero exit path after a successful startup.
         let started = {
-            let bring_up = dev_bring_up(&mut manager, &eph, &foreground, gate_port, skip_hooks);
+            let bring_up = dev_bring_up(
+                &mut manager,
+                &eph,
+                &foreground,
+                gate_port,
+                skip_hooks,
+                &mut brought_up,
+            );
             tokio::pin!(bring_up);
             tokio::select! {
                 result = &mut bring_up => Some(result?),
@@ -1004,46 +1001,14 @@ async fn dev_bring_up(
     foreground: &str,
     gate_port: Option<u16>,
     skip_hooks: bool,
+    brought_up: &mut Vec<String>,
 ) -> Result<(tokio::process::Child, Option<tokio::task::JoinHandle<()>>)> {
-    // Two steps so the foreground app inherits eph's stdio. First bring the
-    // backing services up with `eph up`'s exact hook interleaving (each
-    // service's pre-start runs just before that service is created, so it can
-    // reference the services already up); post-start is deferred below so it
-    // can also reference the foreground app. Then start the app in the
-    // foreground, running its own pre-start immediately before it, again
-    // matching `up`. The foreground app is named as a reserve-ahead service so
-    // its port is decided before any backing hook runs, keeping references to
-    // it (`${web.port}` in a proxy config, say) resolvable exactly as they are
-    // under `eph up`. `start_services` with an empty filter would start
-    // everything, so only call it when there is at least one backing service.
-    let backing: Vec<String> = eph
-        .services
-        .keys()
-        .filter(|name| *name != foreground)
-        .cloned()
-        .collect();
-    let hooks = if skip_hooks {
-        Hooks::None
-    } else {
-        Hooks::PreStartOnly
-    };
-    let reserve_ahead = [foreground.to_string()];
-    if !backing.is_empty() {
-        manager
-            .start_services(eph, &backing, hooks, &reserve_ahead)
-            .await?;
-    }
-    if !skip_hooks {
-        manager.run_pre_start_for(eph, foreground).await?;
-    }
-    let (fg, child) = manager.start_foreground(eph, foreground).await?;
-
-    // Everything is healthy now, so run post-start hooks (seeding) for every
-    // service, preserving the `eph up` rule that a hook may reference any
-    // service's assigned port.
-    if !skip_hooks {
-        manager.run_all_post_start(eph).await?;
-    }
+    // Backing startup, foreground port reservation, hooks, and process state
+    // form one lifecycle transaction so prune cannot split the environment the
+    // hooks observed from the one the foreground process receives.
+    let (fg, child) = manager
+        .start_dev(eph, foreground, skip_hooks, brought_up)
+        .await?;
 
     // Seeding is done, so open the preview-facing gate. Binding $PORT here, and
     // not one step earlier, is the whole point: the preview server watches this
@@ -1872,6 +1837,26 @@ mod tests {
         let (global, command) = split_run_argv(&argv).expect("run should split");
         assert!(global.is_empty());
         assert_eq!(command, &args(&["make", "run"])[..]);
+    }
+
+    #[test]
+    fn system_prune_parses_force_non_empty_independently_from_force_live() {
+        let cli = Cli::try_parse_from(["eph", "system", "prune", "--force-non-empty"])
+            .expect("force-non-empty should be a system prune flag");
+
+        let Commands::System {
+            command:
+                SystemCommand::Prune {
+                    force_non_empty,
+                    force_live,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected system prune");
+        };
+        assert!(force_non_empty);
+        assert!(!force_live);
     }
 
     #[test]

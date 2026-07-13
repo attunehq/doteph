@@ -1,11 +1,11 @@
-//! Cross-workspace pruning for state left behind by deleted workspaces.
+//! Cross-workspace pruning for state left behind by disposable workspaces.
 //!
 //! Normal lifecycle commands start from the current `.eph` file. Prune starts
 //! from the global state root instead, so it can tear down resources for a
 //! workspace path that no longer exists.
 
 use crate::proc;
-use crate::service::{Backend, ServiceState};
+use crate::service::{Backend, ServiceState, WorkspaceLock};
 use crate::workspace::{WORKSPACE_METADATA_FILE, WorkspaceMetadata, state_root};
 use anyhow::{Context, Result};
 use bollard::Docker;
@@ -28,11 +28,34 @@ pub struct PruneOptions {
     pub dry_run: bool,
     /// Prune state directories written by eph v0.4.2 and earlier.
     pub compatibility_v042: bool,
+    /// Treat recorded workspace paths that still contain files as prune
+    /// candidates. Live resources remain protected unless [`Self::force_live`]
+    /// is also set.
+    pub force_non_empty: bool,
     /// Remove a stale workspace's resources even when it still has running
     /// containers or a live `run=` process. Without this, a workspace that
     /// reads as stale only because it was moved or renamed (its recorded path
     /// no longer resolves) is reported and skipped instead of force-killed.
     pub force_live: bool,
+}
+
+impl PruneOptions {
+    fn non_empty_policy(self) -> NonEmptyWorkspacePolicy {
+        if self.force_non_empty {
+            NonEmptyWorkspacePolicy::Prune
+        } else {
+            NonEmptyWorkspacePolicy::Protect
+        }
+    }
+}
+
+/// Whether existing non-empty workspace paths remain protected during
+/// candidate selection. Keeping this policy distinct from the liveness guard
+/// prevents the two destructive overrides from being conflated internally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NonEmptyWorkspacePolicy {
+    Protect,
+    Prune,
 }
 
 /// Whether `eph system prune`'s confirmation prompt should be shown, skipped,
@@ -83,6 +106,8 @@ pub enum StaleReason {
     Missing,
     /// The recorded workspace path exists but is now an empty directory.
     EmptyDirectory,
+    /// The recorded workspace path is non-empty and was selected explicitly.
+    NonEmptyDirectory,
     /// The recorded workspace path exists but is no longer a directory.
     NotDirectory,
     /// The state directory was written before eph recorded workspace metadata.
@@ -94,6 +119,7 @@ impl StaleReason {
         match self {
             StaleReason::Missing => "missing workspace",
             StaleReason::EmptyDirectory => "empty workspace directory",
+            StaleReason::NonEmptyDirectory => "non-empty workspace directory",
             StaleReason::NotDirectory => "workspace path is not a directory",
             StaleReason::CompatibilityV042State => {
                 "v0.4.2-and-earlier state without workspace metadata"
@@ -232,7 +258,8 @@ impl DockerInventory {
 }
 
 /// Remove resources for metadata-backed workspaces whose recorded path is gone
-/// or empty.
+/// or empty, plus non-empty paths selected by
+/// [`PruneOptions::force_non_empty`].
 ///
 /// # Errors
 ///
@@ -287,6 +314,25 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
         "Found {} stale workspace candidates; inventorying Docker resources",
         candidates.len()
     );
+
+    // An existing non-empty path can still run lifecycle commands. Lock every
+    // destructive candidate before taking the shared Docker snapshot so an
+    // `up` cannot create resources after the liveness check and before prune
+    // removes the workspace's state. The daemon-wide prune lock gives every
+    // prune the same lock order, so candidate locks cannot deadlock each other.
+    let mut workspace_locks = if options.dry_run {
+        Vec::new()
+    } else {
+        candidates
+            .iter()
+            .map(|candidate| WorkspaceLock::open_state_dir(&candidate.state_dir))
+            .collect::<Result<Vec<_>>>()?
+    };
+    let _workspace_guards = workspace_locks
+        .iter_mut()
+        .map(WorkspaceLock::acquire)
+        .collect::<Result<Vec<_>>>()?;
+
     let inventory = DockerInventory::load(&docker).await?;
     let prune_docker = PruneDocker {
         client: &docker,
@@ -376,7 +422,9 @@ async fn classify_state_dir(
         return Ok(None);
     }
 
-    let Some(reason) = classify_workspace_path(&metadata.workspace_path)? else {
+    let Some(reason) =
+        classify_workspace_path(&metadata.workspace_path, options.non_empty_policy())?
+    else {
         report.skipped.push(SkippedWorkspace {
             short_id: metadata.short_id,
             workspace_path: Some(metadata.workspace_path),
@@ -416,7 +464,8 @@ async fn prune_candidate(
 
     if !options.dry_run
         && let Some(metadata) = candidate.metadata.as_ref()
-        && !metadata_still_stale(&candidate.state_dir, metadata).await?
+        && !metadata_still_prunable(&candidate.state_dir, metadata, options.non_empty_policy())
+            .await?
     {
         report.skipped.push(SkippedWorkspace {
             short_id: candidate.short_id,
@@ -881,10 +930,11 @@ pub async fn count_stale_workspaces(root: &Path, exclude_short_id: &str) -> usiz
         let Ok(metadata) = WorkspaceMetadata::load_from_state_dir(&dir).await else {
             continue;
         };
-        let is_stale = classify_workspace_path(&metadata.workspace_path)
-            .ok()
-            .flatten()
-            .is_some();
+        let is_stale =
+            classify_workspace_path(&metadata.workspace_path, NonEmptyWorkspacePolicy::Protect)
+                .ok()
+                .flatten()
+                .is_some();
         if is_stale {
             count += 1;
         }
@@ -910,7 +960,10 @@ async fn state_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
-fn classify_workspace_path(path: &Path) -> Result<Option<StaleReason>> {
+fn classify_workspace_path(
+    path: &Path,
+    non_empty_policy: NonEmptyWorkspacePolicy,
+) -> Result<Option<StaleReason>> {
     if !path.exists() {
         return Ok(Some(StaleReason::Missing));
     }
@@ -925,15 +978,28 @@ fn classify_workspace_path(path: &Path) -> Result<Option<StaleReason>> {
     {
         return Ok(Some(StaleReason::EmptyDirectory));
     }
-    Ok(None)
+    Ok((non_empty_policy == NonEmptyWorkspacePolicy::Prune)
+        .then_some(StaleReason::NonEmptyDirectory))
 }
 
-async fn metadata_still_stale(state_dir: &Path, original: &WorkspaceMetadata) -> Result<bool> {
+/// Re-check a metadata-backed candidate immediately before a destructive pass.
+///
+/// `non_empty_policy` must participate in both the preview classification and
+/// this check. Otherwise a non-empty workspace could appear in the confirmed
+/// preview and then be rejected only when removal begins.
+async fn metadata_still_prunable(
+    state_dir: &Path,
+    original: &WorkspaceMetadata,
+    non_empty_policy: NonEmptyWorkspacePolicy,
+) -> Result<bool> {
+    if !state_dir.join(WORKSPACE_METADATA_FILE).exists() {
+        return Ok(false);
+    }
     let current = WorkspaceMetadata::load_from_state_dir(state_dir).await?;
     if &current != original {
         return Ok(false);
     }
-    Ok(classify_workspace_path(&current.workspace_path)?.is_some())
+    Ok(classify_workspace_path(&current.workspace_path, non_empty_policy)?.is_some())
 }
 
 /// Open the lock file that makes `eph system prune` invocations mutually
@@ -980,7 +1046,7 @@ mod tests {
         let missing = dir.path().join("missing");
 
         assert_eq!(
-            classify_workspace_path(&missing).unwrap(),
+            classify_workspace_path(&missing, NonEmptyWorkspacePolicy::Protect).unwrap(),
             Some(StaleReason::Missing)
         );
     }
@@ -1000,7 +1066,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         assert_eq!(
-            classify_workspace_path(dir.path()).unwrap(),
+            classify_workspace_path(dir.path(), NonEmptyWorkspacePolicy::Protect).unwrap(),
             Some(StaleReason::EmptyDirectory)
         );
     }
@@ -1010,7 +1076,73 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".eph"), "[db]\nimage=postgres:16\n").unwrap();
 
-        assert_eq!(classify_workspace_path(dir.path()).unwrap(), None);
+        assert_eq!(
+            classify_workspace_path(dir.path(), NonEmptyWorkspacePolicy::Protect).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn force_non_empty_classifies_non_empty_workspace_as_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".eph"), "[db]\nimage=postgres:16\n").unwrap();
+
+        assert_eq!(
+            classify_workspace_path(dir.path(), NonEmptyWorkspacePolicy::Prune).unwrap(),
+            Some(StaleReason::NonEmptyDirectory)
+        );
+    }
+
+    #[tokio::test]
+    async fn force_non_empty_promotes_metadata_backed_workspace_to_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join(".eph"), "[db]\nimage=postgres:16\n").unwrap();
+        let short_id = "aaaaaaaaaaaaaaaa";
+        write_workspace_metadata(
+            root.path(),
+            short_id,
+            workspace
+                .path()
+                .to_str()
+                .expect("temp path should be UTF-8"),
+        );
+        let mut report = PruneReport::default();
+
+        let candidate = classify_state_dir(
+            root.path().join(short_id),
+            PruneOptions {
+                force_non_empty: true,
+                ..PruneOptions::default()
+            },
+            &mut report,
+        )
+        .await
+        .unwrap()
+        .expect("forced non-empty workspace should be a candidate");
+
+        assert_eq!(candidate.reason, StaleReason::NonEmptyDirectory);
+        assert!(report.skipped.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removed_metadata_is_no_longer_prunable_after_lock_acquisition() {
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = root.path().join("aaaaaaaaaaaaaaaa");
+        let metadata = WorkspaceMetadata {
+            schema: 1,
+            workspace_id: "a".repeat(64),
+            short_id: "aaaaaaaaaaaaaaaa".to_string(),
+            workspace_path: root.path().join("workspace"),
+            container_prefix: "eph-aaaaaaaaaaaaaaaa".to_string(),
+            last_seen_unix_secs: 0,
+        };
+
+        assert!(
+            !metadata_still_prunable(&state_dir, &metadata, NonEmptyWorkspacePolicy::Prune,)
+                .await
+                .unwrap()
+        );
     }
 
     #[test]

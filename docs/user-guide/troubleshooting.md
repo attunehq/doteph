@@ -249,8 +249,13 @@ does not help here; it only skips lifecycle hooks.
 If the workspace directory itself was deleted, run `eph system prune` from
 anywhere. It scans all eph state directories and removes resources for
 recorded workspace paths that are missing or empty folders. Use `eph system
-prune --dry-run` first to see the plan. An 8-character state directory without
-workspace metadata is skipped unless you pass `--compatibility-v042`.
+prune --dry-run` first to see the plan. If a recorded path still contains files
+but you know the workspace can be discarded, preview it with
+`eph system prune --force-non-empty --dry-run`, then rerun with
+`eph system prune --force-non-empty --yes`. Add `--force-live` when the preview
+reports running containers or a live `run=` process. An 8-character state
+directory without workspace metadata is skipped unless you pass
+`--compatibility-v042`.
 
 For `run=` services, system prune stops only a recorded PID whose live process
 still matches the identity eph captured at launch; PIDs can be reused, so a
