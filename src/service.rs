@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -623,11 +623,12 @@ impl ServiceState {
 }
 
 /// An exclusive, per-workspace lock over state-mutating commands (`up`,
-/// `down`, `clean`), held for the duration of the operation.
+/// `down`, `clean`, and destructive system prune), held for the duration of
+/// the operation.
 ///
-/// Backed by an OS advisory lock (`flock` / `LockFileEx`) on a file in the
-/// workspace's state directory, so it releases automatically when the process
-/// exits for any reason: a killed `eph up` can never wedge the next command.
+/// Backed by an OS advisory lock (`flock` / `LockFileEx`) on a file beside the
+/// state directory, so it releases automatically when the process exits for
+/// any reason: a killed `eph up` can never wedge the next command.
 /// Two overlapping `eph up` runs used to each spawn services and then race
 /// their `state.json` writes, with the loser's processes leaked untracked;
 /// with the lock the second command simply waits.
@@ -644,6 +645,16 @@ impl WorkspaceLock {
     /// lives in it.
     pub(crate) fn open(workspace: &Workspace) -> Result<Self> {
         let dir = workspace.state_dir()?;
+        Self::open_state_dir(&dir)
+    }
+
+    /// Open the lifecycle lock from a state directory path.
+    ///
+    /// System prune has persisted state but may no longer have a workspace path
+    /// from which [`Workspace`] can be constructed. Deriving the same sibling
+    /// lock from the state directory lets prune serialize with lifecycle
+    /// commands without weakening workspace construction.
+    pub(crate) fn open_state_dir(dir: &Path) -> Result<Self> {
         let parent = dir
             .parent()
             .context("workspace state directory has no parent")?;
@@ -1987,6 +1998,8 @@ impl ServiceManager {
     /// persisted state file exists but cannot be read or parsed.
     pub async fn new(workspace: Workspace) -> Result<Self> {
         let docker = DockerClient::connect().await?;
+        let mut lock = WorkspaceLock::open(&workspace)?;
+        let _guard = lock.acquire()?;
         workspace.save_metadata().await?;
         let state = ServiceState::load(&workspace).await?;
         Ok(ServiceManager {
@@ -2150,8 +2163,9 @@ impl ServiceManager {
         // state writes, and the loser's processes leak untracked.
         let mut lock = WorkspaceLock::open(&self.workspace)?;
         let _guard = lock.acquire()?;
-        // Re-read state under the lock: another command may have finished
-        // between this manager's construction and lock acquisition.
+        // Metadata and state must move together under the lifecycle lock. A
+        // prune may have completed after manager construction and removed both.
+        self.workspace.save_metadata().await?;
         self.state = ServiceState::load(&self.workspace).await?;
 
         // Resolve the target set: every service, or just the requested ones (in
@@ -3490,8 +3504,7 @@ impl ServiceManager {
     pub async fn stop_all(&mut self, eph: &EphFile, remove: bool, skip_hooks: bool) -> Result<()> {
         let mut lock = WorkspaceLock::open(&self.workspace)?;
         let _guard = lock.acquire()?;
-        // Re-read state under the lock: it was loaded when this manager was
-        // constructed, and another command may have finished in between.
+        self.workspace.save_metadata().await?;
         self.state = ServiceState::load(&self.workspace).await?;
 
         // Snapshot the running services once, before any teardown, so every
@@ -3537,7 +3550,7 @@ impl ServiceManager {
     ) -> Result<()> {
         let mut lock = WorkspaceLock::open(&self.workspace)?;
         let _guard = lock.acquire()?;
-        // Re-read state under the lock (see stop_all).
+        self.workspace.save_metadata().await?;
         self.state = ServiceState::load(&self.workspace).await?;
 
         let wanted: HashSet<&str> = targets.iter().map(String::as_str).collect();
@@ -3577,7 +3590,7 @@ impl ServiceManager {
     /// `image`/`dockerfile` service, if `docker compose down` fails for a
     /// compose service that was up, or if a `post-stop` hook fails (the service
     /// is already stopped by then).
-    pub async fn stop_service(
+    async fn stop_service(
         &mut self,
         name: &str,
         service: &Service,
@@ -3716,7 +3729,7 @@ impl ServiceManager {
     pub async fn clean(&mut self, eph: &EphFile, skip_hooks: bool) -> Result<CleanSummary> {
         let mut lock = WorkspaceLock::open(&self.workspace)?;
         let _guard = lock.acquire()?;
-        // Re-read state under the lock (see stop_all).
+        self.workspace.save_metadata().await?;
         self.state = ServiceState::load(&self.workspace).await?;
 
         let mut summary = CleanSummary::default();
@@ -3807,16 +3820,6 @@ impl ServiceManager {
         Ok(summary)
     }
 
-    /// Save the current in-memory service state to disk.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the state directory cannot be created or the state
-    /// file cannot be serialized or written.
-    pub async fn save_state(&self) -> Result<()> {
-        self.state.save(&self.workspace).await
-    }
-
     /// Start the foreground `run=` service for `eph dev`, inheriting eph's stdio.
     ///
     /// Unlike the backing `run=` path
@@ -3840,6 +3843,11 @@ impl ServiceManager {
         eph: &EphFile,
         name: &str,
     ) -> Result<(RunningService, tokio::process::Child)> {
+        let mut lock = WorkspaceLock::open(&self.workspace)?;
+        let _guard = lock.acquire()?;
+        self.workspace.save_metadata().await?;
+        self.state = ServiceState::load(&self.workspace).await?;
+
         let service = eph
             .services
             .get(name)

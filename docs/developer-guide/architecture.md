@@ -119,13 +119,22 @@ workspace serialize instead of racing each other's writes.
 `eph clean` deletes this directory for the current workspace. `eph system
 prune` scans every state directory and removes Docker resources by the
 `eph-<short_id>-` namespace when the recorded workspace path is missing or
-empty. Each prune pass takes one daemon-wide Docker resource snapshot and
-partitions it by namespace in memory, so state-root size does not multiply
-Docker API calls. Prune acts only once it has confirmed the workspace is actually dead: a
+empty. `--force-non-empty` adds recorded paths that still contain files. Each
+prune pass takes one daemon-wide Docker resource snapshot and partitions it by
+namespace in memory, so state-root size does not multiply Docker API calls.
+Prune acts only once it has confirmed the workspace is actually dead: a
 recorded path that no longer resolves could mean the workspace was moved or
 renamed rather than deleted, so prune first checks for any running container
 or live `run=` process under that namespace and skips (reports, does not
 remove) a workspace that still has either, unless `--force-live` is passed.
+This liveness gate also applies to `--force-non-empty` candidates, so both
+flags are required when the recorded directory is non-empty and resources are
+live.
+Before a destructive pass inventories Docker, prune acquires every candidate's
+lifecycle lock, the same lock used by `up`, `down`, `clean`, and foreground
+`dev` startup. A concurrent lifecycle command finishes first, then prune
+refreshes its resource snapshot, so resources cannot start between the
+liveness check and state removal.
 For `run=` services every lifecycle command signals only PIDs whose current
 process identity matches the identity saved at launch. Startup stops the child
 and fails if that identity cannot be captured. Process entries without an

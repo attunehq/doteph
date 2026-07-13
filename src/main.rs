@@ -256,6 +256,11 @@ enum SystemCommand {
         #[arg(long)]
         compatibility_v042: bool,
 
+        /// Remove resources for recorded workspace paths that still contain
+        /// files. Live resources still require --force-live.
+        #[arg(long)]
+        force_non_empty: bool,
+
         /// Remove a stale workspace's resources even if it still has running
         /// containers or a live `run=` process. Without this, a workspace
         /// whose recorded path is gone only because it was moved or renamed
@@ -352,11 +357,18 @@ async fn main() -> Result<ExitCode> {
             SystemCommand::Prune {
                 dry_run,
                 compatibility_v042,
+                force_non_empty,
                 force_live,
                 yes,
-            } => cmd_system_prune(dry_run, compatibility_v042, force_live, yes)
-                .await
-                .map(|()| ExitCode::SUCCESS),
+            } => cmd_system_prune(
+                dry_run,
+                compatibility_v042,
+                force_non_empty,
+                force_live,
+                yes,
+            )
+            .await
+            .map(|()| ExitCode::SUCCESS),
         },
         Commands::Dev {
             service,
@@ -639,12 +651,14 @@ async fn cmd_clean(skip_hooks: bool) -> Result<()> {
 async fn cmd_system_prune(
     dry_run: bool,
     compatibility_v042: bool,
+    force_non_empty: bool,
     force_live: bool,
     yes: bool,
 ) -> Result<()> {
     let options = PruneOptions {
         dry_run: true,
         compatibility_v042,
+        force_non_empty,
         force_live,
     };
 
@@ -685,6 +699,7 @@ async fn cmd_system_prune(
     let report = eph::prune(PruneOptions {
         dry_run: false,
         compatibility_v042,
+        force_non_empty,
         force_live,
     })
     .await?;
@@ -1872,6 +1887,26 @@ mod tests {
         let (global, command) = split_run_argv(&argv).expect("run should split");
         assert!(global.is_empty());
         assert_eq!(command, &args(&["make", "run"])[..]);
+    }
+
+    #[test]
+    fn system_prune_parses_force_non_empty_independently_from_force_live() {
+        let cli = Cli::try_parse_from(["eph", "system", "prune", "--force-non-empty"])
+            .expect("force-non-empty should be a system prune flag");
+
+        let Commands::System {
+            command:
+                SystemCommand::Prune {
+                    force_non_empty,
+                    force_live,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected system prune");
+        };
+        assert!(force_non_empty);
+        assert!(!force_live);
     }
 
     #[test]

@@ -73,7 +73,7 @@ Behavior:
 - After a successful `up`, a filesystem-only scan checks whether any *other*
   workspace's recorded path has been deleted (a removed worktree or clone),
   and prints a one-line note on stderr pointing at
-  [`eph system prune`](#eph-system-prune---dry-run---compatibility-v042---force-live--y---yes)
+  [`eph system prune`](#eph-system-prune---dry-run---compatibility-v042---force-non-empty---force-live--y---yes)
   when it finds one. It never touches Docker, never fails the `up` itself, and
   never counts the current workspace.
 
@@ -178,7 +178,7 @@ Behavior beyond the declared services:
   both the `.eph` file and `state.json`, because `clean` promises a full
   reset.
 
-## `eph system prune [--dry-run] [--compatibility-v042] [--force-live] [-y] [--yes]`
+## `eph system prune [--dry-run] [--compatibility-v042] [--force-non-empty] [--force-live] [-y] [--yes]`
 
 Cross-workspace prune for resources left behind after workspace directories
 are deleted (finished worktrees, removed clones). It scans the eph state root
@@ -191,6 +191,7 @@ an empty directory.
 |------|-------------|
 | `--dry-run` | Print what would be removed without deleting anything, and without prompting. |
 | `--compatibility-v042` | Also prune 8-character state directories that have no workspace metadata. |
+| `--force-non-empty` | Also prune workspaces whose recorded path still exists and contains files. |
 | `--force-live` | Remove a stale workspace's resources even if it still has running containers or a live `run=` process. |
 | `-y`, `--yes` | Skip the removal confirmation prompt. |
 
@@ -199,6 +200,8 @@ eph system prune
 eph system prune --dry-run
 eph system prune --yes
 eph system prune --compatibility-v042
+eph system prune --force-non-empty --dry-run
+eph system prune --force-non-empty --yes
 eph system prune --force-live --yes
 ```
 
@@ -231,6 +234,10 @@ Totals:
 
 Behavior:
 
+- By default, a recorded workspace path is eligible only when it is missing,
+  empty, or no longer a directory. `--force-non-empty` also makes existing
+  non-empty directories eligible. This is a global override, so preview it
+  with `--dry-run` before removal.
 - Progress is logged to stderr while prune acquires its lock, inventories
   Docker, scans state directories, and removes resources. The final report
   remains on stdout for callers that capture or pipe it. Prune lists each
@@ -247,9 +254,10 @@ Behavior:
   warning. If any container is running, or a recorded `run=` process is alive
   under the identity eph captured at launch, the workspace is reported under
   "Skipped" instead ("stop them or re-run with --force-live") and left
-  untouched. `--force-live` authorizes removing it anyway. `--dry-run` applies
-  the same check, so its preview always
-  matches what a real run would do.
+  untouched. `--force-live` authorizes removing it anyway. The two force flags
+  are independent: a non-empty workspace with live resources requires both
+  `--force-non-empty` and `--force-live`. `--dry-run` applies the same checks,
+  so its preview always matches what a real run would do.
 - Unless `--dry-run`, prune prints what it is about to remove and then asks
   `Remove these resources? [y/N]` before deleting anything, the same way
   `docker system prune` does. Anything other than `y` or `yes` (a bare Enter
@@ -276,6 +284,11 @@ Behavior:
   instant the holding process exits, crash included, so a second prune
   started while one is already running fails immediately with a clear error
   instead of racing it or wedging on a leftover lock file.
+- A real prune also takes each candidate's workspace lifecycle lock before it
+  inventories Docker. If `up`, `down`, `clean`, or foreground `dev` startup is
+  already changing that workspace, prune waits for it and then inventories the
+  resulting resources. This keeps the live-resource guard accurate for
+  existing non-empty workspaces.
 
 ## `eph dev [SERVICE] [--clean] [--watch GLOB]... [--skip-hooks]`
 
