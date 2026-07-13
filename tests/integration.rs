@@ -805,6 +805,30 @@ pre-start={}
     ws.eph_ok(&["down"]).await;
 }
 
+/// Read-only eph commands invoked by a hook must not contend with the parent
+/// lifecycle transaction. Hooks commonly inspect the environment they are
+/// preparing, and waiting for the parent's lock would deadlock both processes.
+#[tokio::test]
+async fn pre_start_hook_can_run_eph_status() {
+    let eph = env!("CARGO_BIN_EXE_eph");
+    let ws = TestWorkspace::new(&format!(
+        "[app]\nrun={}\npre-start={eph} status > hook-status\n",
+        run_sleep(300)
+    ));
+
+    tokio::time::timeout(Duration::from_secs(30), ws.eph_ok(&["up"]))
+        .await
+        .expect("a read-only eph command in a hook must not wait on the lifecycle lock");
+
+    let hook_status = std::fs::read_to_string(ws.path().join("hook-status"))
+        .expect("the pre-start hook did not capture eph status");
+    assert!(
+        hook_status.contains("No services running"),
+        "the hook should inspect the pre-start state: {hook_status}"
+    );
+    ws.eph_ok(&["down"]).await;
+}
+
 /// A `pre-start` hook runs *before* the service it precedes boots. The `run=`
 /// app and the hook both append to one file, so the recorded order proves the
 /// hook ran first.
@@ -2327,6 +2351,68 @@ pre-start={}
     ws.eph_ok(&["down"]).await;
 }
 
+/// The foreground liveness check belongs inside the same transaction as its
+/// spawn. An `up` that wins the workspace lock must make a queued `dev` reject
+/// the now-running app instead of spawning a duplicate and orphaning one PID.
+#[tokio::test]
+async fn concurrent_up_prevents_dev_from_duplicating_the_foreground() {
+    let held = "up-holds-lock-before-dev";
+    let release = "release-up-before-dev";
+    let ws = TestWorkspace::new(&format!(
+        "[web]\nrun={}\npre-start={}\n",
+        run_sleep(300),
+        hook_mark_and_wait(held, release)
+    ));
+    let eph_binary = env!("CARGO_BIN_EXE_eph");
+
+    let mut up = tokio::process::Command::new(eph_binary)
+        .arg("up")
+        .current_dir(ws.path())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn eph up");
+    assert!(
+        wait_for_file(&ws.path().join(held)).await,
+        "eph up never reached its locked pre-start hook"
+    );
+
+    let dev_stderr_path = ws.path().join("dev-lock-wait.stderr");
+    let mut dev = tokio::process::Command::new(eph_binary)
+        .arg("dev")
+        .current_dir(ws.path())
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(
+            std::fs::File::create(&dev_stderr_path).expect("failed to capture eph dev stderr"),
+        ))
+        .spawn()
+        .expect("failed to spawn eph dev");
+    assert!(
+        wait_for_file_text(
+            &dev_stderr_path,
+            "another eph command is running in this workspace; waiting for it",
+        )
+        .await,
+        "eph dev never contended on eph up's workspace lock"
+    );
+    std::fs::write(ws.path().join(release), "release").unwrap();
+
+    let up_status = up.wait().await.expect("failed to wait for eph up");
+    assert!(up_status.success(), "the winning eph up should succeed");
+    let dev_status = tokio::time::timeout(Duration::from_secs(20), dev.wait())
+        .await
+        .expect("eph dev spawned a duplicate foreground process")
+        .expect("failed to wait for eph dev");
+    let dev_stderr = std::fs::read_to_string(&dev_stderr_path).unwrap_or_default();
+    assert!(!dev_status.success(), "eph dev should reject the live app");
+    assert!(
+        dev_stderr.contains("already running"),
+        "eph dev should explain the locked liveness rejection: {dev_stderr}"
+    );
+
+    ws.eph_ok(&["down"]).await;
+}
+
 /// A destructive force-non-empty prune must share the lifecycle lock with
 /// `up`. The marker proves `up` is inside its lock before prune starts; prune
 /// must wait, refresh Docker inventory, and then preserve the running service
@@ -3066,6 +3152,130 @@ async fn skills_install_and_check_round_trip() {
 /// Unix-only: it delivers `SIGTERM`, the signal a Claude Desktop preview server
 /// uses to stop the dev command. Windows has no equivalent a test harness can
 /// deliver, and that gap (a hard kill skips teardown) is documented behavior.
+#[cfg(unix)]
+#[tokio::test]
+async fn dev_signal_during_foreground_readiness_kills_the_process_tree() {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let ws = TestWorkspace::new(
+        "[web]\nrun=printf '%s' $$ > foreground-pid; sleep 1; exec sh -c 'echo exec > foreground-exec; sleep 600'\nhealthcheck=exit 1\nready-timeout=60\n",
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_eph"))
+        .arg("dev")
+        .current_dir(ws.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn eph dev");
+
+    let pid_path = ws.path().join("foreground-pid");
+    assert!(
+        wait_for_file(&pid_path).await,
+        "the foreground process never entered readiness"
+    );
+    assert!(
+        wait_for_file(&ws.path().join("foreground-exec")).await,
+        "the foreground process never exec'd during readiness"
+    );
+    let foreground_pid: libc::pid_t = std::fs::read_to_string(&pid_path)
+        .expect("failed to read the foreground PID")
+        .trim()
+        .parse()
+        .expect("foreground PID was not numeric");
+
+    let dev_pid = child.id().expect("dev child has a pid") as libc::pid_t;
+    // SAFETY: kill takes plain integers and has no memory-safety preconditions.
+    unsafe {
+        libc::kill(dev_pid, libc::SIGTERM);
+    }
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("eph dev should stop promptly during readiness")
+        .expect("failed to wait for eph dev");
+    assert!(status.success(), "a signalled eph dev should exit cleanly");
+
+    let process_gone = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            // SAFETY: signal 0 only probes whether the PID still exists.
+            if unsafe { libc::kill(foreground_pid, 0) } == -1 {
+                break;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        process_gone,
+        "foreground PID {foreground_pid} survived cancellation during readiness"
+    );
+    let after = ws.eph_ok(&["status"]).await;
+    assert!(
+        after.contains("No services running"),
+        "cancelled foreground startup should leave no live service: {after}"
+    );
+}
+
+/// The cancellation guard captures the shell wrapper immediately, while the
+/// durable backend identity is captured after readiness so a later `exec` of
+/// the real app remains visible to status and teardown.
+#[cfg(unix)]
+#[tokio::test]
+async fn dev_tracks_foreground_identity_after_shell_exec() {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let ws = TestWorkspace::new(
+        "[web]\nrun=sleep 1; exec sleep 600\nhealthcheck=sleep 2; exit 0\nready-timeout=10\n",
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_eph"))
+        .arg("dev")
+        .current_dir(ws.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn eph dev");
+
+    let tracked = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let status = ws.eph_ok(&["status"]).await;
+            if status.contains("web") && !status.contains("web (stopped)") {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        tracked,
+        "status lost the foreground process after shell exec"
+    );
+
+    let dev_pid = child.id().expect("dev child has a pid") as libc::pid_t;
+    // SAFETY: kill takes plain integers and has no memory-safety preconditions.
+    unsafe {
+        libc::kill(dev_pid, libc::SIGTERM);
+    }
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("eph dev should stop promptly")
+        .expect("failed to wait for eph dev");
+    assert!(status.success(), "a signalled eph dev should exit cleanly");
+    let after = ws.eph_ok(&["status"]).await;
+    assert!(
+        after.contains("No services running"),
+        "teardown should stop the exec'd foreground process: {after}"
+    );
+}
+
+/// An auto-port foreground app that loses its first port race is relaunched and
+/// remains attached to `eph dev` until shutdown.
 #[cfg(unix)]
 #[tokio::test]
 async fn dev_retries_an_auto_port_app_that_exits_during_startup() {
