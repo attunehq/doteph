@@ -14,6 +14,8 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 mod common;
+#[path = "integration/system_prune_force.rs"]
+mod system_prune_force;
 use common::{TestWorkspace, extract_port, parse_env_json};
 
 #[cfg(unix)]

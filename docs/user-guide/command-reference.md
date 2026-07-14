@@ -73,7 +73,7 @@ Behavior:
 - After a successful `up`, a filesystem-only scan checks whether any *other*
   workspace's recorded path has been deleted (a removed worktree or clone),
   and prints a one-line note on stderr pointing at
-  [`eph system prune`](#eph-system-prune---dry-run---compatibility-v042---force-non-empty---force-live--y---yes)
+  [`eph system prune`](#eph-system-prune---dry-run---force---compatibility-v042---force-non-empty---force-live--y---yes)
   when it finds one. It never touches Docker, never fails the `up` itself, and
   never counts the current workspace.
 
@@ -182,7 +182,7 @@ Behavior beyond the declared services:
   both the `.eph` file and `state.json`, because `clean` promises a full
   reset.
 
-## `eph system prune [--dry-run] [--compatibility-v042] [--force-non-empty] [--force-live] [-y] [--yes]`
+## `eph system prune [--dry-run] [--force] [--compatibility-v042] [--force-non-empty] [--force-live] [-y] [--yes]`
 
 Cross-workspace prune for resources left behind after workspace directories
 are deleted (finished worktrees, removed clones). It scans the eph state root
@@ -194,6 +194,7 @@ an empty directory.
 | Flag | Description |
 |------|-------------|
 | `--dry-run` | Print what would be removed without deleting anything, and without prompting. |
+| `--force` | Enable `--compatibility-v042`, `--force-non-empty`, `--force-live`, and `--yes`. |
 | `--compatibility-v042` | Also prune 8-character state directories that have no workspace metadata. |
 | `--force-non-empty` | Also prune workspaces whose recorded path still exists and contains files. |
 | `--force-live` | Remove a stale workspace's resources even if it still has running containers or a live `run=` process. |
@@ -202,6 +203,8 @@ an empty directory.
 ```sh
 eph system prune
 eph system prune --dry-run
+eph system prune --force --dry-run
+eph system prune --force
 eph system prune --yes
 eph system prune --compatibility-v042
 eph system prune --force-non-empty --dry-run
@@ -238,6 +241,10 @@ Totals:
 
 Behavior:
 
+- `--force` is the complete destructive override. It includes legacy state,
+  existing non-empty workspace paths, and live resources, then removes the
+  selected resources without prompting. `--force --dry-run` previews that
+  complete scope without changing anything.
 - By default, a recorded workspace path is eligible only when it is missing,
   empty, or no longer a directory. `--force-non-empty` also makes existing
   non-empty directories eligible. This is a global override, so preview it
@@ -258,18 +265,19 @@ Behavior:
   warning. If any container is running, or a recorded `run=` process is alive
   under the identity eph captured at launch, the workspace is reported under
   "Skipped" instead ("stop them or re-run with --force-live") and left
-  untouched. `--force-live` authorizes removing it anyway. The two force flags
-  are independent: a non-empty workspace with live resources requires both
-  `--force-non-empty` and `--force-live`. `--dry-run` applies the same checks,
-  so its preview always matches what a real run would do.
+  untouched. `--force-live` authorizes removing it anyway. The specific force
+  flags are independent: a non-empty workspace with live resources requires
+  both `--force-non-empty` and `--force-live`, or the aggregate `--force`.
+  `--dry-run` applies the same checks, so its preview always matches what a real
+  run would do.
 - Unless `--dry-run`, prune prints what it is about to remove and then asks
   `Remove these resources? [y/N]` before deleting anything, the same way
   `docker system prune` does. Anything other than `y` or `yes` (a bare Enter
   included) aborts with nothing removed, and the command still exits
-  successfully. Pass `-y`/`--yes` to skip the prompt; it is required when
-  stdin is not a terminal (a script or CI job, for instance), where prune
-  errors instead of hanging or silently proceeding. No prompt appears when
-  there is nothing to remove.
+  successfully. Pass `-y`/`--yes` or `--force` to skip the prompt; one is
+  required when stdin is not a terminal (a script or CI job, for instance),
+  where prune errors instead of hanging or silently proceeding. No prompt
+  appears when there is nothing to remove.
 - Docker resources are removed by eph's workspace namespace
   (`eph-<short_id>-...`), so containers, built images, named volumes, Compose
   containers, and Compose networks can all be pruned even when the original

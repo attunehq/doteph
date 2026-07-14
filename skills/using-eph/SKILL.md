@@ -459,6 +459,8 @@ return, so they run as normal commands.
   resources for missing or empty workspace paths. A real prune confirms before
   removal. `--force-non-empty` also selects paths that still contain files, and
   live resources require `--force-live` regardless of how the path was selected.
+  `--force` enables every override and skips confirmation; pair it with
+  `--dry-run` to preview that full scope.
 - **Execution fails closed on unresolved references.** Hooks, service startup,
   health checks, and `eph run` stop before launching a child with a raw eph
   placeholder.

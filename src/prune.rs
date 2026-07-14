@@ -367,33 +367,45 @@ async fn classify_state_dir(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "<unknown>".to_string());
-    if !is_workspace_short_id(&short_id) {
+    let Some(short_id_format) = workspace_short_id_format(&short_id) else {
         report.skipped.push(SkippedWorkspace {
             short_id,
             workspace_path: None,
             reason: "state directory name is not an eph workspace short ID".to_string(),
         });
         return Ok(None);
-    }
+    };
     let metadata_path = state_dir.join(WORKSPACE_METADATA_FILE);
 
     if !metadata_path.exists() {
-        if options.compatibility_v042 {
-            return Ok(Some(PruneCandidate {
-                state_dir,
-                short_id,
-                workspace_path: None,
-                reason: StaleReason::CompatibilityV042State,
-                metadata: None,
-            }));
-        } else {
-            report.skipped.push(SkippedWorkspace {
-                short_id,
-                workspace_path: None,
-                reason:
-                    "v0.4.2-and-earlier state has no workspace metadata; pass --compatibility-v042 to prune it"
-                        .to_string(),
-            });
+        match (short_id_format, options.compatibility_v042) {
+            (WorkspaceShortIdFormat::LegacyV042, true) => {
+                return Ok(Some(PruneCandidate {
+                    state_dir,
+                    short_id,
+                    workspace_path: None,
+                    reason: StaleReason::CompatibilityV042State,
+                    metadata: None,
+                }));
+            }
+            (WorkspaceShortIdFormat::LegacyV042, false) => {
+                report.skipped.push(SkippedWorkspace {
+                    short_id,
+                    workspace_path: None,
+                    reason:
+                        "v0.4.2-and-earlier state has no workspace metadata; pass --compatibility-v042 to prune it"
+                            .to_string(),
+                });
+            }
+            (WorkspaceShortIdFormat::Current, _) => {
+                report.skipped.push(SkippedWorkspace {
+                    short_id,
+                    workspace_path: None,
+                    reason:
+                        "current-format state has no workspace metadata and cannot be pruned safely"
+                            .to_string(),
+                });
+            }
         }
         return Ok(None);
     }
@@ -886,8 +898,22 @@ fn docker_name_has_prefix(name: &str, prefix: &str) -> bool {
     name.strip_prefix('/').unwrap_or(name).starts_with(prefix)
 }
 
-fn is_workspace_short_id(value: &str) -> bool {
-    matches!(value.len(), 8 | 16) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceShortIdFormat {
+    LegacyV042,
+    Current,
+}
+
+fn workspace_short_id_format(value: &str) -> Option<WorkspaceShortIdFormat> {
+    if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    match value.len() {
+        8 => Some(WorkspaceShortIdFormat::LegacyV042),
+        16 => Some(WorkspaceShortIdFormat::Current),
+        _ => None,
+    }
 }
 
 fn ignore_not_found<T: Default>(err: BollardError) -> std::result::Result<T, BollardError> {
@@ -924,7 +950,7 @@ pub async fn count_stale_workspaces(root: &Path, exclude_short_id: &str) -> usiz
         let Some(short_id) = dir.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             continue;
         };
-        if !is_workspace_short_id(&short_id) || short_id == exclude_short_id {
+        if workspace_short_id_format(&short_id).is_none() || short_id == exclude_short_id {
             continue;
         }
         let Ok(metadata) = WorkspaceMetadata::load_from_state_dir(&dir).await else {
@@ -1156,13 +1182,46 @@ mod tests {
     }
 
     #[test]
-    fn workspace_short_id_accepts_current_and_legacy_hex_lengths() {
-        assert!(is_workspace_short_id("a1b2c3d4"));
-        assert!(is_workspace_short_id("ABCDEF12"));
-        assert!(is_workspace_short_id("a1b2c3d4e5f60718"));
-        assert!(!is_workspace_short_id("not-a-workspace"));
-        assert!(!is_workspace_short_id("a1b2c3d"));
-        assert!(!is_workspace_short_id("a1b2c3d4e5f607182"));
+    fn workspace_short_id_format_distinguishes_legacy_and_current_ids() {
+        assert_eq!(
+            workspace_short_id_format("a1b2c3d4"),
+            Some(WorkspaceShortIdFormat::LegacyV042)
+        );
+        assert_eq!(
+            workspace_short_id_format("ABCDEF12"),
+            Some(WorkspaceShortIdFormat::LegacyV042)
+        );
+        assert_eq!(
+            workspace_short_id_format("a1b2c3d4e5f60718"),
+            Some(WorkspaceShortIdFormat::Current)
+        );
+        assert_eq!(workspace_short_id_format("not-a-workspace"), None);
+        assert_eq!(workspace_short_id_format("a1b2c3d"), None);
+        assert_eq!(workspace_short_id_format("a1b2c3d4e5f607182"), None);
+    }
+
+    #[tokio::test]
+    async fn compatibility_never_selects_current_state_without_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let short_id = "aaaaaaaaaaaaaaaa";
+        let state_dir = root.path().join(short_id);
+        std::fs::create_dir(&state_dir).unwrap();
+        let mut report = PruneReport::default();
+
+        let candidate = classify_state_dir(
+            state_dir,
+            PruneOptions {
+                compatibility_v042: true,
+                ..PruneOptions::default()
+            },
+            &mut report,
+        )
+        .await
+        .unwrap();
+
+        assert!(candidate.is_none());
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].reason.contains("cannot be pruned safely"));
     }
 
     #[test]

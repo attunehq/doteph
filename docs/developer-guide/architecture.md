@@ -9,8 +9,8 @@ pieces fit together. For where each decision lives in the code, see
 `eph` is a small Rust CLI built as a thin binary over a reusable library:
 
 - `src/main.rs`: the `clap` front end. Defines the CLI, sets up logging, and
-  dispatches each subcommand to a small `cmd_*` glue function. Nothing here is
-  public API.
+  dispatches each subcommand. `src/system_prune.rs` owns prune-specific CLI
+  options, confirmation, and reporting. Nothing in either file is public API.
 - `src/lib.rs`: the library crate (`eph`) that holds all reusable logic, split
   into modules: `parser`, `workspace`, `service`, `env`, `skills`, `update`
   (the self-updater that pulls, verifies, and swaps in a GitHub release),
@@ -129,7 +129,8 @@ or live `run=` process under that namespace and skips (reports, does not
 remove) a workspace that still has either, unless `--force-live` is passed.
 This liveness gate also applies to `--force-non-empty` candidates, so both
 flags are required when the recorded directory is non-empty and resources are
-live.
+live. The aggregate `--force` also enables legacy-state compatibility and
+confirmation bypass, so it represents the full destructive prune scope.
 Before a destructive pass inventories Docker, prune acquires every candidate's
 lifecycle lock, the same lock used by `up`, `down`, `clean`, and foreground
 `dev` startup. A concurrent lifecycle command finishes first, then prune

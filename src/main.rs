@@ -15,15 +15,14 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use eph::parser::{self, EphFile, ServiceSource};
-use eph::{
-    Hooks, LogOptions, PruneOptions, PruneReport, RunningService, ServiceManager, Workspace, skills,
-};
+use eph::{Hooks, LogOptions, RunningService, ServiceManager, Workspace, skills};
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitCode};
 use tracing_subscriber::EnvFilter;
 
+mod system_prune;
 mod watch;
 use watch::Watch;
 
@@ -247,32 +246,7 @@ enum Commands {
 #[derive(Subcommand)]
 enum SystemCommand {
     /// Remove resources for deleted or empty workspaces.
-    Prune {
-        /// Print what would be removed without deleting anything.
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Also prune state directories written by eph v0.4.2 and earlier.
-        #[arg(long)]
-        compatibility_v042: bool,
-
-        /// Remove resources for recorded workspace paths that still contain
-        /// files. Live resources still require --force-live.
-        #[arg(long)]
-        force_non_empty: bool,
-
-        /// Remove a stale workspace's resources even if it still has running
-        /// containers or a live `run=` process. Without this, a workspace
-        /// whose recorded path is gone only because it was moved or renamed
-        /// (not truly deleted) is reported and left alone instead of
-        /// force-killed.
-        #[arg(long)]
-        force_live: bool,
-
-        /// Skip the removal confirmation prompt.
-        #[arg(short = 'y', long)]
-        yes: bool,
-    },
+    Prune(system_prune::Args),
 }
 
 /// Skills subcommands. They install the skills bundled into this binary into a
@@ -354,21 +328,7 @@ async fn main() -> Result<ExitCode> {
             .map(|()| ExitCode::SUCCESS),
         Commands::Clean { skip_hooks } => cmd_clean(skip_hooks).await.map(|()| ExitCode::SUCCESS),
         Commands::System { command } => match command {
-            SystemCommand::Prune {
-                dry_run,
-                compatibility_v042,
-                force_non_empty,
-                force_live,
-                yes,
-            } => cmd_system_prune(
-                dry_run,
-                compatibility_v042,
-                force_non_empty,
-                force_live,
-                yes,
-            )
-            .await
-            .map(|()| ExitCode::SUCCESS),
+            SystemCommand::Prune(args) => args.run().await.map(|()| ExitCode::SUCCESS),
         },
         Commands::Dev {
             service,
@@ -634,138 +594,6 @@ async fn cmd_clean(skip_hooks: bool) -> Result<()> {
     );
 
     Ok(())
-}
-
-/// `eph system prune`: report what would be torn down for stale workspaces,
-/// then (unless `--dry-run`) confirm and actually tear it down.
-///
-/// A plain `--dry-run` request is a single pass: list, print, done. A real
-/// prune runs the exact same listing pass first (`dry_run: true` under the
-/// hood) so the confirmation prompt shows precisely what is about to be
-/// removed, including any workspace the liveness guard would skip; only after
-/// that plan is shown and confirmed does a second pass, with `dry_run: false`,
-/// perform the removal. The two passes can in principle race with something
-/// changing on disk or in Docker between them, but `prune` already re-checks
-/// each workspace's staleness right before acting on it, the same protection
-/// a single dry-run-then-prompt-then-act flow would need anyway.
-async fn cmd_system_prune(
-    dry_run: bool,
-    compatibility_v042: bool,
-    force_non_empty: bool,
-    force_live: bool,
-    yes: bool,
-) -> Result<()> {
-    let options = PruneOptions {
-        dry_run: true,
-        compatibility_v042,
-        force_non_empty,
-        force_live,
-    };
-
-    if dry_run {
-        let report = eph::prune(options).await?;
-        print_prune_report(&report);
-        return Ok(());
-    }
-
-    let preview = eph::prune(options).await?;
-    print_prune_report(&preview);
-
-    match eph::confirmation_outcome(!preview.totals.is_empty(), yes, io::stdin().is_terminal()) {
-        eph::ConfirmationOutcome::Proceed => {}
-        eph::ConfirmationOutcome::RequireYes => {
-            anyhow::bail!(
-                "stdin is not a terminal, so system prune cannot prompt for confirmation; pass -y/--yes to remove these resources without asking"
-            );
-        }
-        eph::ConfirmationOutcome::Prompt => {
-            print!("\nRemove these resources? [y/N] ");
-            io::stdout()
-                .flush()
-                .context("failed to write the prune confirmation prompt")?;
-
-            let mut answer = String::new();
-            io::stdin()
-                .read_line(&mut answer)
-                .context("failed to read the prune confirmation")?;
-            let answer = answer.trim();
-            if !answer.eq_ignore_ascii_case("y") && !answer.eq_ignore_ascii_case("yes") {
-                println!("Aborted; nothing removed.");
-                return Ok(());
-            }
-        }
-    }
-
-    let report = eph::prune(PruneOptions {
-        dry_run: false,
-        compatibility_v042,
-        force_non_empty,
-        force_live,
-    })
-    .await?;
-    print_prune_report(&report);
-    Ok(())
-}
-
-fn print_prune_report(report: &PruneReport) {
-    let title = if report.dry_run {
-        "System prune dry run:"
-    } else {
-        "System prune complete:"
-    };
-    println!("{title}");
-
-    if report.pruned.is_empty() {
-        println!("  No stale workspaces found");
-    } else {
-        for workspace in &report.pruned {
-            let path = workspace
-                .workspace_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<workspace metadata unavailable>".to_string());
-            println!("  {} ({}) - {}", workspace.short_id, workspace.reason, path);
-            println!(
-                "    containers: {}, volumes: {}, networks: {}, images: {}, run processes: {}, state dirs: {}",
-                workspace.counts.containers,
-                workspace.counts.volumes,
-                workspace.counts.networks,
-                workspace.counts.images,
-                workspace.counts.processes,
-                workspace.counts.state_dirs
-            );
-        }
-    }
-
-    println!();
-    println!("Totals:");
-    println!("  Containers: {}", report.totals.containers);
-    println!("  Volumes: {}", report.totals.volumes);
-    println!("  Networks: {}", report.totals.networks);
-    println!("  Images: {}", report.totals.images);
-    println!("  Verified run= processes: {}", report.totals.processes);
-    println!("  State directories: {}", report.totals.state_dirs);
-
-    if !report.skipped.is_empty() {
-        println!();
-        println!("Skipped:");
-        for skipped in &report.skipped {
-            let path = skipped
-                .workspace_path
-                .as_ref()
-                .map(|p| format!(" ({})", p.display()))
-                .unwrap_or_default();
-            println!("  {}{} - {}", skipped.short_id, path, skipped.reason);
-        }
-    }
-
-    if !report.warnings.is_empty() {
-        println!();
-        println!("Warnings:");
-        for warning in &report.warnings {
-            println!("  {warning}");
-        }
-    }
 }
 
 /// Why [`cmd_dev`] stopped blocking in the foreground.
@@ -1837,26 +1665,6 @@ mod tests {
         let (global, command) = split_run_argv(&argv).expect("run should split");
         assert!(global.is_empty());
         assert_eq!(command, &args(&["make", "run"])[..]);
-    }
-
-    #[test]
-    fn system_prune_parses_force_non_empty_independently_from_force_live() {
-        let cli = Cli::try_parse_from(["eph", "system", "prune", "--force-non-empty"])
-            .expect("force-non-empty should be a system prune flag");
-
-        let Commands::System {
-            command:
-                SystemCommand::Prune {
-                    force_non_empty,
-                    force_live,
-                    ..
-                },
-        } = cli.command
-        else {
-            panic!("expected system prune");
-        };
-        assert!(force_non_empty);
-        assert!(!force_live);
     }
 
     #[test]
