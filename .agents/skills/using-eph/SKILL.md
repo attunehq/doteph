@@ -226,10 +226,11 @@ app starts. The command substitution above discards partial output.
 
 ## Lifecycle hooks see eph's environment
 
-Four hooks bracket a service, in order: `pre-start` (before it is created),
-`post-start` (after it is healthy), `pre-stop` (before it stops), `post-stop`
-(after it has stopped). All run with the same variables `eph env` emits already
-in their environment, so a database migration or codegen step just works:
+Six hooks bracket a service's lifecycle and full reset. `pre-start` and
+`post-start` surround startup, `pre-stop` and `post-stop` surround ordinary
+teardown, and `pre-clean` and `post-clean` run only for `eph clean`. All run
+with the same variables `eph env` emits already in their environment, so a
+database migration or codegen step just works:
 
 ```ini
 [postgres]
@@ -245,6 +246,9 @@ post-start=psql "$DATABASE_URL" -f schema.sql
 pre-stop=./scripts/backup.sh
 # cleanup eph cannot do itself
 post-stop=rm -rf .cache/scratch
+# destructive reset only
+pre-clean=./scripts/export-before-reset.sh
+post-clean=./scripts/reinitialize-local-state.sh
 
 [env]
 DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
@@ -273,20 +277,30 @@ service depends on, like codegen.
 hook may reference any other service's port (`${redis.port}` resolves even if
 redis started after the service whose hook needs it). `post-stop` runs after its
 service has stopped and sees the same pre-teardown environment as `pre-stop`.
+For a live service, clean runs `pre-clean`, `pre-stop`, stops and removes the
+backend, runs `post-stop`, removes managed named volumes, then runs
+`post-clean`. The clean-specific hooks also run when the service was already
+stopped; ordinary `down` never runs them. Clean retains the last assigned ports
+across `down`, so stopped-service hooks receive the same resolved URLs. A
+reference to a port that has never been assigned is still an error.
 
 `pre-start` and `post-start` run on **every** `eph up` (fresh create *or*
 restart); a failing `pre-start` aborts the `up` before its service starts and a
 failing `post-start` aborts the `up`. A failing `pre-stop` aborts the `down` /
 `clean` and leaves the service running so you can fix and retry; a failing
 `post-stop` aborts the rest of teardown, but its service is already stopped.
+A failing `pre-clean` leaves the service and its volumes intact. A failing
+`post-clean` is reported after those resources are removed, and a later clean
+runs the clean hooks again.
 Write hooks to be idempotent (a migration that no-ops when already applied, an
 `INSERT ... ON CONFLICT` seed). For one-off, non-idempotent work, use `eph run`
 instead.
 
 Pass `--skip-hooks` to skip hooks for one invocation: `eph up --skip-hooks`
 starts services without `pre-start`/`post-start`; `eph down --skip-hooks` /
-`eph clean --skip-hooks` tear down without `pre-stop`/`post-stop` (the escape
-hatch when a broken hook is wedging teardown).
+`eph clean --skip-hooks` tear down without `pre-stop`/`post-stop`; clean also
+skips `pre-clean`/`post-clean` (the escape hatch when a broken hook is wedging
+teardown).
 
 ## Running one-off commands with the environment: `eph run`
 
@@ -321,10 +335,10 @@ backing services (each one's `pre-start` running right before it starts, same
 interleaving as `eph up`), runs the foregrounded app's own `pre-start`, starts
 a `run=` app with eph's own stdin, stdout, and stderr wired through to it, runs
 every service's `post-start` (seeding) once everything is up, and on stop tears
-the stack down: `eph down` by default, or `eph clean` with `--clean` (each
-running `pre-stop` then `post-stop`). Pass `--skip-hooks` to skip all four hook
-phases for the whole session, matching `eph up --skip-hooks` /
-`eph down --skip-hooks`.
+the stack down: `eph down` by default, or `eph clean` with `--clean`. The clean
+form adds `pre-clean` and `post-clean` around each service's stop hooks and
+managed-volume removal. Pass `--skip-hooks` to skip every applicable hook phase
+for the whole session.
 
 **Running `eph dev` yourself? Launch it in the background.** `eph dev` foregrounds
 the app and does not return until the app exits, so running it as an ordinary
@@ -445,6 +459,8 @@ return, so they run as normal commands.
   resources for missing or empty workspace paths. A real prune confirms before
   removal. `--force-non-empty` also selects paths that still contain files, and
   live resources require `--force-live` regardless of how the path was selected.
+  `--force` enables every override and skips confirmation; pair it with
+  `--dry-run` to preview that full scope.
 - **Execution fails closed on unresolved references.** Hooks, service startup,
   health checks, and `eph run` stop before launching a child with a raw eph
   placeholder.

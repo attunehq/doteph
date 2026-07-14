@@ -9,8 +9,8 @@ pieces fit together. For where each decision lives in the code, see
 `eph` is a small Rust CLI built as a thin binary over a reusable library:
 
 - `src/main.rs`: the `clap` front end. Defines the CLI, sets up logging, and
-  dispatches each subcommand to a small `cmd_*` glue function. Nothing here is
-  public API.
+  dispatches each subcommand. `src/system_prune.rs` owns prune-specific CLI
+  options, confirmation, and reporting. Nothing in either file is public API.
 - `src/lib.rs`: the library crate (`eph`) that holds all reusable logic, split
   into modules: `parser`, `workspace`, `service`, `env`, `skills`, `update`
   (the self-updater that pulls, verifies, and swaps in a GitHub release),
@@ -129,7 +129,8 @@ or live `run=` process under that namespace and skips (reports, does not
 remove) a workspace that still has either, unless `--force-live` is passed.
 This liveness gate also applies to `--force-non-empty` candidates, so both
 flags are required when the recorded directory is non-empty and resources are
-live.
+live. The aggregate `--force` also enables legacy-state compatibility and
+confirmation bypass, so it represents the full destructive prune scope.
 Before a destructive pass inventories Docker, prune acquires every candidate's
 lifecycle lock, the same lock used by `up`, `down`, `clean`, and foreground
 `dev` startup. A concurrent lifecycle command finishes first, then prune
@@ -293,7 +294,7 @@ With no health check, `eph` waits a fixed 500 ms and proceeds.
 
 ## Lifecycle hooks
 
-Four hooks bracket a service, all run on the host via the platform shell in
+Six hooks bracket a service, all run on the host via the platform shell in
 the workspace directory:
 
 - `pre-start` runs just before a service is created, in phase 1 of `eph up`,
@@ -320,8 +321,16 @@ the workspace directory:
   itself. It sees the same pre-teardown snapshot as `pre-stop`. A failure is
   propagated and aborts the rest of teardown; because the service is already
   stopped, a later `down` will not re-run it.
+- `pre-clean` and `post-clean` run only for `eph clean`, including when the
+  service is already stopped. For each service, `pre-clean` precedes the
+  `pre-stop`/stop/`post-stop` sequence, and `post-clean` follows managed-volume
+  removal. A pre-clean failure leaves that service's resources intact; a
+  post-clean failure is propagated after its resources have been removed.
+  Clean retains the last assigned ports across ordinary teardown so these hooks
+  receive the same resolved snapshot after `down`; a reference for a service
+  that has never had an assigned port remains a strict resolution error.
 
-All four receive eph's resolved environment (the `eph env` variables, `EPH_*`
+All six receive eph's resolved environment (the `eph env` variables, `EPH_*`
 metadata, and the service's own `env.X`); `eph run` exposes the same
 environment to arbitrary commands. Every execution boundary uses tracked,
 strict interpolation: an unresolved runtime reference is an error before a
