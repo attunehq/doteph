@@ -9,6 +9,7 @@ the source. See [Architecture](architecture.md) for the rationale.
 ```text
 src/
   main.rs        clap front end and command dispatch
+  system_prune.rs system prune CLI options, confirmation, and reporting
   watch.rs       binary-side watcher for eph dev --watch
   lib.rs         public library surface
   parser.rs      .eph parser, checked types, roles, interpolation
@@ -210,7 +211,8 @@ An 8-hex state directory without workspace metadata requires
 destructive pass also holds every candidate's `WorkspaceLock` before loading
 the shared Docker inventory, which serializes prune against `up`, `down`,
 `clean`, and foreground `dev` startup without returning to per-workspace Docker
-listings.
+listings. The binary-side `system_prune` module resolves `--force` into all
+three scope overrides plus confirmation bypass before it calls the library.
 
 ## env
 

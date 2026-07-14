@@ -168,7 +168,7 @@ can never wedge a later command.
 
 Two commands manage state directories in bulk: `eph clean` deletes the state
 directory for the current workspace along with its services and data, and
-[`eph system prune`](command-reference.md#eph-system-prune---dry-run---compatibility-v042---force-non-empty---force-live--y---yes)
+[`eph system prune`](command-reference.md#eph-system-prune---dry-run---force---compatibility-v042---force-non-empty---force-live--y---yes)
 scans **all** state directories and removes leftovers for workspaces whose
 directory has since been deleted (a worktree you removed, for example). A
 successful `eph up` checks for exactly that situation in other workspaces (a
