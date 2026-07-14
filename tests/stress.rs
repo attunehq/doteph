@@ -623,3 +623,45 @@ async fn source_type_compose() {
     ws.clean().await;
     assert_no_containers(&prefix).await;
 }
+
+/// A lost state file must not move `post-clean` ahead of Compose resource
+/// removal. The hook records the containers visible during its own execution,
+/// so an empty file proves the recovery sweep completed first.
+#[tokio::test]
+#[ignore = "stress: heavyweight, requires Docker + compose v2"]
+async fn compose_post_clean_follows_recovery_without_state() {
+    prepull_images(&[REDIS_IMAGE]).await;
+
+    let ws =
+        TestWorkspace::new("[cache]\ncompose=docker-compose.yml\npost-clean=echo placeholder\n");
+    ws.write_file(
+        "docker-compose.yml",
+        "services:\n  redis:\n    image: redis:7-alpine\n",
+    );
+    let prefix = container_prefix(&ws).await;
+    let project = format!("{prefix}-cache");
+    ws.write_file(
+        ".eph",
+        &format!(
+            "[cache]\ncompose=docker-compose.yml\npost-clean=docker ps -a --filter name={project} --format {{{{.Names}}}} > post-clean-containers\n"
+        ),
+    );
+
+    ws.eph_ok(&["up"]).await;
+    let info = ws.eph_ok(&["info"]).await;
+    let state_dir = info
+        .lines()
+        .find_map(|line| line.strip_prefix("State directory: "))
+        .expect("info should print the state directory");
+    std::fs::remove_file(std::path::Path::new(state_dir).join("state.json"))
+        .expect("state.json should exist after up");
+
+    ws.clean().await;
+    let visible = std::fs::read_to_string(ws.path().join("post-clean-containers"))
+        .expect("post-clean should record the containers visible during the hook");
+    assert!(
+        visible.trim().is_empty(),
+        "post-clean ran while Compose containers still existed: {visible}"
+    );
+    assert_no_containers(&prefix).await;
+}

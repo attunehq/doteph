@@ -222,6 +222,8 @@ service metadata and are rejected in top-level variables, `[env]`, and
 | `post-start=` | yes | Hook run after every service in the `up` is healthy. |
 | `pre-stop=` | yes | Hook run before the service is stopped. |
 | `post-stop=` | yes | Hook run after the service has stopped. |
+| `pre-clean=` | yes | Hook run before the service is fully cleaned. Only runs for `eph clean`. |
+| `post-clean=` | yes | Hook run after the service and its managed volumes have been removed. Only runs for `eph clean`. |
 | `expose.<alias>=` | one per distinct alias | For `compose=`: expose `<compose-service>:<container-port>` for interpolation. The short form `<container-port>` targets the Compose service named by the alias. Illegal on every other source. |
 
 "Repeatable" means the property can appear multiple times and every value is
@@ -334,7 +336,7 @@ is ready. `ready-timeout` defaults to 30 seconds, or 60 for compose services.
 
 ## Lifecycle hooks
 
-Four hooks bracket a service's life. This section is the authoritative
+Six hooks bracket a service's life and full reset. This section is the authoritative
 reference for how they behave.
 
 | Hook | Runs | Typical use |
@@ -343,8 +345,10 @@ reference for how they behave.
 | `post-start=` | after every service in the `up` is healthy | migrations, seeding |
 | `pre-stop=` | before the service stops | backup, drain |
 | `post-stop=` | after the service has stopped | cleanup eph cannot do itself |
+| `pre-clean=` | before clean starts the service's teardown | export data before a destructive reset |
+| `post-clean=` | after the service and its managed volumes are removed | rebuild local state after a reset |
 
-All four run on the host through the platform shell (`sh -c` on Unix, `cmd /C`
+All six run on the host through the platform shell (`sh -c` on Unix, `cmd /C`
 on Windows), in the workspace root. Each is repeatable, and repeated hooks run
 in order:
 
@@ -358,6 +362,8 @@ post-start=./scripts/seed.sh
 pre-stop=./scripts/drain.sh
 # Tear down a scratch bucket eph never created and cannot clean up.
 post-stop=./scripts/drop-scratch-bucket.sh
+pre-clean=./scripts/export-before-reset.sh
+post-clean=./scripts/reinitialize-local-state.sh
 
 [postgres]
 image=postgres:16-alpine
@@ -387,6 +393,11 @@ Hooks run with eph's resolved environment injected, layered in this order
    `EPH_<SERVICE>_CONTAINER`. Service names are upper-cased with `-` replaced
    by `_`, so `auth-db` becomes `EPH_AUTH_DB_PORT`.
 3. The owning service's own `env.X=` values.
+
+Clean hooks reuse the last ports eph assigned before `down`, so an
+already-stopped service sees the same resolved URLs it had while running. If a
+referenced service has never had a port assignment, clean reports the unresolved
+reference before launching the hook.
 
 The same environment is available outside hooks via
 [`eph run`](command-reference.md#eph-run-cmd), which runs an arbitrary command
@@ -427,11 +438,27 @@ with these variables set.
   the rest of the teardown, but its own service is already stopped, so a later
   `eph down` will not re-run it; fix the cleanup and run it by hand.
 
+### Clean hooks: `pre-clean` and `post-clean`
+
+- **They run only for `eph clean`.** `eph down`, including `eph down --rm`,
+  never runs them. They run for every declared service even if that service is
+  already stopped, because clean can still remove its container, volumes, and
+  persisted state.
+- **`pre-clean` runs before the service's teardown hooks.** A live service
+  therefore follows `pre-clean`, `pre-stop`, stop and removal, `post-stop`,
+  managed-volume removal, then `post-clean`. A failing `pre-clean` aborts before
+  the service is stopped or its volumes are deleted.
+- **`post-clean` runs after the service and its managed named volumes are
+  removed.** A failure aborts the rest of clean, but resources already removed
+  stay removed. Re-running `eph clean` runs the clean hooks again, including for
+  an already-stopped service.
+
 ### Skipping hooks
 
 `--skip-hooks` on `eph up` skips `pre-start` and `post-start`; on `eph down`
-and `eph clean` it skips `pre-stop` and `post-stop`. It is the escape hatch for
-a broken hook that is wedging startup or teardown.
+it skips `pre-stop` and `post-stop`; on `eph clean` it skips the stop hooks and
+the clean-specific hooks. It is the escape hatch for a broken hook that is
+wedging startup or teardown.
 
 ## Roles and ordering
 
@@ -608,7 +635,7 @@ Two different things happen at two different times:
   addressing the sibling on a shared Docker network by its container name and
   **container** port, not through eph's interpolated, host-facing value.
 
-`run=` and hook (`pre-start`/`post-start`/`pre-stop`/`post-stop`) command
+`run=` and hook (`pre-start`/`post-start`/`pre-stop`/`post-stop`/`pre-clean`/`post-clean`) command
 strings are shell commands, so `${VAR}` there belongs to the shell rather than
 eph. Health checks preserve ordinary shell forms such as `${PORT}` too, while
 recognizing, validating, and resolving dotted eph references such as

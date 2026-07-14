@@ -9,6 +9,7 @@ the source. See [Architecture](architecture.md) for the rationale.
 ```text
 src/
   main.rs        clap front end and command dispatch
+  system_prune.rs system prune CLI options, confirmation, and reporting
   watch.rs       binary-side watcher for eph dev --watch
   lib.rs         public library surface
   parser.rs      .eph parser, checked types, roles, interpolation
@@ -161,7 +162,10 @@ affected keys, and the command exits non-zero.
 `down` stops recorded backends in reverse order and preserves config records so
 stopped resources can be reconciled on the next `up`. `down --rm` removes direct
 containers. Compose always uses `compose down`. `clean` also removes declared
-named volumes, sweeps namespaced leftovers, and deletes workspace state.
+named volumes, sweeps namespaced leftovers, and deletes workspace state. Each
+declared service's `pre-clean` runs before its stop hooks, while `post-clean`
+runs after its backend and managed volumes are removed. These clean-only hooks
+are not gated on liveness, so a clean after `down` still runs them.
 
 Logs use Docker or Compose for container backends and captured files for `run=`.
 The all-services path streams concurrently and tags lines; the one-service path
@@ -207,7 +211,8 @@ An 8-hex state directory without workspace metadata requires
 destructive pass also holds every candidate's `WorkspaceLock` before loading
 the shared Docker inventory, which serializes prune against `up`, `down`,
 `clean`, and foreground `dev` startup without returning to per-workspace Docker
-listings.
+listings. The binary-side `system_prune` module resolves `--force` into all
+three scope overrides plus confirmation bypass before it calls the library.
 
 ## env
 
