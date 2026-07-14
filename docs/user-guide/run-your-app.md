@@ -127,12 +127,14 @@ What it does, in order:
    started itself**, and leaves anything that was already running (a
    prewarmed dependency tier, say) untouched.
 
-`--skip-hooks` skips all four hook phases for the whole session (bring-up and
-teardown alike), matching `eph up --skip-hooks` and `eph down --skip-hooks`.
+`--skip-hooks` skips every applicable hook phase for the whole session,
+including clean-specific hooks when used with `--clean`.
 
 The teardown default is `eph down`: containers and data stay for a fast next
 launch. Pass `--clean` to end with a full `eph clean` instead, dropping named
-volumes and their data for a pristine next run.
+volumes and their data for a pristine next run. That final reset also runs each
+service's `pre-clean` and `post-clean` hooks around its ordinary stop hooks and
+managed-volume removal.
 
 If the app crashes, `eph dev` exits non-zero and leaves the backing services
 up; `eph down` stops them when you are done. A hard kill of eph itself

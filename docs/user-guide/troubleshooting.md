@@ -66,8 +66,8 @@ catches it before any `eph up`. Two shapes show up in practice:
   ```
   unknown service property 'prot' at line 5 (known properties: image,
   dockerfile, compose, run, role, command, port, port.<name>, expose.<name>,
-  env.<KEY>, volume, pre-start, post-start, pre-stop, post-stop, healthcheck,
-  ready-timeout, context)
+  env.<KEY>, volume, pre-start, post-start, pre-stop, post-stop, pre-clean,
+  post-clean, healthcheck, ready-timeout, context)
   ```
 
   Property names are lowercase: `image`, `port`, `env.X`, `healthcheck`,
@@ -158,7 +158,7 @@ Fixes:
 - Move one-off or destructive work out of the hook and run it explicitly with
   [`eph run`](command-reference.md#eph-run-cmd) when you actually want it.
 
-## `eph down` or `eph clean` fails on a `pre-stop` or `post-stop` hook
+## `eph down` or `eph clean` fails on a stop or clean hook
 
 A failing `pre-stop` hook **aborts** the teardown and leaves the service
 running, so the hook (a backup, a drain) can be fixed and retried rather than
@@ -171,6 +171,11 @@ will not run that `post-stop` again. If a broken hook is wedging teardown:
   for example with [`eph run`](command-reference.md#eph-run-cmd).
 - Or skip the hooks for this teardown: `eph down --skip-hooks` or
   `eph clean --skip-hooks`.
+
+For `eph clean`, a failing `pre-clean` leaves the service and its volumes
+untouched. A failing `post-clean` is reported after that service and its managed
+volumes are removed. Clean hooks run again on the next `eph clean`, even when
+the service is already stopped.
 
 ## A port reference did not resolve
 

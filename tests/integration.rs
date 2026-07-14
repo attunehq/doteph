@@ -1617,6 +1617,141 @@ post-stop=exit 1
     );
 }
 
+/// Clean-specific hooks run only for `eph clean`, even when the service was
+/// already stopped, and bracket the ordinary teardown hooks when it is live.
+#[tokio::test]
+async fn clean_hooks_run_only_for_clean_and_bracket_teardown() {
+    let ws = TestWorkspace::new(&format!(
+        r#"
+[app]
+run={}
+pre-clean={}
+pre-stop={}
+post-stop={}
+post-clean={}
+"#,
+        run_sleep(300),
+        hook_append("preclean", "hook-order"),
+        hook_append("prestop", "hook-order"),
+        hook_append("poststop", "hook-order"),
+        hook_append("postclean", "hook-order")
+    ));
+
+    ws.eph_ok(&["up"]).await;
+    ws.eph_ok(&["down"]).await;
+
+    let down_order = std::fs::read_to_string(ws.path().join("hook-order"))
+        .expect("the stop hooks should record their order");
+    assert!(down_order.contains("prestop"));
+    assert!(down_order.contains("poststop"));
+    assert!(!down_order.contains("preclean"));
+    assert!(!down_order.contains("postclean"));
+
+    std::fs::write(ws.path().join("hook-order"), "").unwrap();
+    ws.eph_ok(&["clean"]).await;
+    let stopped_clean_order = std::fs::read_to_string(ws.path().join("hook-order"))
+        .expect("clean hooks should run for a stopped service");
+    assert!(stopped_clean_order.contains("preclean"));
+    assert!(stopped_clean_order.contains("postclean"));
+    assert!(!stopped_clean_order.contains("prestop"));
+    assert!(!stopped_clean_order.contains("poststop"));
+
+    std::fs::write(ws.path().join("hook-order"), "").unwrap();
+    ws.eph_ok(&["up"]).await;
+    ws.eph_ok(&["clean"]).await;
+    let clean_order = std::fs::read_to_string(ws.path().join("hook-order"))
+        .expect("clean and stop hooks should record their order");
+    let pre_clean = clean_order.find("preclean").unwrap();
+    let pre_stop = clean_order.find("prestop").unwrap();
+    let post_stop = clean_order.find("poststop").unwrap();
+    let post_clean = clean_order.find("postclean").unwrap();
+    assert!(
+        pre_clean < pre_stop && pre_stop < post_stop && post_stop < post_clean,
+        "expected pre-clean, pre-stop, post-stop, post-clean; got {clean_order:?}"
+    );
+}
+
+/// Clean hooks retain the last resolved environment after `down`, including a
+/// container's dynamically assigned host port, instead of failing before the
+/// hook launches because the service is no longer live.
+#[tokio::test]
+async fn clean_hooks_resolve_last_ports_after_down() {
+    let ws = TestWorkspace::new(&format!(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+pre-clean={}
+post-clean={}
+
+[env]
+REDIS_URL=redis://localhost:${{redis.port}}
+"#,
+        hook_write_var("REDIS_URL", "pre-clean-url"),
+        hook_write_var("REDIS_URL", "post-clean-url")
+    ));
+
+    ws.eph_ok(&["up"]).await;
+    let expected = ws
+        .env_json()
+        .await
+        .get("REDIS_URL")
+        .expect("REDIS_URL should resolve while redis is running")
+        .clone();
+    ws.eph_ok(&["down"]).await;
+    ws.eph_ok(&["clean"]).await;
+
+    for file in ["pre-clean-url", "post-clean-url"] {
+        let actual = std::fs::read_to_string(ws.path().join(file))
+            .unwrap_or_else(|error| panic!("failed to read {file}: {error}"));
+        assert_eq!(actual.trim(), expected);
+    }
+}
+
+/// A failed pre-clean preserves the service, while a failed post-clean is
+/// reported after its resources are gone. `--skip-hooks` remains the escape
+/// hatch for either failure.
+#[tokio::test]
+async fn clean_hook_failures_preserve_phase_semantics() {
+    let ws = TestWorkspace::new(&format!(
+        "[app]\nrun={}\npre-clean=exit 1\n",
+        run_sleep(300)
+    ));
+    ws.eph_ok(&["up"]).await;
+
+    let failed_pre = ws.eph(&["clean"]).await;
+    assert!(!failed_pre.status.success());
+    let stderr = String::from_utf8_lossy(&failed_pre.stderr);
+    assert!(
+        stderr.contains("pre-clean hook failed"),
+        "expected a pre-clean failure message, got: {stderr}"
+    );
+    let status = ws.eph_ok(&["status"]).await;
+    assert!(
+        status.contains("app"),
+        "pre-clean failure should leave the service running: {status}"
+    );
+
+    ws.write_file(
+        ".eph",
+        &format!("[app]\nrun={}\npost-clean=exit 1\n", run_sleep(300)),
+    );
+    let failed_post = ws.eph(&["clean"]).await;
+    assert!(!failed_post.status.success());
+    let stderr = String::from_utf8_lossy(&failed_post.stderr);
+    assert!(
+        stderr.contains("post-clean hook failed"),
+        "expected a post-clean failure message, got: {stderr}"
+    );
+    let status = ws.eph_ok(&["status"]).await;
+    assert!(
+        status.contains("No services running"),
+        "post-clean failure should happen after teardown: {status}"
+    );
+
+    ws.eph_ok(&["clean", "--skip-hooks"]).await;
+}
+
 // ============================================================================
 // eph run
 // ============================================================================

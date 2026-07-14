@@ -452,6 +452,11 @@ pub(crate) struct ServiceState {
     /// restarts and reboots. `eph clean` resets it along with the rest of state.
     #[serde(default)]
     pub(crate) auto_ports: HashMap<String, HashMap<String, u16>>,
+    /// The last host ports observed for each service. These survive `eph down`
+    /// so clean-only hooks can resolve the same environment after ordinary
+    /// teardown has removed the live service record.
+    #[serde(default)]
+    last_ports: HashMap<String, HashMap<String, u16>>,
     /// The runtime configuration and backend most recently created for each
     /// service. These records survive `eph down`: stopped containers still
     /// exist, and accepting one without knowing which configuration created it
@@ -3737,12 +3742,13 @@ impl ServiceManager {
             }
         }
 
-        let stopped_something = if let Some(backend) = self
+        let recorded = self
             .state
             .services
             .get(name)
-            .map(|entry| entry.backend.clone())
-        {
+            .map(|entry| (entry.backend.clone(), entry.ports.clone()));
+        let stopped_something = if let Some((backend, ports)) = recorded {
+            self.state.last_ports.insert(name.to_string(), ports);
             self.stop_recorded_backend(name, &backend, remove).await?
         } else if matches!(
             service.source,
@@ -3816,6 +3822,27 @@ impl ServiceManager {
         Ok(stopped)
     }
 
+    /// Remove containers and volumes whose names begin with `prefix`.
+    ///
+    /// State can disappear before Docker resources do. Keeping the fallback in
+    /// one place lets clean establish the post-clean boundary from Docker's
+    /// observable resources instead of trusting persisted state alone.
+    async fn sweep_docker_leftovers(&self, prefix: &str, summary: &mut CleanSummary) -> Result<()> {
+        for container in self.docker.containers_with_prefix(prefix).await? {
+            info!("Removing leftover container {}", container);
+            if self.docker.remove_container(&container).await? {
+                summary.services_removed += 1;
+            }
+        }
+        for volume in self.docker.volumes_with_prefix(prefix).await? {
+            info!("Removing leftover volume {}", volume);
+            if self.docker.remove_volume(&volume).await? {
+                summary.volumes_removed += 1;
+            }
+        }
+        Ok(())
+    }
+
     /// Names present in recorded state but absent from the `.eph` file, in a
     /// stable order.
     fn orphaned_state_entries(&self, eph: &EphFile) -> Vec<String> {
@@ -3836,14 +3863,14 @@ impl ServiceManager {
     ///
     /// Returns a [`CleanSummary`] describing what was removed.
     ///
-    /// When `skip_hooks` is true, `pre-stop` and `post-stop` hooks are not run,
-    /// so a broken hook cannot block the reset.
+    /// When `skip_hooks` is true, neither the clean-specific hooks nor the
+    /// teardown hooks are run, so a broken hook cannot block the reset.
     ///
     /// # Errors
     ///
-    /// Returns an error if a `pre-stop` or `post-stop` hook fails (unless
-    /// `skip_hooks`), if stopping a service, removing a named volume, or deleting
-    /// the state directory fails.
+    /// Returns an error if a lifecycle hook fails (unless `skip_hooks`), if
+    /// stopping a service, removing a named volume, or deleting the state
+    /// directory fails.
     pub async fn clean(&mut self, eph: &EphFile, skip_hooks: bool) -> Result<CleanSummary> {
         let mut lock = WorkspaceLock::open(&self.workspace)?;
         let _guard = lock.acquire()?;
@@ -3852,9 +3879,33 @@ impl ServiceManager {
 
         let mut summary = CleanSummary::default();
 
-        // Snapshot running services once so pre-stop and post-stop hooks see the
-        // full environment as it was before teardown began.
+        // Keep liveness separate from environment resolution: stop hooks run
+        // only for services that are actually live, while clean hooks also run
+        // after `down` and need remembered ports.
         let running = self.status().await?;
+        let mut clean_hook_services = running.clone();
+        // `down` removes live service records, but clean hooks still need the
+        // last environment eph resolved for those services. Merge persisted
+        // port snapshots without replacing any current live assignment.
+        for (name, ports) in &self.state.last_ports {
+            clean_hook_services
+                .entry(name.clone())
+                .or_insert_with(|| RunningService {
+                    name: name.clone(),
+                    ports: ports.clone(),
+                });
+        }
+        // An externally stopped service can still have a state entry without
+        // appearing in `status`; its recorded ports are equally authoritative
+        // for the clean-only hook snapshot.
+        for (name, entry) in &self.state.services {
+            clean_hook_services
+                .entry(name.clone())
+                .or_insert_with(|| RunningService {
+                    name: name.clone(),
+                    ports: entry.ports.clone(),
+                });
+        }
 
         // Reverse of the actual start order, matching `stop_all`: tear a
         // dependent down before the dependency it relies on. The summary counts
@@ -3862,6 +3913,16 @@ impl ServiceManager {
         // `clean` of a workspace that never ran reports zeros.
         for name in start_order(eph).into_iter().rev() {
             let service = &eph.services[name];
+            if !skip_hooks && !service.pre_clean.is_empty() {
+                info!("Running pre-clean hooks for {}", name);
+                let env = self.hook_env(eph, &clean_hook_services, service)?;
+                for cmd in &service.pre_clean {
+                    self.run_hook(cmd, &env)
+                        .await
+                        .with_context(|| format!("pre-clean hook failed for service '{}'", name))?;
+                }
+            }
+
             // Stop and remove the underlying resource for this service.
             if self
                 .stop_service(name, service, true, eph, &running, skip_hooks)
@@ -3888,6 +3949,25 @@ impl ServiceManager {
                     summary.volumes_removed += 1;
                 }
             }
+
+            // Compose resources use the deterministic project prefix but may
+            // outlive a missing or corrupt state record. Sweep this service's
+            // project before post-clean so the hook's ordering guarantee holds
+            // on recovery paths as well as the recorded-state path.
+            if matches!(service.source, ServiceSource::Compose(_)) {
+                let prefix = format!("{}-", self.workspace.container_name(name));
+                self.sweep_docker_leftovers(&prefix, &mut summary).await?;
+            }
+
+            if !skip_hooks && !service.post_clean.is_empty() {
+                info!("Running post-clean hooks for {}", name);
+                let env = self.hook_env(eph, &clean_hook_services, service)?;
+                for cmd in &service.post_clean {
+                    self.run_hook(cmd, &env).await.with_context(|| {
+                        format!("post-clean hook failed for service '{}'", name)
+                    })?;
+                }
+            }
         }
 
         // Stop anything recorded in state under a name no longer in the file
@@ -3904,24 +3984,14 @@ impl ServiceManager {
         // `clean` promises a full reset, so it cannot trust state (or the
         // current .eph file) to know everything that exists.
         let prefix = format!("eph-{}-", self.workspace.short_id);
-        for container in self.docker.containers_with_prefix(&prefix).await? {
-            info!("Removing leftover container {}", container);
-            if self.docker.remove_container(&container).await? {
-                summary.services_removed += 1;
-            }
-        }
-        for volume in self.docker.volumes_with_prefix(&prefix).await? {
-            info!("Removing leftover volume {}", volume);
-            if self.docker.remove_volume(&volume).await? {
-                summary.volumes_removed += 1;
-            }
-        }
+        self.sweep_docker_leftovers(&prefix, &mut summary).await?;
 
         // Clear in-memory state. `clean` is a full reset, so unlike `down` it
         // also drops the remembered auto-port assignments, letting the next `up`
         // pick fresh ports.
         self.state.services.clear();
         self.state.auto_ports.clear();
+        self.state.last_ports.clear();
         self.state.service_configs.clear();
 
         // Remove the persisted state file (and its directory).
@@ -4551,7 +4621,7 @@ impl ServiceManager {
     }
 
     /// The environment overlaid on a lifecycle hook (`pre-start`, `post-start`,
-    /// `pre-stop`, `post-stop`).
+    /// `pre-stop`, `post-stop`, `pre-clean`, `post-clean`).
     ///
     /// This is [`command_env`](Self::command_env) plus the owning service's own
     /// `env.X` values, which take precedence. A `post-start` hook for a database

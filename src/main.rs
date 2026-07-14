@@ -75,14 +75,14 @@ enum Commands {
         #[arg(short = 'r', long = "rm")]
         rm: bool,
 
-        /// Stop services without running their pre-stop hooks
+        /// Stop services without running pre-stop or post-stop hooks
         #[arg(long = "skip-hooks")]
         skip_hooks: bool,
     },
 
     /// Stop and remove all services, named volumes, and persisted state
     Clean {
-        /// Tear everything down without running pre-stop hooks
+        /// Tear everything down without running clean or stop hooks
         #[arg(long = "skip-hooks")]
         skip_hooks: bool,
     },
@@ -138,7 +138,7 @@ enum Commands {
         watch: Vec<String>,
 
         /// Bring the stack up and tear it down without running any lifecycle
-        /// hooks, matching `eph up --skip-hooks` / `eph down --skip-hooks`.
+        /// hooks, including clean hooks when combined with `--clean`.
         #[arg(long = "skip-hooks")]
         skip_hooks: bool,
     },

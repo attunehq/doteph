@@ -139,7 +139,7 @@ volume**, and deletes the persisted state directory.
 
 | Flag | Description |
 |------|-------------|
-| `--skip-hooks` | Tear everything down without running `pre-stop` or `post-stop` hooks. |
+| `--skip-hooks` | Tear everything down without running `pre-clean`, `pre-stop`, `post-stop`, or `post-clean` hooks. |
 
 ```sh
 eph clean
@@ -161,8 +161,12 @@ workspace whose services never started reports zeros across the board.
 > never touched, and volumes internal to a Compose file are left to
 > `docker compose`.
 
-Like `eph down`, `clean` runs each service's teardown hooks, and a failing
-hook aborts the reset; `--skip-hooks` is the escape hatch.
+For each declared service, `clean` runs `pre-clean`, then the same
+`pre-stop`/`post-stop` teardown as `down`, removes managed named volumes, and
+runs `post-clean`. Clean hooks run even for an already-stopped service. A
+failing `pre-clean` leaves that service untouched; a failing `post-clean` is
+reported after its resources are removed. `--skip-hooks` bypasses all four
+phases.
 
 Behavior beyond the declared services:
 
@@ -322,8 +326,9 @@ Behavior:
   immediately before it starts, seeing every backing service's assigned port.
   `post-start` hooks for every service, foreground app included, run together
   in a second phase once everything is up, so a `post-start` hook may
-  reference any service's port. `--skip-hooks` skips all four hook phases for
-  both bring-up and teardown.
+  reference any service's port. Final teardown runs stop hooks and, under
+  `--clean`, the clean-specific hooks too. `--skip-hooks` skips every
+  applicable phase.
 - On stop (the preview server's stop, or Ctrl-C), only the services `eph dev`
   started itself are torn down; services that were already running when it
   began (a prewarmed tier) are left up. A hard kill (`SIGKILL`) cannot run
