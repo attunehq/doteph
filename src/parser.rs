@@ -322,6 +322,10 @@ pub struct Service {
     pub pre_stop: Vec<String>,
     /// Commands to run after the service has stopped
     pub post_stop: Vec<String>,
+    /// Destructive-reset preparation that ordinary teardown must not trigger
+    pub pre_clean: Vec<String>,
+    /// Recovery work reserved for after managed resources have been removed
+    pub post_clean: Vec<String>,
     /// Readiness probe and its optional timeout.
     ///
     /// Keeping the timeout with the probe prevents a parsed service from
@@ -465,7 +469,7 @@ impl PortMapping {
 /// The names of every property a service section accepts, for error messages.
 const KNOWN_PROPERTIES: &str = "image, dockerfile, compose, run, role, command, port, \
      port.<name>, expose.<name>, env.<KEY>, volume, pre-start, post-start, pre-stop, \
-     post-stop, healthcheck, ready-timeout, context";
+     post-stop, pre-clean, post-clean, healthcheck, ready-timeout, context";
 
 /// What the parser is currently reading: top-of-file variables, an `[env]`
 /// section, the `[roles_order]` section, or a service section.
@@ -516,6 +520,8 @@ struct ServiceBuilder {
     post_start: Vec<String>,
     pre_stop: Vec<String>,
     post_stop: Vec<String>,
+    pre_clean: Vec<String>,
+    post_clean: Vec<String>,
     healthcheck: Option<String>,
     ready_timeout_secs: Option<NonZeroU64>,
     build_context: Option<String>,
@@ -628,6 +634,8 @@ impl ServiceBuilder {
             post_start: self.post_start,
             pre_stop: self.pre_stop,
             post_stop: self.post_stop,
+            pre_clean: self.pre_clean,
+            post_clean: self.post_clean,
             healthcheck: self.healthcheck.map(|command| Healthcheck {
                 command,
                 timeout_secs: self.ready_timeout_secs,
@@ -1427,6 +1435,8 @@ fn parse_service_property(
             | "post-start"
             | "pre-stop"
             | "post-stop"
+            | "pre-clean"
+            | "post-clean"
             | "healthcheck"
             | "context"
     );
@@ -1495,6 +1505,12 @@ fn parse_service_property(
         }
         "post-stop" => {
             service.post_stop.push(value.to_string());
+        }
+        "pre-clean" => {
+            service.pre_clean.push(value.to_string());
+        }
+        "post-clean" => {
+            service.post_clean.push(value.to_string());
         }
         "healthcheck" => {
             scan_command_placeholders(
@@ -1903,6 +1919,9 @@ post-start=./scripts/seed.sh
 pre-stop=./scripts/drain.sh
 post-stop=rm -rf ./tmp/scratch
 post-stop=./scripts/deregister.sh
+pre-clean=./scripts/export-before-reset.sh
+post-clean=./scripts/reinitialize-local-state.sh
+post-clean=./scripts/notify-reset.sh
 "#;
         let result = parse(input).unwrap();
         let api = result.services.get("api").unwrap();
@@ -1912,6 +1931,14 @@ post-stop=./scripts/deregister.sh
         assert_eq!(
             api.post_stop,
             ["rm -rf ./tmp/scratch", "./scripts/deregister.sh"]
+        );
+        assert_eq!(api.pre_clean, ["./scripts/export-before-reset.sh"]);
+        assert_eq!(
+            api.post_clean,
+            [
+                "./scripts/reinitialize-local-state.sh",
+                "./scripts/notify-reset.sh"
+            ]
         );
     }
 

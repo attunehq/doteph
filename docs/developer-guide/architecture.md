@@ -293,7 +293,7 @@ With no health check, `eph` waits a fixed 500 ms and proceeds.
 
 ## Lifecycle hooks
 
-Four hooks bracket a service, all run on the host via the platform shell in
+Six hooks bracket a service, all run on the host via the platform shell in
 the workspace directory:
 
 - `pre-start` runs just before a service is created, in phase 1 of `eph up`,
@@ -320,8 +320,16 @@ the workspace directory:
   itself. It sees the same pre-teardown snapshot as `pre-stop`. A failure is
   propagated and aborts the rest of teardown; because the service is already
   stopped, a later `down` will not re-run it.
+- `pre-clean` and `post-clean` run only for `eph clean`, including when the
+  service is already stopped. For each service, `pre-clean` precedes the
+  `pre-stop`/stop/`post-stop` sequence, and `post-clean` follows managed-volume
+  removal. A pre-clean failure leaves that service's resources intact; a
+  post-clean failure is propagated after its resources have been removed.
+  Clean retains the last assigned ports across ordinary teardown so these hooks
+  receive the same resolved snapshot after `down`; a reference for a service
+  that has never had an assigned port remains a strict resolution error.
 
-All four receive eph's resolved environment (the `eph env` variables, `EPH_*`
+All six receive eph's resolved environment (the `eph env` variables, `EPH_*`
 metadata, and the service's own `env.X`); `eph run` exposes the same
 environment to arbitrary commands. Every execution boundary uses tracked,
 strict interpolation: an unresolved runtime reference is an error before a

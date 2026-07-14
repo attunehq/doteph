@@ -202,13 +202,16 @@ removed before `up` returns, so the next attempt cannot adopt a broken leftover.
 
 ### Hooks bracket the lifecycle
 
-Each service can declare four hooks: `pre-start`, `post-start`, `pre-stop`, and
-`post-stop`. During `eph up`, each service's `pre-start` hooks run just before
-it is created (codegen, generated config), and once **every** service in the
+Each service can declare six hooks: `pre-start`, `post-start`, `pre-stop`,
+`post-stop`, `pre-clean`, and `post-clean`. During `eph up`, each service's
+`pre-start` hooks run just before it is created (codegen, generated config), and
+once **every** service in the
 `up` is healthy, all `post-start` hooks run in a second phase (migrations,
 seeds). Deferring `post-start` this way means a hook can reference any other
 service's assigned port. Teardown mirrors it: `pre-stop` before a service stops
-(backup, drain), `post-stop` after.
+(backup, drain), `post-stop` after. `eph clean` wraps that teardown with
+`pre-clean` before the stop hooks and `post-clean` after the backend and managed
+volumes are removed. Clean hooks also run for an already-stopped service.
 
 Two rules matter here; the full contract lives in
 [The `.eph` File](eph-file.md#lifecycle-hooks):
