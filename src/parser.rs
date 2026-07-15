@@ -1091,7 +1091,7 @@ fn validate_roles(
 /// metadata variables (where uppercasing and `-` -> `_` mapping must stay
 /// collision-free; allowing both `-` and `_` would let `auth-db` and `auth_db`
 /// collide).
-fn is_valid_service_name(name: &str) -> bool {
+pub(crate) fn is_valid_service_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
@@ -1107,7 +1107,7 @@ fn is_valid_compose_service_name(name: &str) -> bool {
 /// shells `eph env` targets: letters, digits, and underscores, not starting
 /// with a digit. Anything else would make the emitted `export NAME=...` line
 /// fail at `eval` time.
-fn is_valid_env_name(name: &str) -> bool {
+pub(crate) fn is_valid_env_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')

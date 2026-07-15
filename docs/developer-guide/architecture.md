@@ -14,8 +14,9 @@ pieces fit together. For where each decision lives in the code, see
 - `src/lib.rs`: the library crate (`eph`) that holds all reusable logic, split
   into modules: `parser`, `workspace`, `service`, `env`, `skills`, `update`
   (the self-updater that pulls, verifies, and swaps in a GitHub release),
-  `prune`, and the crate-internal `proc` (the cross-platform shell and
-  process-control layer). The file watcher behind `eph dev --watch`
+  `prune`, the crate-internal `hooks` (teardown snapshots, environments, and
+  command execution), and the crate-internal `proc` (the cross-platform shell
+  and process-control layer). The file watcher behind `eph dev --watch`
   (`src/watch.rs`) is a binary-side module, not part of the library.
 - `src/skills.rs` and `skills/`: the agent skills bundled into the binary.
   Each `skills/<slug>/SKILL.md` is embedded with `include_str!`. `eph skills
@@ -106,6 +107,11 @@ belong to a workspace. It also retains a canonical runtime fingerprint and the
 backend type that created each service. This lets `up` detect effective config
 drift, including source-type and resolved dependency-port changes, and tear down
 the old resource through recorded backend truth before creating the new one.
+When teardown hooks exist, state also retains their commands, top-level
+variables, service variables, service order, and backend family so system prune
+can run them after the workspace path disappears. These values can contain
+development credentials, so `state.json` has the same sensitivity as `.eph`
+until clean or prune removes it.
 Writes are atomic (a temp file, renamed over the real
 one) so a crash mid-write cannot leave a truncated `state.json`; a file that
 still fails to parse is quarantined to `state.json.corrupt` rather than treated
@@ -131,6 +137,14 @@ This liveness gate also applies to `--force-non-empty` candidates, so both
 flags are required when the recorded directory is non-empty and resources are
 live. The aggregate `--force` also enables legacy-state compatibility and
 confirmation bypass, so it represents the full destructive prune scope.
+For a selected workspace, prune reads and parses the current `.eph` when it is
+available; otherwise it falls back to the saved teardown hook snapshot. A valid
+current file wins, including when it removes all hooks. Live services receive
+`pre-clean`, `pre-stop`, stop, and `post-stop`; every snapshotted service receives
+the clean hooks, and `post-clean` runs after namespace cleanup. Hooks use the
+workspace directory when it exists and the state directory otherwise. Their
+failures are warnings and do not interrupt prune, while Docker, process, and
+state removal failures remain fatal. Dry runs never execute hooks.
 Before a destructive pass inventories Docker, prune acquires every candidate's
 lifecycle lock, the same lock used by `up`, `down`, `clean`, and foreground
 `dev` startup. A concurrent lifecycle command finishes first, then prune
@@ -321,14 +335,20 @@ the workspace directory:
   itself. It sees the same pre-teardown snapshot as `pre-stop`. A failure is
   propagated and aborts the rest of teardown; because the service is already
   stopped, a later `down` will not re-run it.
-- `pre-clean` and `post-clean` run only for `eph clean`, including when the
-  service is already stopped. For each service, `pre-clean` precedes the
+- `pre-clean` and `post-clean` run for `eph clean` and for services cleaned by
+  system prune, including when the service is already stopped. For each service,
+  `pre-clean` precedes the
   `pre-stop`/stop/`post-stop` sequence, and `post-clean` follows managed-volume
   removal. A pre-clean failure leaves that service's resources intact; a
   post-clean failure is propagated after its resources have been removed.
   Clean retains the last assigned ports across ordinary teardown so these hooks
   receive the same resolved snapshot after `down`; a reference for a service
   that has never had an assigned port remains a strict resolution error.
+
+Ordinary lifecycle commands treat hook failures as command failures. System
+prune records hook spawn, resolution, and exit failures as warnings with
+captured output, continues the remaining hooks, and still removes the selected
+resources.
 
 All six receive eph's resolved environment (the `eph env` variables, `EPH_*`
 metadata, and the service's own `env.X`); `eph run` exposes the same

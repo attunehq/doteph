@@ -4,8 +4,12 @@
 //! from the global state root instead, so it can tear down resources for a
 //! workspace path that no longer exists.
 
+use crate::hooks::{
+    CleanupKind, HookWorkspace, TeardownHookService, TeardownHookSnapshot, run_hook,
+};
+use crate::parser;
 use crate::proc;
-use crate::service::{Backend, ServiceState, WorkspaceLock};
+use crate::service::{Backend, RunningService, ServiceState, WorkspaceLock};
 use crate::workspace::{WORKSPACE_METADATA_FILE, WorkspaceMetadata, state_root};
 use anyhow::{Context, Result};
 use bollard::Docker;
@@ -14,7 +18,9 @@ use bollard::models::{ContainerSummary, ContainerSummaryStateEnum, ImageSummary,
 use bollard::query_parameters::{
     ListContainersOptionsBuilder, ListImagesOptionsBuilder, ListNetworksOptionsBuilder,
     RemoveContainerOptionsBuilder, RemoveImageOptionsBuilder, RemoveVolumeOptionsBuilder,
+    StopContainerOptionsBuilder,
 };
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -236,6 +242,26 @@ struct PruneCandidate {
     workspace_path: Option<PathBuf>,
     reason: StaleReason,
     metadata: Option<WorkspaceMetadata>,
+}
+
+struct PruneHookContext<'a> {
+    snapshot: &'a TeardownHookSnapshot,
+    metadata: &'a WorkspaceMetadata,
+    state: Option<&'a ServiceState>,
+    running: &'a HashMap<String, RunningService>,
+    live_services: &'a HashSet<String>,
+    cwd: &'a Path,
+    short_id: &'a str,
+}
+
+impl PruneHookContext<'_> {
+    fn workspace(&self) -> HookWorkspace<'_> {
+        HookWorkspace::new(
+            &self.metadata.workspace_path,
+            &self.metadata.workspace_id,
+            &self.metadata.short_id,
+        )
+    }
 }
 
 impl DockerInventory {
@@ -487,17 +513,7 @@ async fn prune_candidate(
         return Ok(());
     }
 
-    if let Some(pruned) = prune_workspace(
-        docker,
-        &candidate.state_dir,
-        candidate.short_id,
-        candidate.workspace_path,
-        candidate.reason,
-        options,
-        report,
-    )
-    .await?
-    {
+    if let Some(pruned) = prune_workspace(docker, candidate, options, report).await? {
         report.totals.add(&pruned.counts);
         report.pruned.push(pruned);
     }
@@ -529,16 +545,20 @@ fn gained_workspace_metadata(state_dir: &Path) -> bool {
 /// pruned.
 async fn prune_workspace(
     docker: &PruneDocker<'_>,
-    state_dir: &Path,
-    short_id: String,
-    workspace_path: Option<PathBuf>,
-    reason: StaleReason,
+    candidate: PruneCandidate,
     options: PruneOptions,
     report: &mut PruneReport,
 ) -> Result<Option<PrunedWorkspace>> {
+    let PruneCandidate {
+        state_dir,
+        short_id,
+        workspace_path,
+        reason,
+        metadata,
+    } = candidate;
     let prefix = format!("eph-{short_id}-");
 
-    let state = load_state_or_warn(state_dir, &short_id, report).await;
+    let state = load_state_or_warn(&state_dir, &short_id, report).await;
     let live_processes = state.as_ref().map_or(0, count_live_processes);
     let containers = matching_containers(&docker.inventory.containers, &prefix);
     let running_containers = count_running_containers(&containers);
@@ -560,14 +580,57 @@ async fn prune_workspace(
     }
 
     let mut counts = PruneCounts::default();
+    let hook_snapshot = select_teardown_hooks(
+        state.as_ref(),
+        metadata.as_ref(),
+        &state_dir,
+        &short_id,
+        report,
+    )
+    .await;
+    let hook_services = state.as_ref().map_or_else(HashMap::new, hook_services);
+    let live_hook_services = hook_snapshot
+        .as_ref()
+        .zip(metadata.as_ref())
+        .map(|(snapshot, metadata)| {
+            snapshot
+                .services_rev()
+                .filter(|service| {
+                    service_is_live(
+                        service,
+                        state.as_ref(),
+                        &docker.inventory.containers,
+                        &metadata.short_id,
+                    )
+                })
+                .map(|service| service.name.clone())
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let hook_cwd = workspace_path
+        .as_deref()
+        .filter(|path| path.is_dir())
+        .unwrap_or(&state_dir);
 
     if options.dry_run {
         debug!("Planning removal for workspace {short_id}");
     } else {
         info!("Removing resources for workspace {short_id}");
+        if let (Some(snapshot), Some(metadata)) = (&hook_snapshot, &metadata) {
+            let context = PruneHookContext {
+                snapshot,
+                metadata,
+                state: state.as_ref(),
+                running: &hook_services,
+                live_services: &live_hook_services,
+                cwd: hook_cwd,
+                short_id: &short_id,
+            };
+            run_pre_prune_hooks(docker, &context, report, &mut counts).await?;
+        }
     }
 
-    if let Some(state) = state {
+    if let Some(state) = &state {
         terminate_live_processes(state, &short_id, options.dry_run, report, &mut counts).await;
     }
     counts.containers = remove_containers(docker.client, containers, options.dry_run).await?;
@@ -593,11 +656,26 @@ async fn prune_workspace(
     )
     .await?;
 
+    if !options.dry_run
+        && let (Some(snapshot), Some(metadata)) = (&hook_snapshot, &metadata)
+    {
+        let context = PruneHookContext {
+            snapshot,
+            metadata,
+            state: state.as_ref(),
+            running: &hook_services,
+            live_services: &live_hook_services,
+            cwd: hook_cwd,
+            short_id: &short_id,
+        };
+        run_post_clean_hooks(&context, report).await;
+    }
+
     if state_dir.exists() {
         counts.state_dirs = 1;
         if !options.dry_run {
             info!("Removing state directory {}", state_dir.display());
-            tokio::fs::remove_dir_all(state_dir)
+            tokio::fs::remove_dir_all(&state_dir)
                 .await
                 .with_context(|| {
                     format!("failed to remove state directory: {}", state_dir.display())
@@ -611,6 +689,337 @@ async fn prune_workspace(
         reason,
         counts,
     }))
+}
+
+async fn select_teardown_hooks(
+    state: Option<&ServiceState>,
+    metadata: Option<&WorkspaceMetadata>,
+    state_dir: &Path,
+    short_id: &str,
+    report: &mut PruneReport,
+) -> Option<TeardownHookSnapshot> {
+    let Some(metadata) = metadata else {
+        report.warnings.push(format!(
+            "{short_id}: teardown hooks are unavailable because workspace metadata is missing"
+        ));
+        return None;
+    };
+
+    let eph_path = metadata.workspace_path.join(".eph");
+    let mut current_error = None;
+    if metadata.workspace_path.is_dir() {
+        match tokio::fs::read_to_string(&eph_path).await {
+            Ok(contents) => match parser::parse(&contents) {
+                Ok(eph) => return TeardownHookSnapshot::capture(&eph),
+                Err(error) => {
+                    current_error = Some(format!(
+                        "could not parse current {} for prune hooks: {error:#}",
+                        eph_path.display()
+                    ));
+                }
+            },
+            Err(error) => {
+                current_error = Some(format!(
+                    "could not read current {} for prune hooks: {error}",
+                    eph_path.display()
+                ));
+            }
+        }
+    }
+
+    match state.and_then(|state| state.teardown_hooks.clone()) {
+        Some(snapshot) => {
+            if let Some(error) = current_error {
+                report.warnings.push(format!(
+                    "{short_id}: {error}; using the saved teardown snapshot"
+                ));
+            }
+            Some(snapshot)
+        }
+        None => {
+            let state_path = state_dir.join("state.json");
+            match current_error {
+                Some(error) => report.warnings.push(format!(
+                    "{short_id}: teardown hooks are unavailable; {error}; {} has no saved hook snapshot",
+                    state_path.display()
+                )),
+                None => report.warnings.push(format!(
+                    "{short_id}: teardown hooks are unavailable; {} has no saved hook snapshot",
+                    state_path.display()
+                )),
+            }
+            None
+        }
+    }
+}
+
+fn hook_services(state: &ServiceState) -> HashMap<String, RunningService> {
+    let mut services = state
+        .last_ports
+        .iter()
+        .map(|(name, ports)| {
+            (
+                name.clone(),
+                RunningService {
+                    name: name.clone(),
+                    ports: ports.clone(),
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    for (name, entry) in &state.services {
+        services.insert(
+            name.clone(),
+            RunningService {
+                name: name.clone(),
+                ports: entry.ports.clone(),
+            },
+        );
+    }
+    services
+}
+
+async fn run_pre_prune_hooks(
+    docker: &PruneDocker<'_>,
+    context: &PruneHookContext<'_>,
+    report: &mut PruneReport,
+    counts: &mut PruneCounts,
+) -> Result<()> {
+    for service in context.snapshot.services_rev() {
+        run_hook_phase(context, service, "pre-clean", &service.pre_clean, report).await;
+
+        if !context.live_services.contains(&service.name) {
+            continue;
+        }
+
+        run_hook_phase(context, service, "pre-stop", &service.pre_stop, report).await;
+        stop_hook_service(
+            docker.client,
+            service,
+            context.state,
+            &docker.inventory.containers,
+            &context.metadata.short_id,
+            counts,
+        )
+        .await?;
+        run_hook_phase(context, service, "post-stop", &service.post_stop, report).await;
+    }
+    Ok(())
+}
+
+async fn run_post_clean_hooks(context: &PruneHookContext<'_>, report: &mut PruneReport) {
+    for service in context.snapshot.services_rev() {
+        run_hook_phase(context, service, "post-clean", &service.post_clean, report).await;
+    }
+}
+
+async fn run_hook_phase(
+    context: &PruneHookContext<'_>,
+    service: &TeardownHookService,
+    phase: &str,
+    commands: &[String],
+    report: &mut PruneReport,
+) {
+    if commands.is_empty() {
+        return;
+    }
+
+    let env = match context
+        .snapshot
+        .environment(context.workspace(), context.running, service)
+    {
+        Ok(env) => env,
+        Err(error) => {
+            for command in commands {
+                report.warnings.push(format!(
+                    "{}/{} {phase} hook `{command}` was skipped: {error:#}",
+                    context.short_id, service.name
+                ));
+            }
+            return;
+        }
+    };
+
+    for command in commands {
+        if let Err(error) = run_hook(command, context.cwd, &env).await {
+            report.warnings.push(format!(
+                "{}/{} {phase} hook failed: {error}",
+                context.short_id, service.name
+            ));
+        }
+    }
+}
+
+fn service_is_live(
+    service: &TeardownHookService,
+    state: Option<&ServiceState>,
+    containers: &[ContainerSummary],
+    short_id: &str,
+) -> bool {
+    match state.and_then(|state| state.services.get(&service.name)) {
+        Some(entry) => backend_is_live(&entry.backend, &service.name, containers, short_id),
+        None => match service.cleanup_kind {
+            CleanupKind::DirectContainer => direct_containers(containers, short_id, &service.name)
+                .iter()
+                .any(|container| container_is_running(container)),
+            CleanupKind::Compose => {
+                compose_containers(containers, &format!("eph-{short_id}-{}", service.name))
+                    .iter()
+                    .any(|container| container_is_running(container))
+            }
+            CleanupKind::Process => false,
+        },
+    }
+}
+
+fn backend_is_live(
+    backend: &Backend,
+    service_name: &str,
+    containers: &[ContainerSummary],
+    short_id: &str,
+) -> bool {
+    match backend {
+        Backend::Process {
+            pid,
+            identity: Some(identity),
+        } => proc::identity_matches(*pid, identity),
+        Backend::Process { identity: None, .. } => false,
+        Backend::Container { id } => containers.iter().any(|container| {
+            (container.id.as_deref() == Some(id)
+                || container_has_exact_name(container, &format!("eph-{short_id}-{service_name}")))
+                && container_is_running(container)
+        }),
+        Backend::Compose { project } => compose_containers(containers, project)
+            .iter()
+            .any(|container| container_is_running(container)),
+    }
+}
+
+async fn stop_hook_service(
+    docker: &Docker,
+    service: &TeardownHookService,
+    state: Option<&ServiceState>,
+    containers: &[ContainerSummary],
+    short_id: &str,
+    counts: &mut PruneCounts,
+) -> Result<()> {
+    if let Some(entry) = state.and_then(|state| state.services.get(&service.name)) {
+        match &entry.backend {
+            Backend::Process {
+                pid,
+                identity: Some(identity),
+            } if proc::identity_matches(*pid, identity) => {
+                proc::terminate(*pid);
+                sleep(Duration::from_secs(2)).await;
+                proc::force_kill(*pid);
+                counts.processes += 1;
+            }
+            Backend::Process { .. } => {}
+            Backend::Container { id } => {
+                let matched = containers.iter().filter(|container| {
+                    container.id.as_deref() == Some(id)
+                        || container_has_exact_name(
+                            container,
+                            &format!("eph-{short_id}-{}", service.name),
+                        )
+                });
+                stop_containers(docker, matched).await?;
+            }
+            Backend::Compose { project } => {
+                stop_containers(docker, compose_containers(containers, project)).await?;
+            }
+        }
+        return Ok(());
+    }
+
+    match service.cleanup_kind {
+        CleanupKind::DirectContainer => {
+            stop_containers(
+                docker,
+                direct_containers(containers, short_id, &service.name),
+            )
+            .await?;
+        }
+        CleanupKind::Compose => {
+            let project = format!("eph-{short_id}-{}", service.name);
+            stop_containers(docker, compose_containers(containers, &project)).await?;
+        }
+        CleanupKind::Process => {}
+    }
+    Ok(())
+}
+
+async fn stop_containers<'a>(
+    docker: &Docker,
+    containers: impl IntoIterator<Item = &'a ContainerSummary>,
+) -> Result<()> {
+    for container in containers {
+        if !container_is_running(container) {
+            continue;
+        }
+        let Some(id) = container.id.as_deref() else {
+            continue;
+        };
+        info!("Stopping container {id} before prune hooks continue");
+        docker
+            .stop_container(id, Some(StopContainerOptionsBuilder::new().t(10).build()))
+            .await
+            .or_else(ignore_stopped_or_missing)
+            .context("failed to stop container")?;
+    }
+    Ok(())
+}
+
+fn direct_containers<'a>(
+    containers: &'a [ContainerSummary],
+    short_id: &str,
+    service_name: &str,
+) -> Vec<&'a ContainerSummary> {
+    let name = format!("eph-{short_id}-{service_name}");
+    containers
+        .iter()
+        .filter(|container| container_has_exact_name(container, &name))
+        .collect()
+}
+
+fn compose_containers<'a>(
+    containers: &'a [ContainerSummary],
+    project: &str,
+) -> Vec<&'a ContainerSummary> {
+    containers
+        .iter()
+        .filter(|container| {
+            container
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("com.docker.compose.project").map(String::as_str))
+                == Some(project)
+        })
+        .collect()
+}
+
+fn container_has_exact_name(container: &ContainerSummary, expected: &str) -> bool {
+    container.names.as_ref().is_some_and(|names| {
+        names
+            .iter()
+            .any(|name| name.strip_prefix('/').unwrap_or(name) == expected)
+    })
+}
+
+fn container_is_running(container: &ContainerSummary) -> bool {
+    matches!(container.state, Some(ContainerSummaryStateEnum::RUNNING))
+}
+
+fn ignore_stopped_or_missing<T: Default>(
+    error: BollardError,
+) -> std::result::Result<T, BollardError> {
+    match error {
+        BollardError::DockerResponseServerError {
+            status_code: 304 | 404,
+            ..
+        } => Ok(T::default()),
+        other => Err(other),
+    }
 }
 
 /// Whether a stale-pathed workspace has live resources that block a default
@@ -692,19 +1101,19 @@ fn count_live_processes(state: &ServiceState) -> usize {
 /// the PID was reused by an unrelated process, and either way killing it
 /// would be wrong.
 async fn terminate_live_processes(
-    state: ServiceState,
+    state: &ServiceState,
     short_id: &str,
     dry_run: bool,
     report: &mut PruneReport,
     counts: &mut PruneCounts,
 ) {
-    for (name, entry) in state.services {
-        let Backend::Process { pid, identity } = entry.backend else {
+    for (name, entry) in &state.services {
+        let Backend::Process { pid, identity } = &entry.backend else {
             continue;
         };
 
         let Some(identity) = identity else {
-            if proc::is_alive(pid) {
+            if proc::is_alive(*pid) {
                 report.warnings.push(format!(
                     "{short_id}/{name}: skipped run= PID {pid}; state has no process identity"
                 ));
@@ -712,14 +1121,14 @@ async fn terminate_live_processes(
             continue;
         };
 
-        if proc::identity_matches(pid, &identity) {
+        if proc::identity_matches(*pid, identity) {
             counts.processes += 1;
             if !dry_run {
-                proc::terminate(pid);
+                proc::terminate(*pid);
                 sleep(Duration::from_secs(2)).await;
-                proc::force_kill(pid);
+                proc::force_kill(*pid);
             }
-        } else if proc::is_alive(pid) {
+        } else if proc::is_alive(*pid) {
             report.warnings.push(format!(
                 "{short_id}/{name}: skipped run= PID {pid}; the live process does not match recorded identity"
             ));
@@ -1124,19 +1533,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join(".eph"), "[db]\nimage=postgres:16\n").unwrap();
-        let short_id = "aaaaaaaaaaaaaaaa";
-        write_workspace_metadata(
-            root.path(),
-            short_id,
-            workspace
-                .path()
-                .to_str()
-                .expect("temp path should be UTF-8"),
-        );
+        let short_id = write_workspace_metadata(root.path(), workspace.path());
         let mut report = PruneReport::default();
 
         let candidate = classify_state_dir(
-            root.path().join(short_id),
+            root.path().join(&short_id),
             PruneOptions {
                 force_non_empty: true,
                 ..PruneOptions::default()
@@ -1326,18 +1727,83 @@ mod tests {
         assert_eq!(count_running_containers(&[]), 0);
     }
 
-    /// Fabricate a workspace's on-disk metadata directly under a temp state
-    /// root, the same shape `Workspace::save_metadata` writes, so
-    /// `count_stale_workspaces` can be exercised without a real workspace or
-    /// Docker.
-    fn write_workspace_metadata(root: &Path, short_id: &str, workspace_path: &str) {
-        let dir = root.join(short_id);
+    #[test]
+    fn direct_service_recovery_requires_an_exact_container_name() {
+        let containers = vec![ContainerSummary {
+            names: Some(vec!["/eph-0123456789abcdef-web-api".to_string()]),
+            state: Some(ContainerSummaryStateEnum::RUNNING),
+            ..ContainerSummary::default()
+        }];
+
+        assert!(direct_containers(&containers, "0123456789abcdef", "web").is_empty());
+        assert_eq!(
+            direct_containers(&containers, "0123456789abcdef", "web-api").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn compose_backend_liveness_uses_the_recorded_project_label() {
+        let project = "eph-0123456789abcdef-stack";
+        let containers = vec![ContainerSummary {
+            labels: Some(HashMap::from([(
+                "com.docker.compose.project".to_string(),
+                project.to_string(),
+            )])),
+            state: Some(ContainerSummaryStateEnum::RUNNING),
+            ..ContainerSummary::default()
+        }];
+        let backend = Backend::Compose {
+            project: project.to_string(),
+        };
+
+        assert!(backend_is_live(
+            &backend,
+            "renamed-source-service",
+            &containers,
+            "ffffffffffffffff"
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_current_hooks_without_a_snapshot_report_one_truthful_warning() {
+        let workspace_dir = tempfile::tempdir().unwrap();
+        std::fs::write(workspace_dir.path().join(".eph"), "[app]\nrun=\n").unwrap();
+        let workspace = crate::Workspace::from_path(workspace_dir.path()).unwrap();
+        let metadata = WorkspaceMetadata::for_workspace(&workspace);
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = ServiceState::default();
+        let mut report = PruneReport::default();
+
+        let snapshot = select_teardown_hooks(
+            Some(&state),
+            Some(&metadata),
+            state_dir.path(),
+            &metadata.short_id,
+            &mut report,
+        )
+        .await;
+
+        assert!(snapshot.is_none());
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains("could not parse current"));
+        assert!(report.warnings[0].contains("no saved hook snapshot"));
+        assert!(!report.warnings[0].contains("using the saved teardown snapshot"));
+    }
+
+    /// Build metadata through the same path-derived identity contract as a
+    /// real workspace so stale-state tests cannot accidentally exercise an
+    /// impossible identity.
+    fn write_workspace_metadata(root: &Path, workspace_path: &Path) -> String {
+        let workspace_id = crate::workspace::compute_workspace_id(workspace_path);
+        let short_id = workspace_id[..16].to_string();
+        let dir = root.join(&short_id);
         std::fs::create_dir_all(&dir).unwrap();
         let metadata = WorkspaceMetadata {
             schema: 1,
-            workspace_id: short_id.to_string(),
-            short_id: short_id.to_string(),
-            workspace_path: PathBuf::from(workspace_path),
+            workspace_id,
+            short_id: short_id.clone(),
+            workspace_path: workspace_path.to_path_buf(),
             container_prefix: format!("eph-{short_id}"),
             last_seen_unix_secs: 0,
         };
@@ -1346,6 +1812,7 @@ mod tests {
             serde_json::to_string_pretty(&metadata).unwrap(),
         )
         .unwrap();
+        short_id
     }
 
     #[tokio::test]
@@ -1353,28 +1820,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
 
         // Stale: recorded path no longer exists.
-        write_workspace_metadata(
-            root.path(),
-            "aaaaaaaaaaaaaaaa",
-            "/does/not/exist-eph-test-aaaaaaaa",
-        );
+        let missing = root.path().join("does-not-exist-eph-test-aaaaaaaa");
+        write_workspace_metadata(root.path(), &missing);
         // Live: recorded path is a real, non-empty directory.
         let live = tempfile::tempdir().unwrap();
         std::fs::write(live.path().join(".eph"), "[db]\nimage=postgres:16\n").unwrap();
-        write_workspace_metadata(
-            root.path(),
-            "bbbbbbbbbbbbbbbb",
-            live.path().to_str().expect("temp path should be UTF-8"),
-        );
+        write_workspace_metadata(root.path(), live.path());
         // Also stale by path, but this is the "current" workspace: excluded.
-        write_workspace_metadata(
-            root.path(),
-            "cccccccccccccccc",
-            "/also/gone-eph-test-cccccccc",
-        );
+        let excluded_path = root.path().join("also-gone-eph-test-cccccccc");
+        let excluded = write_workspace_metadata(root.path(), &excluded_path);
 
         assert_eq!(
-            count_stale_workspaces(root.path(), "cccccccccccccccc").await,
+            count_stale_workspaces(root.path(), &excluded).await,
             1,
             "only the non-excluded stale workspace should be counted"
         );
@@ -1385,11 +1842,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let live = tempfile::tempdir().unwrap();
         std::fs::write(live.path().join(".eph"), "[db]\nimage=postgres:16\n").unwrap();
-        write_workspace_metadata(
-            root.path(),
-            "dddddddd",
-            live.path().to_str().expect("temp path should be UTF-8"),
-        );
+        write_workspace_metadata(root.path(), live.path());
 
         assert_eq!(count_stale_workspaces(root.path(), "").await, 0);
     }

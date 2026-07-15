@@ -460,6 +460,26 @@ it skips `pre-stop` and `post-stop`; on `eph clean` it skips the stop hooks and
 the clean-specific hooks. It is the escape hatch for a broken hook that is
 wedging startup or teardown.
 
+### Hooks during system prune
+
+`eph system prune` runs teardown hooks for each selected workspace. It reads a
+valid current `.eph` when one is available and otherwise uses the last teardown
+snapshot saved by `up`, `down`, `clean`, or `dev`, even if that command used
+`--skip-hooks`. A valid current file is authoritative, including when hooks were
+removed from it.
+
+A live service follows `pre-clean`, `pre-stop`, stop, and `post-stop`. A service
+that is already stopped skips both stop hooks. Every snapshotted service runs
+`pre-clean`, namespace cleanup removes the workspace resources, then
+`post-clean` runs. Hooks keep the pre-teardown port environment. If the worktree
+is gone, they run from the workspace state directory and
+`EPH_WORKSPACE_ROOT` remains the recorded path.
+
+Prune treats every hook as best effort: a spawn error, unresolved variable, or
+non-zero exit is reported as a warning with stdout and stderr, and the remaining
+hooks and resources continue. Resource removal errors still fail prune.
+`--dry-run` never executes hooks, and system prune has no `--skip-hooks` flag.
+
 ## Roles and ordering
 
 A `role=` tags a service with a tier, and `roles_order` declares the dependency

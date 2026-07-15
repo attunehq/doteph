@@ -44,8 +44,36 @@ impl WorkspaceMetadata {
         let contents = tokio::fs::read_to_string(&path)
             .await
             .with_context(|| format!("failed to read workspace metadata: {}", path.display()))?;
-        serde_json::from_str(&contents)
+        Self::parse(&contents)
             .with_context(|| format!("failed to parse workspace metadata: {}", path.display()))
+    }
+
+    fn parse(contents: &str) -> Result<Self> {
+        let metadata: Self = serde_json::from_str(contents)?;
+        if metadata.schema != WORKSPACE_METADATA_SCHEMA {
+            anyhow::bail!("unsupported workspace metadata schema {}", metadata.schema);
+        }
+        if !metadata.workspace_path.is_absolute() {
+            anyhow::bail!(
+                "workspace metadata path is not absolute: {}",
+                metadata.workspace_path.display()
+            );
+        }
+        let expected_id = compute_workspace_id(&metadata.workspace_path);
+        if metadata.workspace_id != expected_id {
+            anyhow::bail!("workspace metadata ID does not match its recorded path");
+        }
+        if !matches!(
+            metadata.short_id.len(),
+            LEGACY_RESOURCE_ID_LEN | RESOURCE_ID_LEN
+        ) || !metadata.workspace_id.starts_with(&metadata.short_id)
+        {
+            anyhow::bail!("workspace metadata short ID does not match its workspace ID");
+        }
+        if metadata.container_prefix != format!("eph-{}", metadata.short_id) {
+            anyhow::bail!("workspace metadata container prefix does not match its short ID");
+        }
+        Ok(metadata)
     }
 }
 
@@ -251,7 +279,7 @@ impl Workspace {
 }
 
 /// Compute a unique ID for a workspace based on its path
-fn compute_workspace_id(path: &Path) -> String {
+pub(crate) fn compute_workspace_id(path: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(path.to_string_lossy().as_bytes());
     hex::encode(hasher.finalize())
@@ -528,5 +556,32 @@ mod tests {
         assert_eq!(metadata.short_id, workspace.short_id);
         assert_eq!(metadata.workspace_path, workspace.path);
         assert_eq!(metadata.container_prefix, "eph-abcdef0123456789");
+    }
+
+    #[test]
+    fn workspace_metadata_parse_rejects_inconsistent_identity_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::from_path(dir.path()).unwrap();
+        let metadata = WorkspaceMetadata::for_workspace(&workspace);
+        let valid = serde_json::to_value(&metadata).unwrap();
+
+        for (field, replacement) in [
+            ("schema", serde_json::json!(99)),
+            ("workspace_id", serde_json::json!("0".repeat(64))),
+            ("short_id", serde_json::json!("deadbeefdeadbeef")),
+            ("container_prefix", serde_json::json!("eph-unrelated")),
+        ] {
+            let mut changed = valid.clone();
+            changed[field] = replacement;
+            let error = WorkspaceMetadata::parse(&changed.to_string())
+                .expect_err("inconsistent metadata should not cross the parse boundary");
+            assert!(
+                error.to_string().contains("workspace metadata")
+                    || error
+                        .to_string()
+                        .contains("unsupported workspace metadata schema"),
+                "unexpected error for {field}: {error:#}"
+            );
+        }
     }
 }

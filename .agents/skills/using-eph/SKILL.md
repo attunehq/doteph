@@ -302,6 +302,14 @@ starts services without `pre-start`/`post-start`; `eph down --skip-hooks` /
 skips `pre-clean`/`post-clean` (the escape hatch when a broken hook is wedging
 teardown).
 
+`eph system prune` also runs teardown hooks. It prefers a valid current `.eph`
+and falls back to the last teardown snapshot in `state.json` when the file or
+worktree is gone. Live services receive stop hooks; every snapshotted service
+receives clean hooks. Missing-worktree hooks run from the state directory, so
+prefer programs on PATH and absolute paths over workspace-relative scripts.
+Hook failures are warnings and do not block prune; resource failures still do.
+Dry runs never execute hooks, and system prune has no `--skip-hooks` flag.
+
 ## Running one-off commands with the environment: `eph run`
 
 `eph run <cmd>...` runs a command in the workspace root with the resolved
@@ -460,7 +468,9 @@ return, so they run as normal commands.
   removal. `--force-non-empty` also selects paths that still contain files, and
   live resources require `--force-live` regardless of how the path was selected.
   `--force` enables every override and skips confirmation; pair it with
-  `--dry-run` to preview that full scope.
+  `--dry-run` to preview that full scope. A real prune runs applicable stop and
+  clean hooks as best effort, using saved hook state when the worktree is gone;
+  hook failures are warnings.
 - **Execution fails closed on unresolved references.** Hooks, service startup,
   health checks, and `eph run` stop before launching a child with a raw eph
   placeholder.

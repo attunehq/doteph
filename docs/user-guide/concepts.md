@@ -136,6 +136,13 @@ beside it:
 | macOS | `~/Library/Application Support/eph/<short_id>/state.json` |
 | Windows | `%LOCALAPPDATA%\eph\<short_id>\state.json` |
 
+When a file declares stop or clean hooks, state also stores the last parsed
+teardown commands, their top-level and service environments, service order, and
+backend family. System prune needs that snapshot when a worktree has already
+been deleted. Environment values may include development credentials, so protect
+`state.json` like `.eph`; `eph clean` and system prune remove it with the rest of
+the workspace state.
+
 Set `EPH_STATE_ROOT` to an absolute path to override the parent directory (the
 `eph` above `<short_id>`) for every workspace. Relative values are rejected so
 state cannot move when a command runs from a different directory. The override
@@ -222,6 +229,13 @@ Two rules matter here; the full contract lives in
   [`eph run`](command-reference.md#eph-run-cmd) instead.
 - **A failing hook aborts the command** rather than being skipped silently.
   `--skip-hooks` is the escape hatch on `up`, `down`, and `clean`.
+
+System prune is the exception because it is a cross-workspace recovery command.
+It runs stop hooks only when it stops a live service and clean hooks whenever it
+cleans a snapshotted service. A current valid `.eph` wins over saved hooks; when
+the file or worktree is unavailable, prune uses the saved snapshot. Hook failures
+become warnings and cleanup continues, while resource-removal failures remain
+fatal. Dry runs do not execute hooks.
 
 ### Three levels of teardown
 
