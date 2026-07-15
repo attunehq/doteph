@@ -19,6 +19,7 @@
 #![warn(clippy::perf)]
 
 pub mod env;
+pub(crate) mod hooks;
 pub mod parser;
 pub(crate) mod proc;
 pub mod prune;

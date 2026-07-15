@@ -283,6 +283,19 @@ Behavior:
   containers, and Compose networks can all be pruned even when the original
   `.eph` or compose file is gone. The workspace state directory is deleted
   last.
+- Prune honors teardown hooks. It uses a valid current `.eph` when available,
+  otherwise it uses the last teardown snapshot saved in `state.json`. A live
+  service runs `pre-clean`, `pre-stop`, stop, and `post-stop`; an already-stopped
+  service runs only its clean hooks. Namespace resources are removed before
+  `post-clean`. When the workspace directory is gone, hooks run from its state
+  directory but retain the recorded `EPH_WORKSPACE_ROOT`. Hook failures and
+  unresolved hook variables are printed under "Warnings" with captured output,
+  then prune continues. Docker, process, and state removal errors still fail the
+  command. `--dry-run` never executes hooks.
+- There is no prune-specific `--skip-hooks`. System prune is already best effort
+  for hooks, so a broken cleanup script cannot block resource removal. State
+  written before teardown snapshots were introduced still prunes and reports
+  that hooks were unavailable.
 - For `run=` services, only a PID whose current process identity matches the
   identity eph recorded at launch is killed. A process entry without identity,
   and a mismatched PID that may have been reused, are skipped with a warning. A

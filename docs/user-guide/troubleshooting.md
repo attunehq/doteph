@@ -177,6 +177,12 @@ untouched. A failing `post-clean` is reported after that service and its managed
 volumes are removed. Clean hooks run again on the next `eph clean`, even when
 the service is already stopped.
 
+System prune handles hook failures differently because one bad script must not
+block stale-workspace cleanup. It prints a warning containing the workspace,
+service, phase, command, stdout, and stderr, then continues with later hooks and
+resource removal. Fix the script for future lifecycle commands; there is no
+system-prune `--skip-hooks` flag, and `--dry-run` does not execute hooks.
+
 ## A port reference did not resolve
 
 `eph check` rejects unknown services, unknown properties, missing named ports,
@@ -261,6 +267,16 @@ but you know the workspace can be discarded, preview it with
 reports running containers or a live `run=` process. An 8-character state
 directory without workspace metadata is skipped unless you pass
 `--compatibility-v042`.
+
+Prune uses the current `.eph` when it still exists and parses successfully. If
+an existing workspace's file is unreadable or invalid, prune warns and falls
+back to the teardown hook snapshot in `state.json`. When the whole worktree is
+gone, it uses that snapshot directly. State from older eph releases has no
+snapshot; prune still removes the resources and warns that hooks were
+unavailable. Missing-worktree hooks run from the state directory, so cleanup
+programs on PATH and commands that use absolute paths can still work, but
+workspace-relative scripts cannot. Hook environment values saved in state may
+include development secrets.
 
 For `run=` services, system prune stops only a recorded PID whose live process
 still matches the identity eph captured at launch; PIDs can be reused, so a

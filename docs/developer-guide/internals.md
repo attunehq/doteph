@@ -14,6 +14,7 @@ src/
   lib.rs         public library surface
   parser.rs      .eph parser, checked types, roles, interpolation
   workspace.rs   workspace discovery, IDs, names, state paths
+  hooks.rs       persisted teardown hooks, environments, command execution
   service.rs     lifecycle engine, Docker adapter, persisted state
   proc.rs        platform shell and process identity/control
   prune.rs       stale-workspace discovery and resource removal
@@ -23,6 +24,7 @@ src/
 tests/
   common/mod.rs  integration helpers
   integration.rs CLI and live lifecycle coverage
+  integration/system_prune_hooks.rs focused prune-hook scenarios
   stress.rs      ignored heavyweight concurrency and backend-change cases
 ```
 
@@ -166,6 +168,9 @@ named volumes, sweeps namespaced leftovers, and deletes workspace state. Each
 declared service's `pre-clean` runs before its stop hooks, while `post-clean`
 runs after its backend and managed volumes are removed. These clean-only hooks
 are not gated on liveness, so a clean after `down` still runs them.
+Every state-mutating lifecycle entry point refreshes the optional teardown hook
+snapshot under `WorkspaceLock` before its first side effect, including when
+`--skip-hooks` suppresses execution for that invocation.
 
 Logs use Docker or Compose for container backends and captured files for `run=`.
 The all-services path streams concurrently and tags lines; the one-service path
@@ -213,6 +218,13 @@ the shared Docker inventory, which serializes prune against `up`, `down`,
 `clean`, and foreground `dev` startup without returning to per-workspace Docker
 listings. The binary-side `system_prune` module resolves `--force` into all
 three scope overrides plus confirmation bypass before it calls the library.
+For hook execution, prune prefers a readable, valid current `.eph` and falls
+back to the typed snapshot in `ServiceState`. It constructs the pre-teardown
+port environment once, runs clean hooks for every snapshotted service and stop
+hooks only for live services, then uses recorded backend truth to stop them.
+Hook failures append warnings and the prune continues; resource failures still
+return an error. A missing worktree uses the state directory as the hook working
+directory so PATH-only cleanup commands remain usable.
 
 ## env
 

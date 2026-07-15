@@ -11,11 +11,14 @@
 
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
 mod common;
 #[path = "integration/system_prune_force.rs"]
 mod system_prune_force;
+#[path = "integration/system_prune_hooks.rs"]
+mod system_prune_hooks;
 use common::{TestWorkspace, extract_port, parse_env_json};
 
 #[cfg(unix)]
@@ -3868,17 +3871,19 @@ async fn up_nudges_about_stale_workspaces() {
     let ws = TestWorkspace::new("[redis]\nimage=redis:7-alpine\nport=6379\n");
     let root_str = state_root.path().to_string_lossy().into_owned();
 
-    // A fabricated stale workspace: a 16-hex-digit state dir with metadata
-    // (the exact shape `Workspace::save_metadata` writes) pointing at a path
-    // that does not exist.
-    let stale_dir = state_root.path().join("deadbeefdeadbeef");
+    // Derive the fabricated metadata from its missing path so the nudge is
+    // exercising a state record that a real eph workspace could have written.
+    let stale_path = state_root.path().join("deleted-workspace");
+    let workspace_id = hex::encode(Sha256::digest(stale_path.to_string_lossy().as_bytes()));
+    let short_id = &workspace_id[..16];
+    let stale_dir = state_root.path().join(short_id);
     std::fs::create_dir_all(&stale_dir).unwrap();
     let metadata = serde_json::json!({
         "schema": 1,
-        "workspace_id": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-        "short_id": "deadbeefdeadbeef",
-        "workspace_path": "/this/path/does/not/exist-eph-integration-test",
-        "container_prefix": "eph-deadbeefdeadbeef",
+        "workspace_id": workspace_id,
+        "short_id": short_id,
+        "workspace_path": stale_path,
+        "container_prefix": format!("eph-{short_id}"),
         "last_seen_unix_secs": 0
     });
     std::fs::write(

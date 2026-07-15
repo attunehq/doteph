@@ -1,5 +1,6 @@
 //! Service management - starting, stopping, and managing Docker containers
 
+use crate::hooks::{self, HookWorkspace, TeardownHookSnapshot};
 use crate::parser::{
     EphFile, PortMapping, Service, ServiceSource, resolve_interpolations,
     resolve_interpolations_tracked,
@@ -251,7 +252,7 @@ pub fn resolve_env_vars_strict(
     )
 }
 
-fn resolve_env_pairs_strict<'a>(
+pub(crate) fn resolve_env_pairs_strict<'a>(
     variables: impl IntoIterator<Item = (&'a str, &'a str)>,
     running: &HashMap<String, RunningService>,
 ) -> std::result::Result<Vec<(String, String)>, UnresolvedEnvironment> {
@@ -456,13 +457,17 @@ pub(crate) struct ServiceState {
     /// so clean-only hooks can resolve the same environment after ordinary
     /// teardown has removed the live service record.
     #[serde(default)]
-    last_ports: HashMap<String, HashMap<String, u16>>,
+    pub(crate) last_ports: HashMap<String, HashMap<String, u16>>,
     /// The runtime configuration and backend most recently created for each
     /// service. These records survive `eph down`: stopped containers still
     /// exist, and accepting one without knowing which configuration created it
     /// would make edits to `.eph` silently ineffective on the next `up`.
     #[serde(default)]
     service_configs: HashMap<String, ServiceConfigRecord>,
+    /// The last parsed teardown hooks, retained so system prune can honor them
+    /// after the workspace path has disappeared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) teardown_hooks: Option<TeardownHookSnapshot>,
 }
 
 /// A canonical digest of the inputs that determine a service's runtime.
@@ -2044,6 +2049,11 @@ pub struct ServiceManager {
 }
 
 impl ServiceManager {
+    async fn save_teardown_hooks(&mut self, eph: &EphFile) -> Result<()> {
+        self.state.teardown_hooks = TeardownHookSnapshot::capture(eph);
+        self.state.save(&self.workspace).await
+    }
+
     /// Create a new service manager for a workspace.
     ///
     /// Connects to the local Docker daemon and loads any persisted state for
@@ -2221,6 +2231,7 @@ impl ServiceManager {
         // prune may have completed after manager construction and removed both.
         self.workspace.save_metadata().await?;
         self.state = ServiceState::load(&self.workspace).await?;
+        self.save_teardown_hooks(eph).await?;
 
         self.start_services_locked(eph, filter, hooks, reserve_ahead)
             .await
@@ -2375,6 +2386,7 @@ impl ServiceManager {
         let _guard = lock.acquire()?;
         self.workspace.save_metadata().await?;
         self.state = ServiceState::load(&self.workspace).await?;
+        self.save_teardown_hooks(eph).await?;
 
         let service = eph
             .services
@@ -3629,6 +3641,7 @@ impl ServiceManager {
         let _guard = lock.acquire()?;
         self.workspace.save_metadata().await?;
         self.state = ServiceState::load(&self.workspace).await?;
+        self.save_teardown_hooks(eph).await?;
 
         // Snapshot the running services once, before any teardown, so every
         // pre-stop and post-stop hook sees the full environment as it was when
@@ -3675,6 +3688,7 @@ impl ServiceManager {
         let _guard = lock.acquire()?;
         self.workspace.save_metadata().await?;
         self.state = ServiceState::load(&self.workspace).await?;
+        self.save_teardown_hooks(eph).await?;
 
         let wanted: HashSet<&str> = targets.iter().map(String::as_str).collect();
         // Snapshot running services once so every pre-stop/post-stop hook sees the
@@ -3876,6 +3890,7 @@ impl ServiceManager {
         let _guard = lock.acquire()?;
         self.workspace.save_metadata().await?;
         self.state = ServiceState::load(&self.workspace).await?;
+        self.save_teardown_hooks(eph).await?;
 
         let mut summary = CleanSummary::default();
 
@@ -3993,6 +4008,7 @@ impl ServiceManager {
         self.state.auto_ports.clear();
         self.state.last_ports.clear();
         self.state.service_configs.clear();
+        self.state.teardown_hooks = None;
 
         // Remove the persisted state file (and its directory).
         let state_dir = self.workspace.state_dir()?;
@@ -4633,7 +4649,17 @@ impl ServiceManager {
         running: &HashMap<String, RunningService>,
         service: &Service,
     ) -> Result<Vec<(String, String)>> {
-        self.app_env(eph, running, service)
+        Ok(hooks::hook_environment(
+            HookWorkspace::from_workspace(&self.workspace),
+            eph.env_vars
+                .iter()
+                .map(|variable| (variable.name.as_str(), variable.value.as_str())),
+            running,
+            service
+                .env
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )?)
     }
 
     /// Run a hook command in the workspace directory with `env` overlaid on
@@ -4643,32 +4669,9 @@ impl ServiceManager {
     /// top of it, so later entries (the owning service's `env.X`) win over the
     /// resolved top-level variables they may shadow.
     async fn run_hook(&self, cmd: &str, env: &[(String, String)]) -> Result<()> {
-        let output = proc::shell_command(cmd)
-            .current_dir(&self.workspace.path)
-            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .output()
+        hooks::run_hook(cmd, &self.workspace.path, env)
             .await
-            .with_context(|| format!("failed to execute hook: {}", cmd))?;
-
-        if !output.status.success() {
-            // Surface both streams: plenty of tools (migrators especially)
-            // print the useful diagnostic to stdout, and reporting only stderr
-            // used to hide it.
-            let mut detail = String::new();
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stdout.trim().is_empty() {
-                detail.push_str("\nstdout:\n");
-                detail.push_str(stdout.trim_end());
-            }
-            if !stderr.trim().is_empty() {
-                detail.push_str("\nstderr:\n");
-                detail.push_str(stderr.trim_end());
-            }
-            bail!("hook failed: {}{}", cmd, detail);
-        }
-
-        Ok(())
+            .map_err(hooks::HookFailure::into_lifecycle_error)
     }
 }
 
@@ -5538,6 +5541,7 @@ mod tests {
         // The legacy `processes` map is dropped; its PID survives via the
         // migrated `Backend::Process`. `auto_ports` is unchanged.
         assert_eq!(state.auto_ports["web"]["default"], 5173);
+        assert!(state.teardown_hooks.is_none());
     }
 
     /// `start_order` defers `run=` apps to the end (so backing services start
