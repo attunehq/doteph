@@ -234,7 +234,8 @@ async fn missing_worktree_uses_the_saved_snapshot_and_state_directory_cwd() {
     );
     workspace.rewrite_eph(&config);
     assert_success("eph up", &workspace.eph(&["up"]).await);
-    let state_dir = workspace.state_dir().await;
+    let state_dir = dunce::canonicalize(workspace.state_dir().await)
+        .expect("failed to canonicalize test state directory");
     workspace.remove_workspace();
 
     let prune = workspace.prune(&["system", "prune", "--force"]).await;

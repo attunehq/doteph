@@ -1133,16 +1133,29 @@ async fn cmd_status() -> Result<()> {
 fn print_service_ports(name: &str, svc: &RunningService) {
     let mut ports: Vec<(&String, &u16)> = svc.ports.iter().collect();
     ports.sort_by(|a, b| a.0.cmp(b.0));
+    let hyperlinks = io::stdout().is_terminal();
 
     match ports.as_slice() {
         [] => println!("  {} (no ports)", name),
-        [(_, port)] => println!("  {} -> localhost:{}", name, port),
+        [(_, port)] => println!("  {} -> {}", name, service_url(**port, hyperlinks)),
         many => {
             println!("  {}:", name);
             for (port_name, port) in many {
-                println!("    {} -> localhost:{}", port_name, port);
+                println!("    {} -> {}", port_name, service_url(**port, hyperlinks));
             }
         }
+    }
+}
+
+/// Format an assigned port as an HTTP URL, optionally wrapped in an OSC 8
+/// terminal hyperlink. The URL remains the visible label so copied output is
+/// useful even when the terminal strips the control sequence.
+fn service_url(port: u16, hyperlink: bool) -> String {
+    let url = format!("http://localhost:{port}");
+    if hyperlink {
+        format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\")
+    } else {
+        url
     }
 }
 
@@ -1624,6 +1637,19 @@ mod tests {
 
     fn args(strs: &[&str]) -> Vec<String> {
         strs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn service_url_is_plain_http_when_output_is_not_a_terminal() {
+        assert_eq!(service_url(4567, false), "http://localhost:4567");
+    }
+
+    #[test]
+    fn service_url_uses_an_osc_8_hyperlink_for_terminal_output() {
+        assert_eq!(
+            service_url(4567, true),
+            "\x1b]8;;http://localhost:4567\x1b\\http://localhost:4567\x1b]8;;\x1b\\"
+        );
     }
 
     #[test]

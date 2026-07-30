@@ -3444,7 +3444,7 @@ async fn dev_retries_an_auto_port_app_that_exits_during_startup() {
             break;
         }
         let status = ws.eph(&["status"]).await;
-        if String::from_utf8_lossy(&status.stdout).contains("web -> localhost:") {
+        if String::from_utf8_lossy(&status.stdout).contains("web -> http://localhost:") {
             running = true;
             break;
         }
@@ -3589,7 +3589,7 @@ async fn dev_pre_start_hook_sees_foreground_port() {
             break;
         }
         let status = ws.eph(&["status"]).await;
-        if String::from_utf8_lossy(&status.stdout).contains("web -> localhost:") {
+        if String::from_utf8_lossy(&status.stdout).contains("web -> http://localhost:") {
             running = true;
             break;
         }

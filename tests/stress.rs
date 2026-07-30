@@ -568,7 +568,7 @@ async fn source_type_dockerfile_build() {
     // Find the mapped port from status and prove the built image runs redis.
     let env_port = {
         let status = ws.eph_ok(&["status"]).await;
-        // status prints "  cache -> localhost:<port>"
+        // status prints "  cache -> http://localhost:<port>"
         status
             .lines()
             .find_map(|l| l.split("localhost:").nth(1))
