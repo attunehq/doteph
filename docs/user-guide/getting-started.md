@@ -119,10 +119,12 @@ check to pass, and prints the assigned port:
 
 ```
 Services started:
-  postgres -> localhost:54321
+  postgres -> http://localhost:54321
 
 Run `eval "$(eph env)"` to set environment variables
 ```
+
+When stdout is a terminal, `eph` makes each service URL clickable.
 
 ## See what is running
 
@@ -135,7 +137,7 @@ Workspace: /home/you/projects/myapp
 ID: a1b2c3d4e5f60718
 
 Running services:
-  postgres -> localhost:54321
+  postgres -> http://localhost:54321
 ```
 
 ## Load the connection details into your shell
