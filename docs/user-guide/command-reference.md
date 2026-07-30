@@ -378,8 +378,8 @@ Workspace: /home/you/projects/myapp
 ID: a1b2c3d4e5f60718
 
 Running services:
-  postgres -> localhost:54321
-  redis -> localhost:54322
+  postgres -> http://localhost:54321
+  redis -> http://localhost:54322
 
 Stopped services:
   minio
