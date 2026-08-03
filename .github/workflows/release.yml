@@ -144,7 +144,7 @@ jobs:
 
             - name: Install cargo-cross
               if: matrix.cross
-              uses: taiki-e/install-action@v2
+              uses: taiki-e/install-action@v2.85.5
               with:
                   tool: cargo-cross
                   checksum: true
