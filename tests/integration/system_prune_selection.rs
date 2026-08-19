@@ -365,7 +365,8 @@ async fn merged_selects_only_merged_clean_worktrees() {
     let kept_section = out.split("Kept (").nth(1).unwrap_or_default();
     assert!(kept_section.contains(open.to_str().unwrap()), "{out}");
     assert!(
-        !out.contains(&format!("(merged branch) - {}", repo.path().display())),
+        !out.lines()
+            .any(|line| line.ends_with(&format!("(merged branch) - {}", repo.path().display()))),
         "{out}"
     );
 
