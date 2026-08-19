@@ -380,6 +380,7 @@ async fn merged_selects_only_merged_clean_worktrees() {
 
 /// Write metadata for a workspace whose path never existed, the way eph would
 /// have recorded it before the checkout was deleted.
+#[cfg(unix)]
 fn write_stale_metadata(state_root: &Path, workspace_path: &Path) -> PathBuf {
     use sha2::{Digest, Sha256};
     let workspace_id = hex::encode(Sha256::digest(workspace_path.to_string_lossy().as_bytes()));
