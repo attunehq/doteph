@@ -18,11 +18,14 @@ eph [--verbose] <command> [args]
 
 | Flag | Description |
 |------|-------------|
-| `-v`, `--verbose` | Enable debug logging (written to stderr). |
+| `-v`, `--verbose` | Enable debug logging (written to stderr) with timestamps and levels. |
 | `-h`, `--help` | Print help. Works on subcommands too (`eph up --help`). |
 | `-V`, `--version` | Print the version. |
 
-Logging always goes to **stderr**; command output goes to **stdout**.
+Logging always goes to **stderr**; command output goes to **stdout**. By
+default, progress lines ("Creating service web") print bare and warnings and
+errors are prefixed `warning:` / `error:`; `-v` switches to timestamped,
+leveled debug logging.
 
 ## `eph up [SERVICE...]`
 
@@ -254,37 +257,30 @@ eph system prune --force-live --yes
 ```
 
 ```text
-System prune dry run:
-  a1b2c3d4e5f60718 (missing workspace) - C:\Users\me\.codex\worktrees\1234\app
-    containers: 2, volumes: 1, networks: 1, images: 1, run processes: 0, state dirs: 1
+Would remove 2 workspaces (3 containers, 1 volume, 1 network, 1 image, 2 state directories):
+  ID                REASON             RESOURCES                                    WORKSPACE
+  a1b2c3d4e5f60718  missing workspace  2 containers, 1 volume, 1 network, 1 image  C:\Users\me\.codex\worktrees\1234\app
+  e5f60718293a4b5c  missing workspace  1 container                                  C:\Users\me\.codex\worktrees\5678\app
 
-Totals:
-  Containers: 2
-  Volumes: 1
-  Networks: 1
-  Images: 1
-  Verified run= processes: 0
-  State directories: 1
-
-Kept (workspace still exists; oldest first):
+Kept 2 workspaces (path still exists; oldest first):
   ID                LAST SEEN  PROCS  CONTAINERS  VOLUMES  BRANCH    WORKSPACE
   0818f8723c1772c9  14h        2      0/1         1        merged    C:\Users\me\.t3\worktrees\app\t3code-6e3b2781
   b6ce879752027b28  7m         2      1/1         1        unmerged  C:\Users\me\projects\app
-  2 workspaces (2 present), 4 live run= processes, 1 running container, 2 volumes; oldest last seen 14h ago. Select with --idle DURATION, --merged, or --force-non-empty.
+  2 workspaces, 4 live run= processes, 1 running container, 2 volumes
+  Select these with --idle DURATION, --merged, or --force-non-empty.
 
-Remove these resources? [y/N] y
-System prune complete:
-  a1b2c3d4e5f60718 (missing workspace) - C:\Users\me\.codex\worktrees\1234\app
-    containers: 2, volumes: 1, networks: 1, images: 1, run processes: 0, state dirs: 1
+Remove resources for 2 workspaces? [y/N] y
+Removing resources for workspace a1b2c3d4e5f60718
+Removing container eph-a1b2c3d4e5f60718-postgres
+...
 
-Totals:
-  Containers: 2
-  Volumes: 1
-  Networks: 1
-  Images: 1
-  Verified run= processes: 0
-  State directories: 1
+Removed 2 workspaces (3 containers, 1 volume, 1 network, 1 image, 2 state directories).
 ```
+
+`RESOURCES` lists what each workspace's removal covers besides its state
+directory; `state only` means nothing else was left behind. When nothing is
+selected the report opens with `Nothing to prune.` and still prints the Kept
+table.
 
 Behavior:
 
@@ -305,13 +301,15 @@ Behavior:
 - The "Kept" table lists every workspace that still exists and was not
   selected, oldest first, with its idle age, live `run=` processes, running
   and total containers, volumes, and branch status. It is printed with the
-  preview (and with `--dry-run`), not again after removal.
-- Progress is logged to stderr while prune acquires its lock, inventories
-  Docker, scans state directories, and removes resources. The final report
-  remains on stdout for callers that capture or pipe it. Prune lists each
-  Docker resource type once per pass and matches the resulting snapshot to
-  workspace namespaces in memory, so large state roots do not cause repeated
-  Docker API calls.
+  preview (and with `--dry-run`), not again after removal. The completion
+  report after a real removal is the one-line total plus anything the removal
+  itself turned up (skips, hook warnings); the per-workspace list was already
+  shown in the preview.
+- Each resource removal is logged to stderr as it happens; `-v` adds the
+  lock, Docker inventory, and state-scan steps. The report stays on stdout
+  for callers that capture or pipe it. Prune lists each Docker resource type
+  once per pass and matches the resulting snapshot to workspace namespaces in
+  memory, so large state roots do not cause repeated Docker API calls.
 - A workspace's recorded path only decides whether it is *stale*, not whether
   something is still running against it: before removing anything for a
   stale workspace, prune checks that workspace's actual Docker containers for
@@ -333,7 +331,7 @@ Behavior:
   live `run=` process still blocks unless `--force-live` (or `--force`) is
   passed.
 - Unless `--dry-run`, prune prints what it is about to remove and then asks
-  `Remove these resources? [y/N]` before deleting anything, the same way
+  `Remove resources for N workspaces? [y/N]` before deleting anything, the same way
   `docker system prune` does. Anything other than `y` or `yes` (a bare Enter
   included) aborts with nothing removed, and the command still exits
   successfully. Pass `-y`/`--yes` or `--force` to skip the prompt; one is
@@ -351,13 +349,16 @@ Behavior:
   service runs only its clean hooks. Namespace resources are removed before
   `post-clean`. When the workspace directory is gone, hooks run from its state
   directory but retain the recorded `EPH_WORKSPACE_ROOT`. Hook failures and
-  unresolved hook variables are printed under "Warnings" with captured output,
-  then prune continues. Docker, process, and state removal errors still fail the
+  unresolved hook variables are printed as warnings with captured output, then
+  prune continues. A warning shared by several workspaces is printed once with
+  the workspace count. Docker, process, and state removal errors still fail the
   command. `--dry-run` never executes hooks.
 - There is no prune-specific `--skip-hooks`. System prune is already best effort
   for hooks, so a broken cleanup script cannot block resource removal. State
   written before teardown snapshots were introduced still prunes and reports
-  that hooks were unavailable.
+  that hooks were unavailable; every `up` since then saves a snapshot (empty
+  when the file has no teardown hooks), so the warning fades as old state is
+  pruned.
 - For `run=` services, only a PID whose current process identity matches the
   identity eph recorded at launch is killed. A process entry without identity,
   and a mismatched PID that may have been reused, are skipped with a warning. A

@@ -222,6 +222,24 @@ pub struct PrunedWorkspace {
     pub counts: PruneCounts,
 }
 
+/// A non-fatal problem prune reports and then works around.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneWarning {
+    /// Workspace short ID the warning belongs to.
+    pub short_id: String,
+    /// What went wrong and what prune did instead.
+    pub message: String,
+}
+
+impl PruneReport {
+    fn warn(&mut self, short_id: &str, message: impl Into<String>) {
+        self.warnings.push(PruneWarning {
+            short_id: short_id.to_string(),
+            message: message.into(),
+        });
+    }
+}
+
 /// A state directory left alone by prune.
 #[derive(Debug, Clone)]
 pub struct SkippedWorkspace {
@@ -280,7 +298,7 @@ pub struct PruneReport {
     /// Workspaces or state directories left untouched.
     pub skipped: Vec<SkippedWorkspace>,
     /// Non-fatal warnings, including unsafe `run=` process prune skips.
-    pub warnings: Vec<String>,
+    pub warnings: Vec<PruneWarning>,
     /// Total resource counts across [`pruned`](Self::pruned).
     pub totals: PruneCounts,
 }
@@ -372,7 +390,7 @@ impl DockerInventory {
 /// are reported as warnings and skipped.
 pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
     let root = state_root()?;
-    info!("Acquiring system prune lock at {}", root.display());
+    debug!("Acquiring system prune lock at {}", root.display());
     let mut prune_lock = open_prune_lock(&root)?;
     let _lock = prune_lock.try_write().map_err(|err| {
         let path = root.join("prune.lock");
@@ -390,7 +408,7 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
     })?;
     let docker = Docker::connect_with_local_defaults()
         .context("failed to connect to docker (is docker running?)")?;
-    info!("Connecting to Docker");
+    debug!("Connecting to Docker");
     docker
         .ping()
         .await
@@ -404,12 +422,12 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
 
     let state_dirs = state_dirs(&root).await?;
     let state_dir_count = state_dirs.len();
-    info!("Inspecting {state_dir_count} eph state directories");
+    debug!("Inspecting {state_dir_count} eph state directories");
     let mut candidates = Vec::new();
     let mut inspected = Vec::new();
     for (index, state_dir) in state_dirs.into_iter().enumerate() {
         if index > 0 && index % 100 == 0 {
-            info!("Inspected {index} of {state_dir_count} eph state directories");
+            debug!("Inspected {index} of {state_dir_count} eph state directories");
         }
         debug!("Inspecting {}", state_dir.display());
         match classify_state_dir(state_dir, options, &mut report)? {
@@ -447,7 +465,7 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
     }
     candidates.sort_by(|a, b| a.short_id.cmp(&b.short_id));
 
-    info!(
+    debug!(
         "Found {} stale workspace candidates; inventorying Docker resources",
         candidates.len()
     );
@@ -475,7 +493,7 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
         client: &docker,
         inventory: &inventory,
     };
-    info!(
+    debug!(
         "Docker inventory contains {} containers, {} volumes, {} networks, and {} images",
         inventory.containers.len(),
         inventory.volumes.len(),
@@ -494,7 +512,7 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
     report
         .kept
         .sort_by_key(|workspace| workspace.last_seen_unix_secs);
-    info!(
+    debug!(
         "System prune pass found {} stale workspaces, kept {} existing workspaces, and skipped {} state directories",
         report.pruned.len(),
         report.kept.len(),
@@ -778,7 +796,7 @@ async fn prune_workspace(
         live_processes,
         options.force_live,
     ) {
-        info!(
+        debug!(
             "Skipping workspace {short_id}: {} still live",
             live_resource_summary(running_containers, live_processes)
         );
@@ -794,14 +812,8 @@ async fn prune_workspace(
     }
 
     let mut counts = PruneCounts::default();
-    let hook_snapshot = select_teardown_hooks(
-        state.as_ref(),
-        metadata.as_ref(),
-        &state_dir,
-        &short_id,
-        report,
-    )
-    .await;
+    let hook_snapshot =
+        select_teardown_hooks(state.as_ref(), metadata.as_ref(), &short_id, report).await;
     let hook_services = state.as_ref().map_or_else(HashMap::new, hook_services);
     let live_hook_services = hook_snapshot
         .as_ref()
@@ -908,14 +920,14 @@ async fn prune_workspace(
 async fn select_teardown_hooks(
     state: Option<&ServiceState>,
     metadata: Option<&WorkspaceMetadata>,
-    state_dir: &Path,
     short_id: &str,
     report: &mut PruneReport,
 ) -> Option<TeardownHookSnapshot> {
     let Some(metadata) = metadata else {
-        report.warnings.push(format!(
-            "{short_id}: teardown hooks are unavailable because workspace metadata is missing"
-        ));
+        report.warn(
+            short_id,
+            "teardown hooks are unavailable: workspace metadata is missing",
+        );
         return None;
     };
 
@@ -924,7 +936,7 @@ async fn select_teardown_hooks(
     if metadata.workspace_path.is_dir() {
         match tokio::fs::read_to_string(&eph_path).await {
             Ok(contents) => match parser::parse(&contents) {
-                Ok(eph) => return TeardownHookSnapshot::capture(&eph),
+                Ok(eph) => return Some(TeardownHookSnapshot::capture(&eph)),
                 Err(error) => {
                     current_error = Some(format!(
                         "could not parse current {} for prune hooks: {error:#}",
@@ -944,24 +956,27 @@ async fn select_teardown_hooks(
     match state.and_then(|state| state.teardown_hooks.clone()) {
         Some(snapshot) => {
             if let Some(error) = current_error {
-                report.warnings.push(format!(
-                    "{short_id}: {error}; using the saved teardown snapshot"
-                ));
+                report.warn(
+                    short_id,
+                    format!("{error}; using the saved teardown snapshot"),
+                );
             }
             Some(snapshot)
         }
         None => {
-            let state_path = state_dir.join("state.json");
-            match current_error {
-                Some(error) => report.warnings.push(format!(
-                    "{short_id}: teardown hooks are unavailable; {error}; {} has no saved hook snapshot",
-                    state_path.display()
-                )),
-                None => report.warnings.push(format!(
-                    "{short_id}: teardown hooks are unavailable; {} has no saved hook snapshot",
-                    state_path.display()
-                )),
-            }
+            // Every `up` since hook snapshots were introduced saves one (empty
+            // when the file has no teardown hooks), so a missing snapshot
+            // means the state predates them.
+            let detail = match current_error {
+                Some(error) => format!("{error}; "),
+                None => String::new(),
+            };
+            report.warn(
+                short_id,
+                format!(
+                    "teardown hooks are unavailable: {detail}state.json has no saved hook snapshot (written by an older eph)"
+                ),
+            );
             None
         }
     }
@@ -1045,10 +1060,13 @@ async fn run_hook_phase(
         Ok(env) => env,
         Err(error) => {
             for command in commands {
-                report.warnings.push(format!(
-                    "{}/{} {phase} hook `{command}` was skipped: {error:#}",
-                    context.short_id, service.name
-                ));
+                report.warn(
+                    context.short_id,
+                    format!(
+                        "{} {phase} hook `{command}` was skipped: {error:#}",
+                        service.name
+                    ),
+                );
             }
             return;
         }
@@ -1056,10 +1074,10 @@ async fn run_hook_phase(
 
     for command in commands {
         if let Err(error) = run_hook(command, context.cwd, &env).await {
-            report.warnings.push(format!(
-                "{}/{} {phase} hook failed: {error}",
-                context.short_id, service.name
-            ));
+            report.warn(
+                context.short_id,
+                format!("{} {phase} hook failed: {error}", service.name),
+            );
         }
     }
 }
@@ -1299,9 +1317,10 @@ async fn load_state_or_warn(
     match load_state(state_dir).await {
         Ok(state) => state,
         Err(err) => {
-            report.warnings.push(format!(
-                "{short_id}: could not read state.json, so run= process prune was skipped: {err:#}"
-            ));
+            report.warn(
+                short_id,
+                format!("could not read state.json, so run= process prune was skipped: {err:#}"),
+            );
             None
         }
     }
@@ -1349,9 +1368,10 @@ async fn terminate_live_processes(
 
         let Some(identity) = identity else {
             if proc::is_alive(*pid) {
-                report.warnings.push(format!(
-                    "{short_id}/{name}: skipped run= PID {pid}; state has no process identity"
-                ));
+                report.warn(
+                    short_id,
+                    format!("{name}: skipped run= PID {pid}; state has no process identity"),
+                );
             }
             continue;
         };
@@ -1364,9 +1384,12 @@ async fn terminate_live_processes(
                 proc::force_kill(*pid);
             }
         } else if proc::is_alive(*pid) {
-            report.warnings.push(format!(
-                "{short_id}/{name}: skipped run= PID {pid}; the live process does not match recorded identity"
-            ));
+            report.warn(
+                short_id,
+                format!(
+                    "{name}: skipped run= PID {pid}; the live process does not match recorded identity"
+                ),
+            );
         }
     }
 }
@@ -2176,14 +2199,12 @@ mod tests {
         std::fs::write(workspace_dir.path().join(".eph"), "[app]\nrun=\n").unwrap();
         let workspace = crate::Workspace::from_path(workspace_dir.path()).unwrap();
         let metadata = WorkspaceMetadata::for_workspace(&workspace);
-        let state_dir = tempfile::tempdir().unwrap();
         let state = ServiceState::default();
         let mut report = PruneReport::default();
 
         let snapshot = select_teardown_hooks(
             Some(&state),
             Some(&metadata),
-            state_dir.path(),
             &metadata.short_id,
             &mut report,
         )
@@ -2191,9 +2212,15 @@ mod tests {
 
         assert!(snapshot.is_none());
         assert_eq!(report.warnings.len(), 1);
-        assert!(report.warnings[0].contains("could not parse current"));
-        assert!(report.warnings[0].contains("no saved hook snapshot"));
-        assert!(!report.warnings[0].contains("using the saved teardown snapshot"));
+        let warning = &report.warnings[0];
+        assert_eq!(warning.short_id, metadata.short_id);
+        assert!(warning.message.contains("could not parse current"));
+        assert!(warning.message.contains("no saved hook snapshot"));
+        assert!(
+            !warning
+                .message
+                .contains("using the saved teardown snapshot")
+        );
     }
 
     /// Build metadata through the same path-derived identity contract as a

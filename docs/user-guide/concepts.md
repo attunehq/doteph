@@ -136,10 +136,10 @@ beside it:
 | macOS | `~/Library/Application Support/eph/<short_id>/state.json` |
 | Windows | `%LOCALAPPDATA%\eph\<short_id>\state.json` |
 
-When a file declares stop or clean hooks, state also stores the last parsed
-teardown commands, their top-level and service environments, service order, and
-backend family. System prune needs that snapshot when a worktree has already
-been deleted. Environment values may include development credentials, so protect
+State also stores a teardown hook snapshot: the last parsed stop and clean
+hook commands, their top-level and service environments, service order, and
+backend family (empty when the file declares no such hooks). System prune needs
+that snapshot when a worktree has already been deleted. Environment values may include development credentials, so protect
 `state.json` like `.eph`; `eph clean` and system prune remove it with the rest of
 the workspace state.
 

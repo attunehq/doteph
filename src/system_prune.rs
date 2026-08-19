@@ -1,9 +1,10 @@
 //! CLI boundary for cross-workspace pruning.
 
-use crate::system_ls::{format_age, workspace_table, workspace_totals};
+use crate::system_ls::{count_noun, render_table, workspace_table, workspace_totals};
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
-use eph::{PruneOptions, PruneReport};
+use eph::prune::PruneCounts;
+use eph::{PruneOptions, PruneReport, PruneWarning};
 use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
@@ -108,20 +109,13 @@ impl Args {
             merged: options.merged,
         };
 
-        if options.dry_run {
-            let report = eph::prune(preview_options).await?;
-            print_report(&report, true);
+        let preview = eph::prune(preview_options).await?;
+        print_preview(&preview);
+        if options.dry_run || preview.pruned.is_empty() {
             return Ok(());
         }
 
-        let preview = eph::prune(preview_options).await?;
-        print_report(&preview, true);
-
-        match eph::confirmation_outcome(
-            !preview.totals.is_empty(),
-            options.yes,
-            io::stdin().is_terminal(),
-        ) {
+        match eph::confirmation_outcome(true, options.yes, io::stdin().is_terminal()) {
             eph::ConfirmationOutcome::Proceed => {}
             eph::ConfirmationOutcome::RequireYes => {
                 anyhow::bail!(
@@ -129,7 +123,10 @@ impl Args {
                 );
             }
             eph::ConfirmationOutcome::Prompt => {
-                print!("\nRemove these resources? [y/N] ");
+                print!(
+                    "\nRemove resources for {}? [y/N] ",
+                    count_noun(preview.pruned.len(), "workspace")
+                );
                 io::stdout()
                     .flush()
                     .context("failed to write the prune confirmation prompt")?;
@@ -155,89 +152,155 @@ impl Args {
             merged: options.merged,
         })
         .await?;
-        // The kept table did not change between preview and removal and was
-        // just shown, so the completion report leaves it out.
-        print_report(&report, false);
+        println!();
+        print_completion(&report);
         Ok(())
     }
 }
 
-fn print_report(report: &PruneReport, with_kept: bool) {
-    let title = if report.dry_run {
-        "System prune dry run:"
-    } else {
-        "System prune complete:"
-    };
-    println!("{title}");
-
+/// The selection report: every workspace that would be removed and why,
+/// followed by the workspaces left alone. Printed for `--dry-run` and as the
+/// preview before the confirmation prompt.
+fn print_preview(report: &PruneReport) {
     if report.pruned.is_empty() {
-        println!("  No stale workspaces found");
+        println!("Nothing to prune.");
     } else {
-        for workspace in &report.pruned {
-            let path = workspace
-                .workspace_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<workspace metadata unavailable>".to_string());
-            println!("  {} ({}) - {}", workspace.short_id, workspace.reason, path);
-            println!(
-                "    containers: {}, volumes: {}, networks: {}, images: {}, run processes: {}, state dirs: {}",
-                workspace.counts.containers,
-                workspace.counts.volumes,
-                workspace.counts.networks,
-                workspace.counts.images,
-                workspace.counts.processes,
-                workspace.counts.state_dirs
-            );
+        println!(
+            "Would remove {} ({}):",
+            count_noun(report.pruned.len(), "workspace"),
+            counts_summary(&report.totals, true)
+        );
+        let mut rows = vec![
+            ["ID", "REASON", "RESOURCES", "WORKSPACE"]
+                .map(str::to_string)
+                .to_vec(),
+        ];
+        rows.extend(report.pruned.iter().map(|workspace| {
+            vec![
+                workspace.short_id.clone(),
+                workspace.reason.to_string(),
+                counts_summary(&workspace.counts, false),
+                workspace
+                    .workspace_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(no workspace metadata)".to_string()),
+            ]
+        }));
+        for line in render_table(&rows) {
+            println!("{line}");
         }
     }
 
-    println!();
-    println!("Totals:");
-    println!("  Containers: {}", report.totals.containers);
-    println!("  Volumes: {}", report.totals.volumes);
-    println!("  Networks: {}", report.totals.networks);
-    println!("  Images: {}", report.totals.images);
-    println!("  Verified run= processes: {}", report.totals.processes);
-    println!("  State directories: {}", report.totals.state_dirs);
-
-    if with_kept && !report.kept.is_empty() {
+    if !report.kept.is_empty() {
         println!();
-        println!("Kept (workspace still exists; oldest first):");
+        println!(
+            "Kept {} (path still exists; oldest first):",
+            count_noun(report.kept.len(), "workspace")
+        );
         for line in workspace_table(&report.kept, report.now_unix_secs, false) {
             println!("{line}");
         }
-        let oldest = report
-            .kept
-            .first()
-            .map(|workspace| format_age(workspace.idle_secs(report.now_unix_secs)))
-            .unwrap_or_default();
-        println!(
-            "  {}; oldest last seen {oldest} ago. Select with --idle DURATION, --merged, or --force-non-empty.",
-            workspace_totals(&report.kept)
-        );
+        println!("  {}", workspace_totals(&report.kept));
+        println!("  Select these with --idle DURATION, --merged, or --force-non-empty.");
     }
 
+    print_skipped_and_warnings(report);
+}
+
+/// The outcome of a real removal. The preview already listed each workspace,
+/// so this repeats only the totals plus anything new the removal turned up.
+fn print_completion(report: &PruneReport) {
+    println!(
+        "Removed {} ({}).",
+        count_noun(report.pruned.len(), "workspace"),
+        counts_summary(&report.totals, true)
+    );
+    print_skipped_and_warnings(report);
+}
+
+fn print_skipped_and_warnings(report: &PruneReport) {
     if !report.skipped.is_empty() {
         println!();
-        println!("Skipped:");
+        println!("Skipped {}:", count_noun(report.skipped.len(), "workspace"));
+        let mut rows = Vec::new();
         for skipped in &report.skipped {
-            let path = skipped
-                .workspace_path
-                .as_ref()
-                .map(|p| format!(" ({})", p.display()))
-                .unwrap_or_default();
-            println!("  {}{} - {}", skipped.short_id, path, skipped.reason);
+            rows.push(vec![skipped.short_id.clone(), skipped.reason.clone()]);
+            if let Some(path) = &skipped.workspace_path {
+                rows.push(vec![String::new(), path.display().to_string()]);
+            }
+        }
+        for line in render_table(&rows) {
+            println!("{line}");
         }
     }
 
     if !report.warnings.is_empty() {
         println!();
-        println!("Warnings:");
-        for warning in &report.warnings {
-            println!("  {warning}");
+        println!("{}:", count_noun(report.warnings.len(), "warning"));
+        for line in grouped_warnings(&report.warnings) {
+            println!("  {line}");
         }
     }
+}
+
+/// One line per distinct warning message. A message shared by several
+/// workspaces (typically a whole batch of state written by an older eph)
+/// appears once with the workspace count in place of a single ID.
+fn grouped_warnings(warnings: &[PruneWarning]) -> Vec<String> {
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    for warning in warnings {
+        match groups
+            .iter_mut()
+            .find(|(message, _)| *message == warning.message)
+        {
+            Some((_, ids)) => ids.push(&warning.short_id),
+            None => groups.push((&warning.message, vec![&warning.short_id])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(message, ids)| {
+            let who = match ids.as_slice() {
+                [id] => (*id).to_string(),
+                ids => count_noun(ids.len(), "workspace"),
+            };
+            format!("{who:16}  {message}")
+        })
+        .collect()
+}
+
+/// `2 containers, 1 volume`: the non-zero counts in `counts`. State
+/// directories are listed only `with_state`; each pruned workspace has exactly
+/// one, so a per-workspace row that removes nothing else reads `state only`.
+fn counts_summary(counts: &PruneCounts, with_state: bool) -> String {
+    let mut parts = Vec::new();
+    for (count, noun) in [
+        (counts.containers, "container"),
+        (counts.volumes, "volume"),
+        (counts.networks, "network"),
+        (counts.images, "image"),
+        (counts.processes, "run= process"),
+    ] {
+        if count > 0 {
+            parts.push(count_noun(count, noun));
+        }
+    }
+    if with_state && counts.state_dirs > 0 {
+        parts.push(format!(
+            "{} state director{}",
+            counts.state_dirs,
+            if counts.state_dirs == 1 { "y" } else { "ies" }
+        ));
+    }
+    if parts.is_empty() {
+        return if with_state {
+            "nothing".to_string()
+        } else {
+            "state only".to_string()
+        };
+    }
+    parts.join(", ")
 }
 
 #[cfg(test)]
@@ -311,6 +374,50 @@ mod tests {
         assert!(options.force_non_empty);
         assert!(options.force_live);
         assert!(options.yes);
+    }
+
+    #[test]
+    fn counts_summary_lists_only_non_zero_resources() {
+        let counts = PruneCounts {
+            containers: 2,
+            volumes: 1,
+            state_dirs: 1,
+            ..PruneCounts::default()
+        };
+        assert_eq!(counts_summary(&counts, false), "2 containers, 1 volume");
+        assert_eq!(
+            counts_summary(&counts, true),
+            "2 containers, 1 volume, 1 state directory"
+        );
+        let state_only = PruneCounts {
+            state_dirs: 3,
+            ..PruneCounts::default()
+        };
+        assert_eq!(counts_summary(&state_only, false), "state only");
+        assert_eq!(counts_summary(&state_only, true), "3 state directories");
+    }
+
+    #[test]
+    fn identical_warnings_collapse_to_one_line_with_a_count() {
+        let warning = |short_id: &str, message: &str| PruneWarning {
+            short_id: short_id.to_string(),
+            message: message.to_string(),
+        };
+        let lines = grouped_warnings(&[
+            warning("a1b2c3d4e5f60718", "state.json has no saved hook snapshot"),
+            warning(
+                "0123456789abcdef",
+                "web post-stop hook failed: exit status 1",
+            ),
+            warning("e5f60718293a4b5c", "state.json has no saved hook snapshot"),
+        ]);
+        assert_eq!(
+            lines,
+            [
+                "2 workspaces      state.json has no saved hook snapshot",
+                "0123456789abcdef  web post-stop hook failed: exit status 1",
+            ]
+        );
     }
 
     #[test]

@@ -2050,7 +2050,7 @@ pub struct ServiceManager {
 
 impl ServiceManager {
     async fn save_teardown_hooks(&mut self, eph: &EphFile) -> Result<()> {
-        self.state.teardown_hooks = TeardownHookSnapshot::capture(eph);
+        self.state.teardown_hooks = Some(TeardownHookSnapshot::capture(eph));
         self.state.save(&self.workspace).await
     }
 
