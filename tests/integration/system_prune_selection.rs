@@ -409,12 +409,19 @@ fn write_stale_metadata(state_root: &Path, workspace_path: &Path) -> PathBuf {
 /// confirmation prompt; prune now locks candidates in bounded batches.
 #[cfg(unix)]
 #[tokio::test]
-async fn prune_survives_more_stale_workspaces_than_open_file_slots() {
+async fn prune_survives_more_stale_workspaces_than_open_file_slots_and_sweeps_lock_files() {
     let state_root = tempfile::tempdir().unwrap();
     let missing = state_root.path().join("deleted-checkouts");
     let state_dirs: Vec<PathBuf> = (0..300)
         .map(|i| write_stale_metadata(state_root.path(), &missing.join(i.to_string())))
         .collect();
+    // Lock files left behind by earlier cleans and prunes: an idle one is
+    // swept, one another eph command holds right now is not.
+    let idle_lock = state_root.path().join("0123456789abcdef.lock");
+    let held_lock = state_root.path().join("fedcba9876543210.lock");
+    std::fs::write(&idle_lock, "").unwrap();
+    let mut held = fd_lock::RwLock::new(std::fs::File::create(&held_lock).unwrap());
+    let _held_guard = held.write().unwrap();
 
     let prune = tokio::process::Command::new("sh")
         .arg("-c")
@@ -438,4 +445,15 @@ async fn prune_survives_more_stale_workspaces_than_open_file_slots() {
         "a workspace that never started a service has no hooks to miss: {out}"
     );
     assert!(state_dirs.iter().all(|dir| !dir.exists()));
+    assert!(
+        state_dirs
+            .iter()
+            .all(|dir| !dir.with_extension("lock").exists()),
+        "prune should sweep the lock files of the workspaces it removed"
+    );
+    assert!(
+        !idle_lock.exists(),
+        "an idle orphan lock file should be swept"
+    );
+    assert!(held_lock.exists(), "a held lock file must be left alone");
 }
