@@ -303,6 +303,9 @@ pub struct PruneReport {
     pub totals: PruneCounts,
 }
 
+/// How many stale workspaces one prune batch locks at once; see [`prune`].
+const LOCK_BATCH_SIZE: usize = 64;
+
 /// One daemon-wide resource listing shared by every workspace in a prune pass.
 ///
 /// State roots can contain thousands of workspaces. Listing each Docker
@@ -465,45 +468,55 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
     }
     candidates.sort_by(|a, b| a.short_id.cmp(&b.short_id));
 
-    debug!(
-        "Found {} stale workspace candidates; inventorying Docker resources",
-        candidates.len()
-    );
+    debug!("Found {} stale workspace candidates", candidates.len());
 
     // An existing non-empty path can still run lifecycle commands. Lock every
     // destructive candidate before taking the shared Docker snapshot so an
     // `up` cannot create resources after the liveness check and before prune
     // removes the workspace's state. The daemon-wide prune lock gives every
     // prune the same lock order, so candidate locks cannot deadlock each other.
-    let mut workspace_locks = if options.dry_run {
-        Vec::new()
-    } else {
-        candidates
-            .iter()
-            .map(|candidate| WorkspaceLock::open_state_dir(&candidate.state_dir))
-            .collect::<Result<Vec<_>>>()?
-    };
-    let _workspace_guards = workspace_locks
-        .iter_mut()
-        .map(WorkspaceLock::acquire)
-        .collect::<Result<Vec<_>>>()?;
+    //
+    // Each held lock is an open file descriptor, and a state root can hold
+    // hundreds of stale workspaces (a default macOS shell allows 256 open
+    // files), so candidates are locked and inventoried in bounded batches
+    // rather than all at once. Dry runs take no locks, but share the batching
+    // so their Docker snapshots match a real run's.
+    let mut candidates = candidates.into_iter().peekable();
+    while candidates.peek().is_some() {
+        let batch: Vec<PruneCandidate> = candidates.by_ref().take(LOCK_BATCH_SIZE).collect();
+        let mut workspace_locks = if options.dry_run {
+            Vec::new()
+        } else {
+            batch
+                .iter()
+                .map(|candidate| WorkspaceLock::open_state_dir(&candidate.state_dir))
+                .collect::<Result<Vec<_>>>()?
+        };
+        let _workspace_guards = workspace_locks
+            .iter_mut()
+            .map(WorkspaceLock::acquire)
+            .collect::<Result<Vec<_>>>()?;
 
-    let inventory = DockerInventory::load(&docker).await?;
-    let prune_docker = PruneDocker {
-        client: &docker,
-        inventory: &inventory,
-    };
-    debug!(
-        "Docker inventory contains {} containers, {} volumes, {} networks, and {} images",
-        inventory.containers.len(),
-        inventory.volumes.len(),
-        inventory.networks.len(),
-        inventory.images.len()
-    );
-
-    for candidate in candidates {
-        prune_candidate(&prune_docker, candidate, options, &mut report).await?;
+        let inventory = DockerInventory::load(&docker).await?;
+        let prune_docker = PruneDocker {
+            client: &docker,
+            inventory: &inventory,
+        };
+        debug!(
+            "Docker inventory contains {} containers, {} volumes, {} networks, and {} images",
+            inventory.containers.len(),
+            inventory.volumes.len(),
+            inventory.networks.len(),
+            inventory.images.len()
+        );
+        for candidate in batch {
+            prune_candidate(&prune_docker, candidate, options, &mut report).await?;
+        }
     }
+
+    // Kept workspaces are summarized from a snapshot taken after every
+    // removal, so their counts never include resources a batch just deleted.
+    let inventory = DockerInventory::load(&docker).await?;
     for (workspace, merge) in kept {
         report
             .kept
@@ -953,7 +966,11 @@ async fn select_teardown_hooks(
         }
     }
 
-    match state.and_then(|state| state.teardown_hooks.clone()) {
+    // No state at all means no service was ever started here, so there is
+    // nothing for teardown hooks to act on and nothing to warn about. (An
+    // unreadable state.json is reported separately by `load_state_or_warn`.)
+    let state = state?;
+    match state.teardown_hooks.clone() {
         Some(snapshot) => {
             if let Some(error) = current_error {
                 report.warn(

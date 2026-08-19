@@ -377,3 +377,65 @@ async fn merged_selects_only_merged_clean_worktrees() {
     )
     .await;
 }
+
+/// Write metadata for a workspace whose path never existed, the way eph would
+/// have recorded it before the checkout was deleted.
+#[cfg(unix)]
+fn write_stale_metadata(state_root: &Path, workspace_path: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let workspace_id = hex::encode(Sha256::digest(workspace_path.to_string_lossy().as_bytes()));
+    let short_id = &workspace_id[..16];
+    let state_dir = state_root.join(short_id);
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let metadata = serde_json::json!({
+        "schema": 1,
+        "workspace_id": workspace_id,
+        "short_id": short_id,
+        "workspace_path": workspace_path,
+        "container_prefix": format!("eph-{short_id}"),
+        "last_seen_unix_secs": 0
+    });
+    std::fs::write(
+        state_dir.join("workspace.json"),
+        serde_json::to_string_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+    state_dir
+}
+
+/// Each locked candidate is an open file descriptor. A state root with more
+/// stale workspaces than the process may have open files (a default macOS
+/// shell allows 256) used to fail with "Too many open files" right after the
+/// confirmation prompt; prune now locks candidates in bounded batches.
+#[cfg(unix)]
+#[tokio::test]
+async fn prune_survives_more_stale_workspaces_than_open_file_slots() {
+    let state_root = tempfile::tempdir().unwrap();
+    let missing = state_root.path().join("deleted-checkouts");
+    let state_dirs: Vec<PathBuf> = (0..300)
+        .map(|i| write_stale_metadata(state_root.path(), &missing.join(i.to_string())))
+        .collect();
+
+    let prune = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "ulimit -n 128 && exec '{}' system prune --yes",
+            env!("CARGO_BIN_EXE_eph")
+        ))
+        .current_dir(state_root.path())
+        .env("EPH_STATE_ROOT", state_root.path())
+        .output()
+        .await
+        .expect("failed to run eph under a low open-file limit");
+    assert_success("eph system prune --yes with ulimit -n 128", &prune);
+    let out = stdout(&prune);
+    assert!(
+        out.contains("Removed 300 workspaces"),
+        "every stale workspace should be removed: {out}"
+    );
+    assert!(
+        !out.contains("no saved hook snapshot"),
+        "a workspace that never started a service has no hooks to miss: {out}"
+    );
+    assert!(state_dirs.iter().all(|dir| !dir.exists()));
+}
