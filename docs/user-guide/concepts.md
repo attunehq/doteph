@@ -171,7 +171,9 @@ race the same `state.json` or double-spawn a service; the second command
 waits for the first (printing a notice while it does) rather than
 proceeding against stale state. The lock is released by the operating system
 the instant the holding process exits, crash included, so a killed `eph up`
-can never wedge a later command.
+can never wedge a later command. The lock file lives beside the state
+directory, so removing the directory leaves it behind; `eph system prune`
+sweeps lock files whose state directory is gone and that nothing holds.
 
 Two commands manage state directories in bulk: `eph clean` deletes the state
 directory for the current workspace along with its services and data, and

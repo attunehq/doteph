@@ -514,6 +514,10 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
         }
     }
 
+    if !options.dry_run {
+        sweep_orphan_lock_files(&root);
+    }
+
     // Kept workspaces are summarized from a snapshot taken after every
     // removal, so their counts never include resources a batch just deleted.
     let inventory = DockerInventory::load(&docker).await?;
@@ -1672,6 +1676,54 @@ async fn state_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     }
     dirs.sort();
     Ok(dirs)
+}
+
+/// Remove `<short_id>.lock` files whose state directory is gone and that no
+/// eph command currently holds.
+///
+/// Workspace locks live beside their state directory (see
+/// [`WorkspaceLock::open_state_dir`]), so `eph clean` and prune leave one
+/// behind for every workspace they remove; on a busy state root those
+/// accumulate into hundreds of empty files. A lock file is only ever reused by
+/// a command in that same workspace, and a held one (a first `up` creating the
+/// state directory right now, for instance) is left alone: it is unlinked only
+/// while this prune holds it, so a later opener creates a fresh file.
+///
+/// Best effort: a file that cannot be opened, locked, or removed is simply
+/// left for the next prune.
+fn sweep_orphan_lock_files(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(stem) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".lock"))
+        else {
+            continue;
+        };
+        if stem == "prune" || root.join(stem).is_dir() {
+            continue;
+        }
+        let Ok(file) = OpenOptions::new().write(true).open(&path) else {
+            continue;
+        };
+        let mut lock = fd_lock::RwLock::new(file);
+        let Ok(_held) = lock.try_write() else {
+            debug!("Leaving held lock file {}", path.display());
+            continue;
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(error) => debug!("Could not remove lock file {}: {error}", path.display()),
+        }
+    }
+    if removed > 0 {
+        debug!("Removed {removed} orphan workspace lock files");
+    }
 }
 
 /// Look at the recorded workspace path on disk.

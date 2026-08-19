@@ -379,6 +379,10 @@ Behavior:
   already changing that workspace, prune waits for it and then inventories the
   resulting resources. This keeps the live-resource guard accurate for
   existing non-empty workspaces.
+- Workspace lock files (`<short_id>.lock`, beside each state directory) are
+  left behind by `eph clean` and by prune itself. A real prune finishes by
+  removing every lock file whose state directory is gone and that no eph
+  command currently holds, so the state root does not fill with empty files.
 
 ## `eph dev [SERVICE] [--clean] [--watch GLOB]... [--skip-hooks]`
 
