@@ -21,6 +21,9 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitCode};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::fmt::format::{self, FormatEvent, FormatFields};
+use tracing_subscriber::registry::LookupSpan;
 
 mod system_ls;
 mod system_prune;
@@ -382,17 +385,47 @@ async fn main() -> Result<ExitCode> {
 /// Log to stderr, never stdout: stdout carries the command's real output (e.g.
 /// `eph env` emits shell/JSON meant for `eval "$(eph env)"` or piping into a
 /// parser); mixing log lines into it corrupts that machine-readable output.
+///
+/// By default, `info!` lines are eph's progress narration ("Creating service
+/// web", "Removing container ..."), so they print bare, with warnings and
+/// errors prefixed `warning:` / `error:`. `-v` switches to the full
+/// timestamped, leveled format down to `debug`.
 fn init_tracing(verbose: bool) {
-    let filter = if verbose {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::new("info")
-    };
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let builder = tracing_subscriber::fmt()
         .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
+        .with_writer(std::io::stderr);
+    if verbose {
+        builder.with_env_filter(EnvFilter::new("debug")).init();
+    } else {
+        builder
+            .with_env_filter(EnvFilter::new("info"))
+            .event_format(PlainFormat)
+            .init();
+    }
+}
+
+/// The default, non-verbose log line: `[warning: |error: ]<message>`.
+struct PlainFormat;
+
+impl<S, N> FormatEvent<S, N> for PlainFormat
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        match *event.metadata().level() {
+            tracing::Level::ERROR => writer.write_str("error: ")?,
+            tracing::Level::WARN => writer.write_str("warning: ")?,
+            _ => {}
+        }
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
+    }
 }
 
 /// Split `eph`'s raw argv (everything after the program name) into

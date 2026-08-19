@@ -68,8 +68,14 @@ pub(crate) fn workspace_table(
         ]);
         rows.push(row);
     }
+    render_table(&rows)
+}
 
-    let columns = rows[0].len();
+/// Align `rows` into columns, two spaces apart, each line indented by two
+/// spaces. Every row must have the same number of cells; the last cell is not
+/// padded, so long paths in a final column do not drag trailing whitespace.
+pub(crate) fn render_table(rows: &[Vec<String>]) -> Vec<String> {
+    let columns = rows.first().map_or(0, Vec::len);
     let widths: Vec<usize> = (0..columns)
         .map(|column| {
             rows.iter()
@@ -93,26 +99,37 @@ pub(crate) fn workspace_table(
         .collect()
 }
 
-/// One-line summary of the live footprint across `workspaces`.
+/// One-line summary of the live footprint across `workspaces`. The present
+/// count appears only when some workspace is not present, so a list where
+/// every path still exists (prune's "Kept" table) does not repeat itself.
 pub(crate) fn workspace_totals(workspaces: &[WorkspaceSummary]) -> String {
     let present = workspaces
         .iter()
         .filter(|workspace| workspace.path_state == PathState::Present)
         .count();
+    let present = if present == workspaces.len() {
+        String::new()
+    } else {
+        format!(" ({present} present)")
+    };
     let processes: usize = workspaces.iter().map(|w| w.live_processes).sum();
     let running: usize = workspaces.iter().map(|w| w.running_containers).sum();
     let volumes: usize = workspaces.iter().map(|w| w.volumes).sum();
     format!(
-        "{} workspace{} ({present} present), {processes} live run= process{}, {running} running container{}, {volumes} volume{}",
-        workspaces.len(),
-        plural(workspaces.len()),
+        "{}{present}, {processes} live run= process{}, {running} running container{}, {}",
+        count_noun(workspaces.len(), "workspace"),
         if processes == 1 { "" } else { "es" },
         plural(running),
-        plural(volumes),
+        count_noun(volumes, "volume"),
     )
 }
 
-fn plural(count: usize) -> &'static str {
+/// `1 container`, `2 containers`: a count with its regularly pluralized noun.
+pub(crate) fn count_noun(count: usize, noun: &str) -> String {
+    format!("{count} {noun}{}", plural(count))
+}
+
+pub(crate) fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
 
@@ -190,12 +207,14 @@ mod tests {
         one.volumes = 1;
         assert_eq!(
             workspace_totals(&[one]),
-            "1 workspace (1 present), 1 live run= process, 1 running container, 1 volume"
+            "1 workspace, 1 live run= process, 1 running container, 1 volume"
         );
-        let lines = workspace_totals(&[summary("a", 0), summary("b", 0)]);
+        let mut missing = summary("b", 0);
+        missing.path_state = PathState::Missing;
+        let lines = workspace_totals(&[summary("a", 0), missing]);
         assert_eq!(
             lines,
-            "2 workspaces (2 present), 4 live run= processes, 2 running containers, 2 volumes"
+            "2 workspaces (1 present), 4 live run= processes, 2 running containers, 2 volumes"
         );
     }
 }

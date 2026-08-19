@@ -177,11 +177,11 @@ async fn missing_workspace_with_live_run_process_is_pruned_without_force_live() 
     assert_success("eph system prune --yes", &prune);
     let out = stdout(&prune);
     assert!(
-        out.contains("(missing workspace)") && out.contains("Verified run= processes: 1"),
+        out.contains("missing workspace") && out.contains("1 run= process"),
         "prune should reap the orphaned run= process: {out}"
     );
     assert!(
-        !out.contains("Skipped:"),
+        !out.contains("Skipped "),
         "nothing should be skipped: {out}"
     );
     assert!(!state_dir.exists());
@@ -207,7 +207,7 @@ async fn idle_selects_old_workspaces_and_reaps_their_processes() {
     assert_success("eph system prune --dry-run", &kept);
     let kept_out = stdout(&kept);
     assert!(
-        kept_out.contains("Kept (workspace still exists")
+        kept_out.contains("Kept 1 workspace")
             && kept_out.contains(&short_id)
             && kept_out.contains("3d"),
         "an idle workspace should be listed as kept with its age: {kept_out}"
@@ -219,7 +219,7 @@ async fn idle_selects_old_workspaces_and_reaps_their_processes() {
         .await;
     assert_success("eph system prune --idle 7d", &too_young);
     assert!(
-        !stdout(&too_young).contains("(idle workspace)"),
+        !stdout(&too_young).contains("idle workspace"),
         "a 3d-old workspace is not idle for 7d: {}",
         stdout(&too_young)
     );
@@ -230,7 +230,7 @@ async fn idle_selects_old_workspaces_and_reaps_their_processes() {
     assert_success("eph system prune --idle 2d --yes", &prune);
     let out = stdout(&prune);
     assert!(
-        out.contains("(idle workspace)") && out.contains("Verified run= processes: 1"),
+        out.contains("idle workspace") && out.contains("1 run= process"),
         "idle prune should select the workspace and reap its process: {out}"
     );
     assert!(!state_dir.exists());
@@ -267,7 +267,7 @@ async fn workspace_without_eph_file_is_pruned_by_default() {
     let prune = workspace.eph(&["system", "prune", "--yes"]).await;
     assert_success("eph system prune --yes", &prune);
     assert!(
-        stdout(&prune).contains("(workspace has no .eph file)"),
+        stdout(&prune).contains("workspace has no .eph file"),
         "{}",
         stdout(&prune)
     );
@@ -359,14 +359,15 @@ async fn merged_selects_only_merged_clean_worktrees() {
     assert_success("eph system prune --merged --yes", &prune);
     let out = stdout(&prune);
     assert!(
-        out.contains("(merged branch)") && out.contains(merged.to_str().unwrap()),
+        out.contains("merged branch") && out.contains(merged.to_str().unwrap()),
         "{out}"
     );
-    let kept_section = out.split("Kept (").nth(1).unwrap_or_default();
+    let kept_section = out.split("Kept ").nth(1).unwrap_or_default();
     assert!(kept_section.contains(open.to_str().unwrap()), "{out}");
     assert!(
-        !out.lines()
-            .any(|line| line.ends_with(&format!("(merged branch) - {}", repo.path().display()))),
+        !out.lines().any(|line| {
+            line.contains("merged branch") && line.ends_with(&repo.path().display().to_string())
+        }),
         "{out}"
     );
 

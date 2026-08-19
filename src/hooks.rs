@@ -41,11 +41,6 @@ impl<'de> Deserialize<'de> for TeardownHookSnapshot {
         }
 
         let raw = RawSnapshot::deserialize(deserializer)?;
-        if raw.services.is_empty() {
-            return Err(serde::de::Error::custom(
-                "teardown hook snapshot has no hook-bearing services",
-            ));
-        }
 
         let mut env_names = HashSet::new();
         for variable in &raw.env_vars {
@@ -216,7 +211,12 @@ impl TeardownHookService {
 
 impl TeardownHookSnapshot {
     /// Capture the minimum configuration needed to run teardown hooks later.
-    pub(crate) fn capture(eph: &EphFile) -> Option<Self> {
+    ///
+    /// A file with no teardown hooks yields an empty snapshot rather than
+    /// `None`, so a saved state can tell "this workspace has no hooks" apart
+    /// from "this state predates hook snapshots" and prune only warns about
+    /// the latter.
+    pub(crate) fn capture(eph: &EphFile) -> Self {
         let services = eph
             .start_order()
             .into_iter()
@@ -234,11 +234,7 @@ impl TeardownHookSnapshot {
             })
             .collect::<Vec<_>>();
 
-        if services.is_empty() {
-            return None;
-        }
-
-        Some(Self {
+        Self {
             env_vars: eph
                 .env_vars
                 .iter()
@@ -248,7 +244,7 @@ impl TeardownHookSnapshot {
                 })
                 .collect(),
             services,
-        })
+        }
     }
 
     pub(crate) fn services_rev(&self) -> impl DoubleEndedIterator<Item = &TeardownHookService> {
@@ -484,7 +480,7 @@ mod tests {
         )
         .unwrap();
 
-        let snapshot = TeardownHookSnapshot::capture(&eph).unwrap();
+        let snapshot = TeardownHookSnapshot::capture(&eph);
         let names = snapshot
             .services
             .iter()
@@ -495,10 +491,10 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_is_absent_without_teardown_hooks() {
+    fn snapshot_is_empty_without_teardown_hooks() {
         let eph = parse("[db]\nimage=postgres\npost-start=seed\n").unwrap();
 
-        assert!(TeardownHookSnapshot::capture(&eph).is_none());
+        assert!(TeardownHookSnapshot::capture(&eph).services.is_empty());
     }
 
     #[test]
@@ -507,7 +503,7 @@ mod tests {
             "DATABASE_URL=postgres://localhost:${db.port}/app\n\n[db]\nimage=postgres\nport=5432\nenv.POSTGRES_DB=app\npre-start=generate\npost-start=seed\npre-stop=backup\npost-clean=restore\n",
         )
         .unwrap();
-        let snapshot = TeardownHookSnapshot::capture(&eph).unwrap();
+        let snapshot = TeardownHookSnapshot::capture(&eph);
 
         let json = serde_json::to_string(&snapshot).unwrap();
         let restored: TeardownHookSnapshot = serde_json::from_str(&json).unwrap();
@@ -533,10 +529,14 @@ mod tests {
             }]
         });
 
-        let mut cases = Vec::new();
         let mut no_services = valid.clone();
         no_services["services"] = serde_json::json!([]);
-        cases.push(no_services);
+        assert!(
+            serde_json::from_value::<TeardownHookSnapshot>(no_services).is_ok(),
+            "a file without teardown hooks saves an empty snapshot"
+        );
+
+        let mut cases = Vec::new();
         let mut invalid_service = valid.clone();
         invalid_service["services"][0]["name"] = serde_json::json!("DB");
         cases.push(invalid_service);
@@ -572,7 +572,7 @@ mod tests {
             "DATABASE_URL=postgres://localhost:${db.port}/app\n\n[db]\nimage=postgres\nport=5432\nenv.PORT_COPY=${db.port}\npre-stop=backup\n",
         )
         .unwrap();
-        let snapshot = TeardownHookSnapshot::capture(&eph).unwrap();
+        let snapshot = TeardownHookSnapshot::capture(&eph);
         let service = &snapshot.services[0];
         let running = HashMap::from([(
             "db".to_string(),

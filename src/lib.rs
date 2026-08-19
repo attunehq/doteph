@@ -37,7 +37,7 @@ pub use git::MergeStatus;
 pub use parser::{EphFile, Service, ServiceSource, parse, resolve_interpolations};
 pub use proc::disinherit_std_handles;
 pub use prune::{
-    ConfirmationOutcome, PathState, PruneOptions, PruneReport, WorkspaceSummary,
+    ConfirmationOutcome, PathState, PruneOptions, PruneReport, PruneWarning, WorkspaceSummary,
     confirmation_outcome, current_unix_secs, list_workspaces, prune,
 };
 pub use service::{

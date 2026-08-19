@@ -2624,7 +2624,7 @@ async fn force_non_empty_prune_serializes_with_up_before_inventory() {
         "system prune should succeed: {prune_stderr}"
     );
     assert!(
-        prune_stdout.contains("Skipped:") && prune_stdout.contains("running container"),
+        prune_stdout.contains("Skipped ") && prune_stdout.contains("running container"),
         "prune should preserve the service started before inventory: {prune_stdout}"
     );
     assert!(
@@ -2728,7 +2728,7 @@ async fn force_non_empty_prune_serializes_with_foreground_dev_startup() {
         "foreground process should exit after its explicit test release"
     );
     assert!(
-        prune_stdout.contains("Skipped:") && prune_stdout.contains("live run= process"),
+        prune_stdout.contains("Skipped ") && prune_stdout.contains("live run= process"),
         "prune should preserve the foreground process recorded before inventory: {prune_stdout}"
     );
     assert!(
