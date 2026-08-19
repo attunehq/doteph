@@ -259,13 +259,18 @@ does not help here; it only skips lifecycle hooks.
 
 If the workspace directory itself was deleted, run `eph system prune` from
 anywhere. It scans all eph state directories and removes resources for
-recorded workspace paths that are missing or empty folders. Use `eph system
-prune --dry-run` first to see the plan. If a recorded path still contains files
-but you know the workspace can be discarded, preview it with
-`eph system prune --force-non-empty --dry-run`, then rerun with
-`eph system prune --force-non-empty --yes`. Add `--force-live` when the preview
-reports running containers or a live `run=` process. An 8-character state
-directory without workspace metadata is skipped unless you pass
+recorded workspace paths that are missing, empty, or no longer hold a `.eph`
+file, terminating any `run=` process still running from a deleted directory.
+Use `eph system prune --dry-run` first to see the plan; its "Kept" table (or
+`eph system ls`) shows every workspace that still exists with its idle age,
+live processes, containers, and branch status. Worktrees that agent tools
+never removed pile up there: select them with `eph system prune --merged`
+(branch merged into the default branch, clean tree) or `--idle 2d` (no eph
+command for two days), preview with `--dry-run`, then rerun with `--yes`. If
+a recorded path still contains files and none of those signals apply but you
+know the workspace can be discarded, use `--force-non-empty`. Add
+`--force-live` when the preview reports a running container. An 8-character
+state directory without workspace metadata is skipped unless you pass
 `--compatibility-v042`.
 
 Prune uses the current `.eph` when it still exists and parses successfully. If

@@ -73,7 +73,7 @@ Behavior:
 - After a successful `up`, a filesystem-only scan checks whether any *other*
   workspace's recorded path has been deleted (a removed worktree or clone),
   and prints a one-line note on stderr pointing at
-  [`eph system prune`](#eph-system-prune---dry-run---force---compatibility-v042---force-non-empty---force-live--y---yes)
+  [`eph system prune`](#eph-system-prune---dry-run---force---compatibility-v042---force-non-empty---force-live---idle-duration---merged--y---yes)
   when it finds one. It never touches Docker, never fails the `up` itself, and
   never counts the current workspace.
 
@@ -182,14 +182,51 @@ Behavior beyond the declared services:
   both the `.eph` file and `state.json`, because `clean` promises a full
   reset.
 
-## `eph system prune [--dry-run] [--force] [--compatibility-v042] [--force-non-empty] [--force-live] [-y] [--yes]`
+## `eph system ls`
 
-Cross-workspace prune for resources left behind after workspace directories
-are deleted (finished worktrees, removed clones). It scans the eph state root
-(the platform default, or `EPH_STATE_ROOT` when set; see
-[Persisted state](concepts.md#persisted-state)), reads each workspace's
-recorded path, and removes resources for workspaces whose path is gone or is
-an empty directory.
+List every workspace eph has state for, oldest first, with the signals
+`eph system prune` uses to select it. Read-only; needs Docker for the
+container and volume counts.
+
+```text
+  ID                PATH     LAST SEEN  PROCS  CONTAINERS  VOLUMES  BRANCH        WORKSPACE
+  c28e01270821529c  present  19d        0      0/1         1        unmerged      /Users/me/projects/app
+  9072a61a8e3970aa  present  19d        0      0/1         1        merged        /Users/me/.t3/worktrees/app/t3code-f1e706bf
+  fd9533db50776005  missing  15d        0      0/1         1        -             /Users/me/conductor/workspaces/app/bissau
+  6cf3c526c07d5c84  present  1d         0      0/1         1        merged+dirty  /Users/me/.cursor/worktrees/app/emkl
+  f31ebfdd2f907406  no .eph  21h        2      0/1         1        unmerged      /Users/me/projects/app/.claude/worktrees/left-behind
+  447009e7cbf541ad  present  11m        2      1/1         1        unmerged      /Users/me/.t3/worktrees/app/t3code-6af612ee
+
+6 workspaces (4 present), 4 live run= processes, 1 running container, 6 volumes
+```
+
+| Column | Meaning |
+|--------|---------|
+| `PATH` | `present` (directory with a `.eph` file), `no .eph`, `empty`, `not a directory`, or `missing`. |
+| `LAST SEEN` | Time since the last `up`, `dev`, `down`, `clean`, `env`, `run`, or `status` in that workspace. |
+| `PROCS` | `run=` processes still alive under the identity eph recorded at launch. |
+| `CONTAINERS` | Running / total containers in the workspace's namespace. |
+| `BRANCH` | `merged` (every change is in the repository's default branch and the tree is clean), `merged+dirty` (merged, but uncommitted or untracked files remain), `unmerged`, or `-` (not a git checkout, or git is unavailable). |
+
+`BRANCH` is answered by the local `git` binary with no network access, so it
+is as fresh as the last fetch. A branch reads as merged when its tip is an
+ancestor of the default branch, when every commit has a patch-equivalent on
+the default branch (rebase merge), when its squashed patch matches a commit on
+the default branch (squash merge), or when merging it would change nothing.
+If the checkout is behind its own upstream branch, the upstream tip is judged,
+since that is what got merged. The default branch's own checkout, and a fresh
+worktree sitting on the default branch's tip with no commits, read `unmerged`.
+
+## `eph system prune [--dry-run] [--force] [--compatibility-v042] [--force-non-empty] [--force-live] [--idle DURATION] [--merged] [-y] [--yes]`
+
+Cross-workspace prune for resources left behind by finished workspaces. It
+scans the eph state root (the platform default, or `EPH_STATE_ROOT` when set;
+see [Persisted state](concepts.md#persisted-state)), reads each workspace's
+recorded path, and removes resources for workspaces whose path is gone, is an
+empty directory, or no longer contains a `.eph` file. Workspaces that still
+exist are listed under "Kept" with the same columns as
+[`eph system ls`](#eph-system-ls), and `--idle` or `--merged` selects them by
+those signals.
 
 | Flag | Description |
 |------|-------------|
@@ -197,12 +234,16 @@ an empty directory.
 | `--force` | Enable `--compatibility-v042`, `--force-non-empty`, `--force-live`, and `--yes`. |
 | `--compatibility-v042` | Also prune 8-character state directories that have no workspace metadata. |
 | `--force-non-empty` | Also prune workspaces whose recorded path still exists and contains files. |
-| `--force-live` | Remove a stale workspace's resources even if it still has running containers or a live `run=` process. |
+| `--force-live` | Remove a stale workspace's resources even if it still has a running container (or, for `--force-non-empty`, a live `run=` process). |
+| `--idle DURATION` | Also prune workspaces no eph command has touched for at least `DURATION` (`90s`, `30m`, `12h`, `2d`). |
+| `--merged` | Also prune workspaces whose git branch is merged into the repository's default branch and whose working tree is clean. |
 | `-y`, `--yes` | Skip the removal confirmation prompt. |
 
 ```sh
 eph system prune
 eph system prune --dry-run
+eph system prune --idle 2d --dry-run
+eph system prune --merged --idle 7d
 eph system prune --force --dry-run
 eph system prune --force
 eph system prune --yes
@@ -225,6 +266,12 @@ Totals:
   Verified run= processes: 0
   State directories: 1
 
+Kept (workspace still exists; oldest first):
+  ID                LAST SEEN  PROCS  CONTAINERS  VOLUMES  BRANCH    WORKSPACE
+  0818f8723c1772c9  14h        2      0/1         1        merged    C:\Users\me\.t3\worktrees\app\t3code-6e3b2781
+  b6ce879752027b28  7m         2      1/1         1        unmerged  C:\Users\me\projects\app
+  2 workspaces (2 present), 4 live run= processes, 1 running container, 2 volumes; oldest last seen 14h ago. Select with --idle DURATION, --merged, or --force-non-empty.
+
 Remove these resources? [y/N] y
 System prune complete:
   a1b2c3d4e5f60718 (missing workspace) - C:\Users\me\.codex\worktrees\1234\app
@@ -246,9 +293,19 @@ Behavior:
   selected resources without prompting. `--force --dry-run` previews that
   complete scope without changing anything.
 - By default, a recorded workspace path is eligible only when it is missing,
-  empty, or no longer a directory. `--force-non-empty` also makes existing
-  non-empty directories eligible. This is a global override, so preview it
-  with `--dry-run` before removal.
+  empty, no longer a directory, or no longer contains a `.eph` file (a
+  half-removed worktree). `--merged` and `--idle` add existing workspaces by
+  signal: a merged, clean branch, or no eph command for the given duration.
+  `last_seen` is refreshed by `up`, `dev`, `down`, `clean`, `env`, `run`, and
+  `status`, so a workspace an agent reads every day never reads as idle.
+  `--force-non-empty` makes every existing non-empty directory eligible. Each
+  is a global selection, so preview with `--dry-run` before removal. When
+  several apply, the report names the most specific reason: `merged branch`,
+  then `idle workspace`, then `non-empty workspace directory`.
+- The "Kept" table lists every workspace that still exists and was not
+  selected, oldest first, with its idle age, live `run=` processes, running
+  and total containers, volumes, and branch status. It is printed with the
+  preview (and with `--dry-run`), not again after removal.
 - Progress is logged to stderr while prune acquires its lock, inventories
   Docker, scans state directories, and removes resources. The final report
   remains on stdout for callers that capture or pipe it. Prune lists each
@@ -257,19 +314,24 @@ Behavior:
   Docker API calls.
 - A workspace's recorded path only decides whether it is *stale*, not whether
   something is still running against it: before removing anything for a
-  stale workspace, prune checks that workspace's actual Docker containers and
-  `run=` processes for signs of life. This matters because a workspace that
-  was merely moved or renamed while its services keep running looks exactly
-  like a deleted one from the recorded path alone; without the check, prune
-  would force-kill those live containers and delete their volume data with no
-  warning. If any container is running, or a recorded `run=` process is alive
-  under the identity eph captured at launch, the workspace is reported under
-  "Skipped" instead ("stop them or re-run with --force-live") and left
-  untouched. `--force-live` authorizes removing it anyway. The specific force
-  flags are independent: a non-empty workspace with live resources requires
-  both `--force-non-empty` and `--force-live`, or the aggregate `--force`.
-  `--dry-run` applies the same checks, so its preview always matches what a real
-  run would do.
+  stale workspace, prune checks that workspace's actual Docker containers for
+  signs of life. A workspace that was merely moved or renamed while its
+  services keep running looks exactly like a deleted one from the recorded
+  path alone; without the check, prune would force-kill those live containers
+  and delete their volume data with no warning. If any container is running,
+  the workspace is reported under "Skipped" instead ("stop them or re-run
+  with --force-live") and left untouched. `--force-live` authorizes removing
+  it anyway. `--dry-run` applies the same checks, so its preview always
+  matches what a real run would do.
+- A live `run=` process does not block a missing, empty, `.eph`-less, idle, or
+  merged workspace; prune terminates it along with the rest. Its recorded
+  identity includes the working directory eph launched it in, so a process
+  that still matches while its directory is gone is an orphan by construction
+  (a moved workspace reports the new directory and stops matching), and idle
+  and merged selections already say nobody is using the workspace. The one
+  exception is `--force-non-empty`, which carries no such signal: there a
+  live `run=` process still blocks unless `--force-live` (or `--force`) is
+  passed.
 - Unless `--dry-run`, prune prints what it is about to remove and then asks
   `Remove these resources? [y/N]` before deleting anything, the same way
   `docker system prune` does. Anything other than `y` or `yes` (a bare Enter

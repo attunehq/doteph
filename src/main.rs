@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitCode};
 use tracing_subscriber::EnvFilter;
 
+mod system_ls;
 mod system_prune;
 mod watch;
 use watch::Watch;
@@ -245,8 +246,11 @@ enum Commands {
 /// System subcommands that operate outside the current workspace.
 #[derive(Subcommand)]
 enum SystemCommand {
-    /// Remove resources for deleted or empty workspaces.
+    /// Remove resources for deleted, empty, idle, or merged workspaces.
     Prune(system_prune::Args),
+    /// List every recorded workspace with its age, live processes, containers,
+    /// volumes, and branch merge status.
+    Ls(system_ls::Args),
 }
 
 /// Skills subcommands. They install the skills bundled into this binary into a
@@ -329,6 +333,7 @@ async fn main() -> Result<ExitCode> {
         Commands::Clean { skip_hooks } => cmd_clean(skip_hooks).await.map(|()| ExitCode::SUCCESS),
         Commands::System { command } => match command {
             SystemCommand::Prune(args) => args.run().await.map(|()| ExitCode::SUCCESS),
+            SystemCommand::Ls(args) => args.run().await.map(|()| ExitCode::SUCCESS),
         },
         Commands::Dev {
             service,
@@ -1069,6 +1074,7 @@ async fn wait_for_shutdown() {
 async fn cmd_status() -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
+    workspace.touch_metadata().await?;
 
     // Print workspace header before moving `workspace` into the manager.
     println!("Workspace: {}", workspace.path.display());
@@ -1167,6 +1173,7 @@ fn service_url(port: u16, hyperlink: bool) -> String {
 async fn cmd_env(format: &str) -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
+    workspace.touch_metadata().await?;
 
     let manager = ServiceManager::new(workspace).await?;
     let running = manager.status().await?;
@@ -1197,6 +1204,7 @@ async fn cmd_run(command: Vec<String>) -> Result<ExitCode> {
     let workspace = Workspace::find_from_cwd()?;
     let workspace_root = workspace.path.clone();
     let eph = load_eph_file(&workspace)?;
+    workspace.touch_metadata().await?;
 
     let manager = ServiceManager::new(workspace).await?;
     let running = manager.status().await?;

@@ -175,9 +175,11 @@ can never wedge a later command.
 
 Two commands manage state directories in bulk: `eph clean` deletes the state
 directory for the current workspace along with its services and data, and
-[`eph system prune`](command-reference.md#eph-system-prune---dry-run---force---compatibility-v042---force-non-empty---force-live--y---yes)
+[`eph system prune`](command-reference.md#eph-system-prune---dry-run---force---compatibility-v042---force-non-empty---force-live---idle-duration---merged--y---yes)
 scans **all** state directories and removes leftovers for workspaces whose
-directory has since been deleted (a worktree you removed, for example). A
+directory has since been deleted (a worktree you removed, for example), and
+can also select worktrees whose branch has been merged (`--merged`) or that
+no eph command has touched for a while (`--idle`). A
 successful `eph up` checks for exactly that situation in other workspaces (a
 cheap filesystem scan, never Docker) and prints a one-line note on stderr
 pointing at `eph system prune` when it finds any, so stale state does not sit

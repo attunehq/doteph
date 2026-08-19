@@ -133,10 +133,23 @@ impl ProcessIdentity {
         }
 
         self.start_time.abs_diff(other.start_time) <= 1
-            && known_fields_agree(&self.cwd, &other.cwd)
+            && known_fields_agree(
+                &self.cwd.as_deref().map(strip_deleted_cwd_marker),
+                &other.cwd.as_deref().map(strip_deleted_cwd_marker),
+            )
             && known_fields_agree(&self.exe, &other.exe)
             && (self.cmd.is_empty() || other.cmd.is_empty() || self.cmd == other.cmd)
     }
+}
+
+/// Strip the ` (deleted)` marker Linux appends to `/proc/<pid>/cwd` once the
+/// directory is unlinked. A `run=` service whose worktree was deleted out from
+/// under it is still the process eph launched; without this, its recorded cwd
+/// would stop matching the live one and prune would leave the orphan running.
+fn strip_deleted_cwd_marker(cwd: &Path) -> &Path {
+    cwd.to_str()
+        .and_then(|text| text.strip_suffix(" (deleted)"))
+        .map_or(cwd, Path::new)
 }
 
 /// Build a [`TokioCommand`] that runs `cmd` through the platform shell.
