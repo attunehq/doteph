@@ -4,6 +4,7 @@
 //! from the global state root instead, so it can tear down resources for a
 //! workspace path that no longer exists.
 
+use crate::git::{self, MergeStatus};
 use crate::hooks::{
     CleanupKind, HookWorkspace, TeardownHookService, TeardownHookSnapshot, run_hook,
 };
@@ -23,7 +24,7 @@ use bollard::query_parameters::{
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
 use tracing::{debug, info};
 
@@ -38,30 +39,48 @@ pub struct PruneOptions {
     /// candidates. Live resources remain protected unless [`Self::force_live`]
     /// is also set.
     pub force_non_empty: bool,
-    /// Remove a stale workspace's resources even when it still has running
-    /// containers or a live `run=` process. Without this, a workspace that
-    /// reads as stale only because it was moved or renamed (its recorded path
-    /// no longer resolves) is reported and skipped instead of force-killed.
+    /// Remove a stale workspace's resources even when it still has a running
+    /// container, or (for a [`StaleReason::NonEmptyDirectory`] candidate) a
+    /// live `run=` process. Without this, a workspace that reads as stale only
+    /// because it was moved or renamed (its recorded path no longer resolves)
+    /// is reported and skipped instead of force-killed.
     pub force_live: bool,
+    /// Treat an existing workspace as stale when no lifecycle command has
+    /// touched it for at least this long (its recorded `last_seen` age).
+    pub idle: Option<Duration>,
+    /// Treat an existing workspace as stale when its git branch is merged into
+    /// the repository's default branch and the working tree is clean.
+    pub merged: bool,
 }
 
-impl PruneOptions {
-    fn non_empty_policy(self) -> NonEmptyWorkspacePolicy {
-        if self.force_non_empty {
-            NonEmptyWorkspacePolicy::Prune
-        } else {
-            NonEmptyWorkspacePolicy::Protect
+/// Whether the recorded workspace path still holds an eph workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathState {
+    /// The path no longer exists.
+    Missing,
+    /// The path exists but is not a directory.
+    NotDirectory,
+    /// The path is an empty directory.
+    Empty,
+    /// The path is a non-empty directory with no `.eph` file, so no eph
+    /// command can run there any more.
+    NoEphFile,
+    /// The path is a non-empty directory with a `.eph` file.
+    Present,
+}
+
+impl PathState {
+    /// Short label for tabular output.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            PathState::Missing => "missing",
+            PathState::NotDirectory => "not a directory",
+            PathState::Empty => "empty",
+            PathState::NoEphFile => "no .eph",
+            PathState::Present => "present",
         }
     }
-}
-
-/// Whether existing non-empty workspace paths remain protected during
-/// candidate selection. Keeping this policy distinct from the liveness guard
-/// prevents the two destructive overrides from being conflated internally.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NonEmptyWorkspacePolicy {
-    Protect,
-    Prune,
 }
 
 /// Whether `eph system prune`'s confirmation prompt should be shown, skipped,
@@ -116,6 +135,14 @@ pub enum StaleReason {
     NonEmptyDirectory,
     /// The recorded workspace path exists but is no longer a directory.
     NotDirectory,
+    /// The recorded workspace path exists but no longer contains a `.eph` file.
+    NoEphFile,
+    /// No lifecycle command has touched the workspace within
+    /// [`PruneOptions::idle`].
+    Idle,
+    /// The workspace's git branch is merged into its repository's default
+    /// branch and its working tree is clean ([`PruneOptions::merged`]).
+    MergedBranch,
     /// The state directory was written before eph recorded workspace metadata.
     CompatibilityV042State,
 }
@@ -127,6 +154,9 @@ impl StaleReason {
             StaleReason::EmptyDirectory => "empty workspace directory",
             StaleReason::NonEmptyDirectory => "non-empty workspace directory",
             StaleReason::NotDirectory => "workspace path is not a directory",
+            StaleReason::NoEphFile => "workspace has no .eph file",
+            StaleReason::Idle => "idle workspace",
+            StaleReason::MergedBranch => "merged branch",
             StaleReason::CompatibilityV042State => {
                 "v0.4.2-and-earlier state without workspace metadata"
             }
@@ -203,13 +233,50 @@ pub struct SkippedWorkspace {
     pub reason: String,
 }
 
+/// What prune (or `eph system ls`) knows about one metadata-backed workspace.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSummary {
+    /// Workspace short ID, the namespace used in Docker resource names.
+    pub short_id: String,
+    /// Recorded workspace path.
+    pub workspace_path: PathBuf,
+    /// Whether the recorded path still holds an eph workspace.
+    pub path_state: PathState,
+    /// Unix time of the last lifecycle, `env`, `run`, or `status` command.
+    pub last_seen_unix_secs: u64,
+    /// The checkout's relationship to its repository's default branch.
+    pub merge: MergeStatus,
+    /// `run=` processes still alive under the identity eph recorded.
+    pub live_processes: usize,
+    /// Containers in the workspace's namespace that are running.
+    pub running_containers: usize,
+    /// All containers in the workspace's namespace.
+    pub containers: usize,
+    /// Volumes in the workspace's namespace.
+    pub volumes: usize,
+}
+
+impl WorkspaceSummary {
+    /// Seconds since the workspace was last seen, relative to `now`.
+    #[must_use]
+    pub fn idle_secs(&self, now: u64) -> u64 {
+        now.saturating_sub(self.last_seen_unix_secs)
+    }
+}
+
 /// Summary returned by [`prune`].
 #[derive(Debug, Clone, Default)]
 pub struct PruneReport {
     /// Whether this was a dry run.
     pub dry_run: bool,
+    /// Unix time the pass ran, the reference point for idle ages.
+    pub now_unix_secs: u64,
     /// Stale workspaces removed, or that would be removed during a dry run.
     pub pruned: Vec<PrunedWorkspace>,
+    /// Metadata-backed workspaces that still exist and were not selected,
+    /// oldest `last_seen` first, with the signals a user needs to decide
+    /// whether to select them (`--idle`, `--merged`, `--force-non-empty`).
+    pub kept: Vec<WorkspaceSummary>,
     /// Workspaces or state directories left untouched.
     pub skipped: Vec<SkippedWorkspace>,
     /// Non-fatal warnings, including unsafe `run=` process prune skips.
@@ -242,6 +309,17 @@ struct PruneCandidate {
     workspace_path: Option<PathBuf>,
     reason: StaleReason,
     metadata: Option<WorkspaceMetadata>,
+    /// Merge status at classification time, reused by the pre-removal
+    /// re-check so git is not consulted twice.
+    merge: MergeStatus,
+}
+
+/// A metadata-backed state directory after the filesystem checks, before the
+/// stale decision (which may also need the merge status) is made.
+struct InspectedWorkspace {
+    state_dir: PathBuf,
+    metadata: WorkspaceMetadata,
+    path_state: PathState,
 }
 
 struct PruneHookContext<'a> {
@@ -317,8 +395,10 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
         .ping()
         .await
         .context("failed to ping docker daemon")?;
+    let now = current_unix_secs();
     let mut report = PruneReport {
         dry_run: options.dry_run,
+        now_unix_secs: now,
         ..PruneReport::default()
     };
 
@@ -326,15 +406,46 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
     let state_dir_count = state_dirs.len();
     info!("Inspecting {state_dir_count} eph state directories");
     let mut candidates = Vec::new();
+    let mut inspected = Vec::new();
     for (index, state_dir) in state_dirs.into_iter().enumerate() {
         if index > 0 && index % 100 == 0 {
             info!("Inspected {index} of {state_dir_count} eph state directories");
         }
         debug!("Inspecting {}", state_dir.display());
-        if let Some(candidate) = classify_state_dir(state_dir, options, &mut report).await? {
-            candidates.push(candidate);
+        match classify_state_dir(state_dir, options, &mut report)? {
+            Classified::Candidate(candidate) => candidates.push(candidate),
+            Classified::Inspected(workspace) => inspected.push(workspace),
+            Classified::Skipped => {}
         }
     }
+
+    // Every existing checkout is asked about its branch once, concurrently:
+    // the answer selects `--merged` candidates and is shown for kept
+    // workspaces either way.
+    let merges = merge_statuses(&inspected).await;
+    let mut kept = Vec::new();
+    for (workspace, merge) in inspected.into_iter().zip(merges) {
+        let age = Duration::from_secs(now.saturating_sub(workspace.metadata.last_seen_unix_secs));
+        match stale_reason(workspace.path_state, merge, age, options) {
+            Some(reason) => {
+                debug!(
+                    "Found stale workspace {} at {} ({reason})",
+                    workspace.metadata.short_id,
+                    workspace.metadata.workspace_path.display()
+                );
+                candidates.push(PruneCandidate {
+                    state_dir: workspace.state_dir,
+                    short_id: workspace.metadata.short_id.clone(),
+                    workspace_path: Some(workspace.metadata.workspace_path.clone()),
+                    reason,
+                    metadata: Some(workspace.metadata),
+                    merge,
+                });
+            }
+            None => kept.push((workspace, merge)),
+        }
+    }
+    candidates.sort_by(|a, b| a.short_id.cmp(&b.short_id));
 
     info!(
         "Found {} stale workspace candidates; inventorying Docker resources",
@@ -375,20 +486,134 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
     for candidate in candidates {
         prune_candidate(&prune_docker, candidate, options, &mut report).await?;
     }
+    for (workspace, merge) in kept {
+        report
+            .kept
+            .push(summarize(workspace, merge, &inventory).await);
+    }
+    report
+        .kept
+        .sort_by_key(|workspace| workspace.last_seen_unix_secs);
     info!(
-        "System prune pass found {} stale workspaces and skipped {} state directories",
+        "System prune pass found {} stale workspaces, kept {} existing workspaces, and skipped {} state directories",
         report.pruned.len(),
+        report.kept.len(),
         report.skipped.len()
     );
 
     Ok(report)
 }
 
-async fn classify_state_dir(
+/// Inspect every metadata-backed workspace in the state root without removing
+/// anything: the data behind `eph system ls`.
+///
+/// # Errors
+///
+/// Returns an error if the state root cannot be read or Docker cannot be
+/// reached.
+pub async fn list_workspaces() -> Result<Vec<WorkspaceSummary>> {
+    let root = state_root()?;
+    let docker = Docker::connect_with_local_defaults()
+        .context("failed to connect to docker (is docker running?)")?;
+    docker
+        .ping()
+        .await
+        .context("failed to ping docker daemon")?;
+
+    let mut report = PruneReport::default();
+    let mut inspected = Vec::new();
+    for state_dir in state_dirs(&root).await? {
+        if let Classified::Inspected(workspace) =
+            classify_state_dir(state_dir, PruneOptions::default(), &mut report)?
+        {
+            inspected.push(workspace);
+        }
+    }
+    let merges = merge_statuses(&inspected).await;
+    let inventory = DockerInventory::load(&docker).await?;
+    let mut summaries = Vec::with_capacity(inspected.len());
+    for (workspace, merge) in inspected.into_iter().zip(merges) {
+        summaries.push(summarize(workspace, merge, &inventory).await);
+    }
+    summaries.sort_by_key(|workspace| workspace.last_seen_unix_secs);
+    Ok(summaries)
+}
+
+/// Current Unix time in seconds; a clock before 1970 reads as zero.
+#[must_use]
+pub fn current_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// Ask git about every inspected workspace whose path still holds a checkout,
+/// concurrently. Paths that are gone get [`MergeStatus::Unknown`] without a
+/// git invocation.
+async fn merge_statuses(inspected: &[InspectedWorkspace]) -> Vec<MergeStatus> {
+    futures_util::future::join_all(inspected.iter().map(|workspace| async {
+        match workspace.path_state {
+            PathState::Present | PathState::NoEphFile => {
+                git::merge_status(&workspace.metadata.workspace_path).await
+            }
+            PathState::Missing | PathState::NotDirectory | PathState::Empty => MergeStatus::Unknown,
+        }
+    }))
+    .await
+}
+
+/// Combine an inspected workspace with its Docker and process footprint.
+async fn summarize(
+    workspace: InspectedWorkspace,
+    merge: MergeStatus,
+    inventory: &DockerInventory,
+) -> WorkspaceSummary {
+    let InspectedWorkspace {
+        state_dir,
+        metadata,
+        path_state,
+    } = workspace;
+    let prefix = format!("eph-{}-", metadata.short_id);
+    let live_processes = load_state(&state_dir)
+        .await
+        .ok()
+        .flatten()
+        .as_ref()
+        .map_or(0, count_live_processes);
+    let containers = matching_containers(&inventory.containers, &prefix);
+    WorkspaceSummary {
+        short_id: metadata.short_id,
+        workspace_path: metadata.workspace_path,
+        path_state,
+        last_seen_unix_secs: metadata.last_seen_unix_secs,
+        merge,
+        live_processes,
+        running_containers: count_running_containers(&containers),
+        containers: containers.len(),
+        volumes: inventory
+            .volumes
+            .iter()
+            .filter(|volume| volume.name.starts_with(&prefix))
+            .count(),
+    }
+}
+
+/// Outcome of looking at one state directory.
+enum Classified {
+    /// A legacy directory selected by `--compatibility-v042`.
+    Candidate(PruneCandidate),
+    /// A metadata-backed workspace whose stale decision still needs the merge
+    /// status and idle age.
+    Inspected(InspectedWorkspace),
+    /// Already reported under `skipped`.
+    Skipped,
+}
+
+fn classify_state_dir(
     state_dir: PathBuf,
     options: PruneOptions,
     report: &mut PruneReport,
-) -> Result<Option<PruneCandidate>> {
+) -> Result<Classified> {
     let short_id = state_dir
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -399,19 +624,20 @@ async fn classify_state_dir(
             workspace_path: None,
             reason: "state directory name is not an eph workspace short ID".to_string(),
         });
-        return Ok(None);
+        return Ok(Classified::Skipped);
     };
     let metadata_path = state_dir.join(WORKSPACE_METADATA_FILE);
 
     if !metadata_path.exists() {
         match (short_id_format, options.compatibility_v042) {
             (WorkspaceShortIdFormat::LegacyV042, true) => {
-                return Ok(Some(PruneCandidate {
+                return Ok(Classified::Candidate(PruneCandidate {
                     state_dir,
                     short_id,
                     workspace_path: None,
                     reason: StaleReason::CompatibilityV042State,
                     metadata: None,
+                    merge: MergeStatus::Unknown,
                 }));
             }
             (WorkspaceShortIdFormat::LegacyV042, false) => {
@@ -433,10 +659,10 @@ async fn classify_state_dir(
                 });
             }
         }
-        return Ok(None);
+        return Ok(Classified::Skipped);
     }
 
-    let metadata = match WorkspaceMetadata::load_from_state_dir(&state_dir).await {
+    let metadata = match WorkspaceMetadata::load_from_state_dir_sync(&state_dir) {
         Ok(metadata) => metadata,
         Err(err) => {
             report.skipped.push(SkippedWorkspace {
@@ -444,7 +670,7 @@ async fn classify_state_dir(
                 workspace_path: None,
                 reason: format!("{err:#}"),
             });
-            return Ok(None);
+            return Ok(Classified::Skipped);
         }
     };
 
@@ -457,31 +683,14 @@ async fn classify_state_dir(
                 metadata.short_id
             ),
         });
-        return Ok(None);
+        return Ok(Classified::Skipped);
     }
 
-    let Some(reason) =
-        classify_workspace_path(&metadata.workspace_path, options.non_empty_policy())?
-    else {
-        report.skipped.push(SkippedWorkspace {
-            short_id: metadata.short_id,
-            workspace_path: Some(metadata.workspace_path),
-            reason: "workspace still exists and is not empty".to_string(),
-        });
-        return Ok(None);
-    };
-    debug!(
-        "Found stale workspace {} at {} ({reason})",
-        metadata.short_id,
-        metadata.workspace_path.display()
-    );
-
-    Ok(Some(PruneCandidate {
+    let path_state = path_state(&metadata.workspace_path)?;
+    Ok(Classified::Inspected(InspectedWorkspace {
         state_dir,
-        short_id: metadata.short_id.clone(),
-        workspace_path: Some(metadata.workspace_path.clone()),
-        reason,
-        metadata: Some(metadata),
+        metadata,
+        path_state,
     }))
 }
 
@@ -502,8 +711,7 @@ async fn prune_candidate(
 
     if !options.dry_run
         && let Some(metadata) = candidate.metadata.as_ref()
-        && !metadata_still_prunable(&candidate.state_dir, metadata, options.non_empty_policy())
-            .await?
+        && !metadata_still_prunable(&candidate.state_dir, metadata, candidate.merge, options)?
     {
         report.skipped.push(SkippedWorkspace {
             short_id: candidate.short_id,
@@ -555,6 +763,7 @@ async fn prune_workspace(
         workspace_path,
         reason,
         metadata,
+        merge: _,
     } = candidate;
     let prefix = format!("eph-{short_id}-");
 
@@ -563,7 +772,12 @@ async fn prune_workspace(
     let containers = matching_containers(&docker.inventory.containers, &prefix);
     let running_containers = count_running_containers(&containers);
 
-    if blocks_prune(running_containers, live_processes, options.force_live) {
+    if blocks_prune(
+        reason,
+        running_containers,
+        live_processes,
+        options.force_live,
+    ) {
         info!(
             "Skipping workspace {short_id}: {} still live",
             live_resource_summary(running_containers, live_processes)
@@ -1029,8 +1243,29 @@ fn ignore_stopped_or_missing<T: Default>(
 /// Pulled out of [`prune_workspace`] as a plain function over counts (rather
 /// than the Docker/process-table calls that produce them) so the decision
 /// itself is exercised by a unit test with no Docker daemon involved.
-fn blocks_prune(running_containers: usize, live_processes: usize, force_live: bool) -> bool {
-    !force_live && (running_containers > 0 || live_processes > 0)
+/// Whether live resources keep a stale candidate out of this pass.
+///
+/// A running container always blocks without `--force-live`: a workspace that
+/// was moved or renamed keeps its containers, so a running one can mean the
+/// workspace is still in use under a path prune cannot see.
+///
+/// A live `run=` process is different. Its recorded identity includes the
+/// working directory eph launched it in, so a process that still matches while
+/// its workspace path is gone, emptied, or has lost its `.eph` file is an
+/// orphan by construction: a moved workspace would report the new path and
+/// stop matching. Idle and merged candidates were selected by a signal that
+/// already says nobody is using them. Only the blunt `--force-non-empty`
+/// selection, which carries no such signal, lets a live process block.
+fn blocks_prune(
+    reason: StaleReason,
+    running_containers: usize,
+    live_processes: usize,
+    force_live: bool,
+) -> bool {
+    if force_live {
+        return false;
+    }
+    running_containers > 0 || (reason == StaleReason::NonEmptyDirectory && live_processes > 0)
 }
 
 /// Describe a positive count of running containers and/or live `run=`
@@ -1365,11 +1600,15 @@ pub async fn count_stale_workspaces(root: &Path, exclude_short_id: &str) -> usiz
         let Ok(metadata) = WorkspaceMetadata::load_from_state_dir(&dir).await else {
             continue;
         };
-        let is_stale =
-            classify_workspace_path(&metadata.workspace_path, NonEmptyWorkspacePolicy::Protect)
-                .ok()
-                .flatten()
-                .is_some();
+        let is_stale = path_state(&metadata.workspace_path).is_ok_and(|state| {
+            stale_reason(
+                state,
+                MergeStatus::Unknown,
+                Duration::ZERO,
+                PruneOptions::default(),
+            )
+            .is_some()
+        });
         if is_stale {
             count += 1;
         }
@@ -1395,15 +1634,13 @@ async fn state_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
-fn classify_workspace_path(
-    path: &Path,
-    non_empty_policy: NonEmptyWorkspacePolicy,
-) -> Result<Option<StaleReason>> {
+/// Look at the recorded workspace path on disk.
+fn path_state(path: &Path) -> Result<PathState> {
     if !path.exists() {
-        return Ok(Some(StaleReason::Missing));
+        return Ok(PathState::Missing);
     }
     if !path.is_dir() {
-        return Ok(Some(StaleReason::NotDirectory));
+        return Ok(PathState::NotDirectory);
     }
     if path
         .read_dir()
@@ -1411,30 +1648,67 @@ fn classify_workspace_path(
         .next()
         .is_none()
     {
-        return Ok(Some(StaleReason::EmptyDirectory));
+        return Ok(PathState::Empty);
     }
-    Ok((non_empty_policy == NonEmptyWorkspacePolicy::Prune)
-        .then_some(StaleReason::NonEmptyDirectory))
+    if !path.join(".eph").is_file() {
+        return Ok(PathState::NoEphFile);
+    }
+    Ok(PathState::Present)
+}
+
+/// Decide whether a metadata-backed workspace is stale under `options`.
+///
+/// A path that no longer holds an eph workspace is always stale. A present one
+/// is stale only on a signal the caller opted into: its branch is merged
+/// (`--merged`), nothing has touched it for `--idle`, or the blunt
+/// `--force-non-empty`. The first matching reason wins, most specific first,
+/// so the report names the strongest evidence.
+fn stale_reason(
+    path_state: PathState,
+    merge: MergeStatus,
+    idle_for: Duration,
+    options: PruneOptions,
+) -> Option<StaleReason> {
+    match path_state {
+        PathState::Missing => return Some(StaleReason::Missing),
+        PathState::NotDirectory => return Some(StaleReason::NotDirectory),
+        PathState::Empty => return Some(StaleReason::EmptyDirectory),
+        PathState::NoEphFile => return Some(StaleReason::NoEphFile),
+        PathState::Present => {}
+    }
+    if options.merged && merge == MergeStatus::Merged {
+        return Some(StaleReason::MergedBranch);
+    }
+    if options.idle.is_some_and(|threshold| idle_for >= threshold) {
+        return Some(StaleReason::Idle);
+    }
+    options
+        .force_non_empty
+        .then_some(StaleReason::NonEmptyDirectory)
 }
 
 /// Re-check a metadata-backed candidate immediately before a destructive pass.
 ///
-/// `non_empty_policy` must participate in both the preview classification and
-/// this check. Otherwise a non-empty workspace could appear in the confirmed
-/// preview and then be rejected only when removal begins.
-async fn metadata_still_prunable(
+/// The same `options` (and the merge status observed at classification) must
+/// drive both the preview classification and this check. Otherwise a
+/// workspace could appear in the confirmed preview and then be rejected only
+/// when removal begins. A lifecycle command that ran in between rewrites the
+/// metadata (new `last_seen`), which the equality check catches.
+fn metadata_still_prunable(
     state_dir: &Path,
     original: &WorkspaceMetadata,
-    non_empty_policy: NonEmptyWorkspacePolicy,
+    merge: MergeStatus,
+    options: PruneOptions,
 ) -> Result<bool> {
     if !state_dir.join(WORKSPACE_METADATA_FILE).exists() {
         return Ok(false);
     }
-    let current = WorkspaceMetadata::load_from_state_dir(state_dir).await?;
+    let current = WorkspaceMetadata::load_from_state_dir_sync(state_dir)?;
     if &current != original {
         return Ok(false);
     }
-    Ok(classify_workspace_path(&current.workspace_path, non_empty_policy)?.is_some())
+    let age = Duration::from_secs(current_unix_secs().saturating_sub(current.last_seen_unix_secs));
+    Ok(stale_reason(path_state(&current.workspace_path)?, merge, age, options).is_some())
 }
 
 /// Open the lock file that makes `eph system prune` invocations mutually
@@ -1475,13 +1749,116 @@ fn open_prune_lock(root: &Path) -> Result<fd_lock::RwLock<File>> {
 mod tests {
     use super::*;
 
+    fn present_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".eph"), "[db]\nimage=postgres:16\n").unwrap();
+        dir
+    }
+
+    fn reason_for(path: &Path, options: PruneOptions) -> Option<StaleReason> {
+        stale_reason(
+            path_state(path).unwrap(),
+            MergeStatus::Unknown,
+            Duration::ZERO,
+            options,
+        )
+    }
+
     #[test]
     fn classifies_missing_workspace_as_stale() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing");
 
         assert_eq!(
-            classify_workspace_path(&missing, NonEmptyWorkspacePolicy::Protect).unwrap(),
+            reason_for(&missing, PruneOptions::default()),
+            Some(StaleReason::Missing)
+        );
+    }
+
+    #[test]
+    fn classifies_workspace_without_eph_file_as_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "left behind").unwrap();
+
+        assert_eq!(
+            reason_for(dir.path(), PruneOptions::default()),
+            Some(StaleReason::NoEphFile)
+        );
+    }
+
+    #[test]
+    fn idle_threshold_selects_only_workspaces_at_least_that_old() {
+        let options = PruneOptions {
+            idle: Some(Duration::from_secs(3600)),
+            ..PruneOptions::default()
+        };
+        let idle = |age| {
+            stale_reason(
+                PathState::Present,
+                MergeStatus::Unknown,
+                Duration::from_secs(age),
+                options,
+            )
+        };
+
+        assert_eq!(idle(3599), None);
+        assert_eq!(idle(3600), Some(StaleReason::Idle));
+        assert_eq!(idle(86_400), Some(StaleReason::Idle));
+    }
+
+    #[test]
+    fn merged_selects_clean_merged_branches_only_when_asked() {
+        let asked = PruneOptions {
+            merged: true,
+            ..PruneOptions::default()
+        };
+        let reason =
+            |merge, options| stale_reason(PathState::Present, merge, Duration::ZERO, options);
+
+        assert_eq!(
+            reason(MergeStatus::Merged, asked),
+            Some(StaleReason::MergedBranch)
+        );
+        assert_eq!(reason(MergeStatus::MergedDirty, asked), None);
+        assert_eq!(reason(MergeStatus::Unmerged, asked), None);
+        assert_eq!(reason(MergeStatus::Unknown, asked), None);
+        assert_eq!(reason(MergeStatus::Merged, PruneOptions::default()), None);
+    }
+
+    #[test]
+    fn most_specific_reason_wins_for_a_present_workspace() {
+        let everything = PruneOptions {
+            force_non_empty: true,
+            idle: Some(Duration::ZERO),
+            merged: true,
+            ..PruneOptions::default()
+        };
+
+        assert_eq!(
+            stale_reason(
+                PathState::Present,
+                MergeStatus::Merged,
+                Duration::ZERO,
+                everything
+            ),
+            Some(StaleReason::MergedBranch)
+        );
+        assert_eq!(
+            stale_reason(
+                PathState::Present,
+                MergeStatus::Unmerged,
+                Duration::ZERO,
+                everything
+            ),
+            Some(StaleReason::Idle)
+        );
+        assert_eq!(
+            stale_reason(
+                PathState::Missing,
+                MergeStatus::Merged,
+                Duration::ZERO,
+                everything
+            ),
             Some(StaleReason::Missing)
         );
     }
@@ -1501,54 +1878,53 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         assert_eq!(
-            classify_workspace_path(dir.path(), NonEmptyWorkspacePolicy::Protect).unwrap(),
+            reason_for(dir.path(), PruneOptions::default()),
             Some(StaleReason::EmptyDirectory)
         );
     }
 
     #[test]
     fn keeps_non_empty_workspace_active() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".eph"), "[db]\nimage=postgres:16\n").unwrap();
+        let dir = present_workspace();
 
-        assert_eq!(
-            classify_workspace_path(dir.path(), NonEmptyWorkspacePolicy::Protect).unwrap(),
-            None
-        );
+        assert_eq!(reason_for(dir.path(), PruneOptions::default()), None);
     }
 
     #[test]
     fn force_non_empty_classifies_non_empty_workspace_as_stale() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".eph"), "[db]\nimage=postgres:16\n").unwrap();
+        let dir = present_workspace();
 
         assert_eq!(
-            classify_workspace_path(dir.path(), NonEmptyWorkspacePolicy::Prune).unwrap(),
+            reason_for(
+                dir.path(),
+                PruneOptions {
+                    force_non_empty: true,
+                    ..PruneOptions::default()
+                }
+            ),
             Some(StaleReason::NonEmptyDirectory)
         );
     }
 
-    #[tokio::test]
-    async fn force_non_empty_promotes_metadata_backed_workspace_to_candidate() {
+    #[test]
+    fn metadata_backed_workspace_is_inspected_not_skipped() {
         let root = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join(".eph"), "[db]\nimage=postgres:16\n").unwrap();
+        let workspace = present_workspace();
         let short_id = write_workspace_metadata(root.path(), workspace.path());
         let mut report = PruneReport::default();
 
-        let candidate = classify_state_dir(
+        let classified = classify_state_dir(
             root.path().join(&short_id),
-            PruneOptions {
-                force_non_empty: true,
-                ..PruneOptions::default()
-            },
+            PruneOptions::default(),
             &mut report,
         )
-        .await
-        .unwrap()
-        .expect("forced non-empty workspace should be a candidate");
+        .unwrap();
 
-        assert_eq!(candidate.reason, StaleReason::NonEmptyDirectory);
+        let Classified::Inspected(inspected) = classified else {
+            panic!("metadata-backed workspace should be inspected");
+        };
+        assert_eq!(inspected.path_state, PathState::Present);
+        assert_eq!(inspected.metadata.short_id, short_id);
         assert!(report.skipped.is_empty());
     }
 
@@ -1566,9 +1942,16 @@ mod tests {
         };
 
         assert!(
-            !metadata_still_prunable(&state_dir, &metadata, NonEmptyWorkspacePolicy::Prune,)
-                .await
-                .unwrap()
+            !metadata_still_prunable(
+                &state_dir,
+                &metadata,
+                MergeStatus::Unknown,
+                PruneOptions {
+                    force_non_empty: true,
+                    ..PruneOptions::default()
+                },
+            )
+            .unwrap()
         );
     }
 
@@ -1609,7 +1992,7 @@ mod tests {
         std::fs::create_dir(&state_dir).unwrap();
         let mut report = PruneReport::default();
 
-        let candidate = classify_state_dir(
+        let classified = classify_state_dir(
             state_dir,
             PruneOptions {
                 compatibility_v042: true,
@@ -1617,10 +2000,9 @@ mod tests {
             },
             &mut report,
         )
-        .await
         .unwrap();
 
-        assert!(candidate.is_none());
+        assert!(matches!(classified, Classified::Skipped));
         assert_eq!(report.skipped.len(), 1);
         assert!(report.skipped[0].reason.contains("cannot be pruned safely"));
     }
@@ -1674,23 +2056,46 @@ mod tests {
     }
 
     #[test]
-    fn blocks_prune_on_a_running_container() {
-        assert!(blocks_prune(1, 0, false));
+    fn blocks_prune_on_a_running_container_for_every_reason() {
+        for reason in [
+            StaleReason::Missing,
+            StaleReason::EmptyDirectory,
+            StaleReason::NotDirectory,
+            StaleReason::NoEphFile,
+            StaleReason::Idle,
+            StaleReason::MergedBranch,
+            StaleReason::NonEmptyDirectory,
+            StaleReason::CompatibilityV042State,
+        ] {
+            assert!(blocks_prune(reason, 1, 0, false), "{reason}");
+        }
     }
 
     #[test]
-    fn blocks_prune_on_a_live_process() {
-        assert!(blocks_prune(0, 1, false));
+    fn live_process_blocks_only_the_blunt_non_empty_selection() {
+        assert!(blocks_prune(StaleReason::NonEmptyDirectory, 0, 1, false));
+        for reason in [
+            StaleReason::Missing,
+            StaleReason::EmptyDirectory,
+            StaleReason::NotDirectory,
+            StaleReason::NoEphFile,
+            StaleReason::Idle,
+            StaleReason::MergedBranch,
+            StaleReason::CompatibilityV042State,
+        ] {
+            assert!(!blocks_prune(reason, 0, 1, false), "{reason}");
+        }
     }
 
     #[test]
     fn blocks_prune_allows_a_fully_dead_workspace() {
-        assert!(!blocks_prune(0, 0, false));
+        assert!(!blocks_prune(StaleReason::NonEmptyDirectory, 0, 0, false));
     }
 
     #[test]
     fn force_live_overrides_the_liveness_guard() {
-        assert!(!blocks_prune(3, 2, true));
+        assert!(!blocks_prune(StaleReason::NonEmptyDirectory, 3, 2, true));
+        assert!(!blocks_prune(StaleReason::Missing, 3, 2, true));
     }
 
     #[test]

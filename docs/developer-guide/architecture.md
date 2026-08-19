@@ -10,11 +10,14 @@ pieces fit together. For where each decision lives in the code, see
 
 - `src/main.rs`: the `clap` front end. Defines the CLI, sets up logging, and
   dispatches each subcommand. `src/system_prune.rs` owns prune-specific CLI
-  options, confirmation, and reporting. Nothing in either file is public API.
+  options, confirmation, and reporting; `src/system_ls.rs` owns `eph system
+  ls` and the workspace table both commands print. Nothing in these files is
+  public API.
 - `src/lib.rs`: the library crate (`eph`) that holds all reusable logic, split
   into modules: `parser`, `workspace`, `service`, `env`, `skills`, `update`
   (the self-updater that pulls, verifies, and swaps in a GitHub release),
-  `prune`, the crate-internal `hooks` (teardown snapshots, environments, and
+  `prune`, `git` (read-only branch merge detection for prune and `system
+  ls`), the crate-internal `hooks` (teardown snapshots, environments, and
   command execution), and the crate-internal `proc` (the cross-platform shell
   and process-control layer). The file watcher behind `eph dev --watch`
   (`src/watch.rs`) is a binary-side module, not part of the library.
@@ -125,18 +128,27 @@ workspace serialize instead of racing each other's writes.
 `eph clean` deletes this directory for the current workspace. `eph system
 prune` scans every state directory and removes Docker resources by the
 `eph-<short_id>-` namespace when the recorded workspace path is missing or
-empty. `--force-non-empty` adds recorded paths that still contain files. Each
-prune pass takes one daemon-wide Docker resource snapshot and partitions it by
-namespace in memory, so state-root size does not multiply Docker API calls.
-Prune acts only once it has confirmed the workspace is actually dead: a
-recorded path that no longer resolves could mean the workspace was moved or
-renamed rather than deleted, so prune first checks for any running container
-or live `run=` process under that namespace and skips (reports, does not
-remove) a workspace that still has either, unless `--force-live` is passed.
-This liveness gate also applies to `--force-non-empty` candidates, so both
-flags are required when the recorded directory is non-empty and resources are
-live. The aggregate `--force` also enables legacy-state compatibility and
-confirmation bypass, so it represents the full destructive prune scope.
+empty, or has lost its `.eph` file. `--merged` adds existing checkouts whose
+branch is merged into the repository's default branch with a clean tree (the
+`git` module answers that with the local git binary: ancestor, rebase
+patch-equivalence, squash patch-id, or no-op merge-tree), and `--idle` adds
+workspaces whose metadata `last_seen` is older than a duration (refreshed by
+every lifecycle command plus `env`, `run`, and `status`). `--force-non-empty`
+adds every recorded path that still contains files. Existing workspaces that
+were not selected are reported under "Kept" with their signals, the same table
+`eph system ls` prints. Each prune pass takes one daemon-wide Docker resource
+snapshot and partitions it by namespace in memory, so state-root size does not
+multiply Docker API calls. A recorded path that no longer resolves could mean
+the workspace was moved or renamed rather than deleted, so prune checks for a
+running container under that namespace and skips (reports, does not remove) a
+workspace that has one unless `--force-live` is passed. A live `run=` process
+does not block: its recorded identity includes the launch directory, so a
+process that still matches under a gone path is an orphan (a moved workspace
+reports the new directory and stops matching), and prune terminates it with
+the workspace. Only `--force-non-empty` candidates, selected with no signal of
+disuse, keep the process gate. The aggregate `--force` also enables
+legacy-state compatibility and confirmation bypass, so it represents the full
+destructive prune scope.
 For a selected workspace, prune reads and parses the current `.eph` when it is
 available; otherwise it falls back to the saved teardown hook snapshot. A valid
 current file wins, including when it removes all hooks. Live services receive
@@ -386,7 +398,8 @@ Commands follow a simple, predictable shape:
 eph up [services...]            # start
 eph down [--rm] [services...]   # stop (optionally remove containers)
 eph clean                       # full reset
-eph system prune                # remove resources for deleted workspaces
+eph system ls                   # list recorded workspaces and their signals
+eph system prune                # remove resources for deleted or finished workspaces
 eph dev [service]               # foreground the stack for a preview server
 eph status                      # show state
 eph env [-f format]             # export resolved environment

@@ -48,6 +48,16 @@ impl WorkspaceMetadata {
             .with_context(|| format!("failed to parse workspace metadata: {}", path.display()))
     }
 
+    /// Blocking twin of [`Self::load_from_state_dir`] for callers that are
+    /// already doing synchronous directory walks (prune's classification).
+    pub(crate) fn load_from_state_dir_sync(state_dir: &Path) -> Result<Self> {
+        let path = state_dir.join(WORKSPACE_METADATA_FILE);
+        let contents = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read workspace metadata: {}", path.display()))?;
+        Self::parse(&contents)
+            .with_context(|| format!("failed to parse workspace metadata: {}", path.display()))
+    }
+
     fn parse(contents: &str) -> Result<Self> {
         let metadata: Self = serde_json::from_str(contents)?;
         if metadata.schema != WORKSPACE_METADATA_SCHEMA {
@@ -246,6 +256,23 @@ impl Workspace {
         tokio::fs::write(&path, contents)
             .await
             .with_context(|| format!("failed to write workspace metadata: {}", path.display()))
+    }
+
+    /// Refresh `last_seen` in the workspace metadata if the workspace already
+    /// has state. Read-only commands (`env`, `run`, `status`) call this so a
+    /// workspace that is consulted every day never reads as idle to
+    /// `eph system prune --idle`, while a checkout that has never run `up`
+    /// gains no state directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state directory cannot be resolved or the
+    /// metadata file cannot be written.
+    pub async fn touch_metadata(&self) -> Result<()> {
+        if self.state_dir()?.join(WORKSPACE_METADATA_FILE).is_file() {
+            self.save_metadata().await?;
+        }
+        Ok(())
     }
 
     /// Get the directory holding captured `run=` service logs.

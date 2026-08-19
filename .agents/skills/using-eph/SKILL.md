@@ -463,10 +463,15 @@ return, so they run as normal commands.
 - **Process teardown requires identity.** eph captures a `run=` process's
   identity at launch and verifies it before signaling the recorded PID. A state
   entry without identity requires manual process inspection and cleanup.
-- **Deleted workspaces are global state.** `eph system prune --dry-run` lists
-  resources for missing or empty workspace paths. A real prune confirms before
-  removal. `--force-non-empty` also selects paths that still contain files, and
-  live resources require `--force-live` regardless of how the path was selected.
+- **Deleted workspaces are global state.** `eph system ls` shows every
+  recorded workspace with its age, live processes, containers, and branch merge
+  status. `eph system prune --dry-run` lists resources for missing, empty, or
+  `.eph`-less workspace paths and shows the rest under "Kept". A real prune
+  confirms before removal. `--merged` selects clean worktrees whose branch is
+  merged into the default branch, `--idle 2d` selects workspaces no eph command
+  touched for two days, and `--force-non-empty` selects every path that still
+  contains files. Orphaned `run=` processes are terminated with their
+  workspace; a running container requires `--force-live`.
   `--force` enables every override and skips confirmation; pair it with
   `--dry-run` to preview that full scope. A real prune runs applicable stop and
   clean hooks as best effort, using saved hook state when the worktree is gone;

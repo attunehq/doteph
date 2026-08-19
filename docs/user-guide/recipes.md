@@ -266,7 +266,7 @@ ports. Fixed `run=` ports and Compose bindings still follow their declarations.
 
 When you later delete a checkout (a finished worktree, an abandoned
 experiment), its containers and volumes do not die with the directory. Run
-[`eph system prune`](command-reference.md#eph-system-prune---dry-run---force---compatibility-v042---force-non-empty---force-live--y---yes)
+[`eph system prune`](command-reference.md#eph-system-prune---dry-run---force---compatibility-v042---force-non-empty---force-live---idle-duration---merged--y---yes)
 from anywhere to sweep up resources belonging to workspaces whose directory no
 longer exists.
 
@@ -317,6 +317,9 @@ accordingly:
 | Re-run migrations or seeds against the running data | `eph run <your migrate/seed cmd>` |
 | Wipe data and start completely clean | `eph clean` then `eph up` |
 | Sweep up after deleted checkouts | `eph system prune` |
+| Sweep up worktrees whose PR landed | `eph system prune --merged` |
+| Sweep up anything untouched for a week | `eph system prune --idle 7d` |
+| See every workspace eph knows about | `eph system ls` |
 
 ## Next
 

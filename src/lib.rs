@@ -19,6 +19,7 @@
 #![warn(clippy::perf)]
 
 pub mod env;
+pub mod git;
 pub(crate) mod hooks;
 pub mod parser;
 pub(crate) mod proc;
@@ -32,9 +33,13 @@ pub use env::{
     escape_bash, escape_fish, escape_powershell, render, render_export, render_fish, render_json,
     render_powershell, render_with_unsets,
 };
+pub use git::MergeStatus;
 pub use parser::{EphFile, Service, ServiceSource, parse, resolve_interpolations};
 pub use proc::disinherit_std_handles;
-pub use prune::{ConfirmationOutcome, PruneOptions, PruneReport, confirmation_outcome, prune};
+pub use prune::{
+    ConfirmationOutcome, PathState, PruneOptions, PruneReport, WorkspaceSummary,
+    confirmation_outcome, current_unix_secs, list_workspaces, prune,
+};
 pub use service::{
     Hooks, LogOptions, RunningService, ServiceManager, UnresolvedEnvVar, UnresolvedEnvironment,
     UnresolvedReference, resolve_against_strict, resolve_env_vars, resolve_env_vars_strict,

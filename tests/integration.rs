@@ -19,6 +19,8 @@ mod common;
 mod system_prune_force;
 #[path = "integration/system_prune_hooks.rs"]
 mod system_prune_hooks;
+#[path = "integration/system_prune_selection.rs"]
+mod system_prune_selection;
 use common::{TestWorkspace, extract_port, parse_env_json};
 
 #[cfg(unix)]

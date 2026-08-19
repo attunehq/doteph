@@ -9,6 +9,7 @@ the source. See [Architecture](architecture.md) for the rationale.
 ```text
 src/
   main.rs        clap front end and command dispatch
+  system_ls.rs    system ls CLI and the workspace table shared with prune
   system_prune.rs system prune CLI options, confirmation, and reporting
   watch.rs       binary-side watcher for eph dev --watch
   lib.rs         public library surface
@@ -206,11 +207,17 @@ depth.
 ## prune
 
 `prune` scans state directories with 16-hex or 8-hex names,
-classifies missing or empty workspace paths, and discovers namespaced Docker and
-process resources. It lists each Docker resource type once per pass, then
-partitions that snapshot by workspace namespace. `--force-non-empty` also
-classifies existing non-empty paths as candidates. Live resources block every
-candidate unless `--force-live` is set.
+classifies each recorded path (`PathState`: missing, not a directory, empty,
+no `.eph`, present), asks the `git` module for each present checkout's
+`MergeStatus` concurrently, and discovers namespaced Docker and process
+resources. It lists each Docker resource type once per pass, then partitions
+that snapshot by workspace namespace. `stale_reason` turns path state, merge
+status, idle age, and options into a `StaleReason`; `--merged`, `--idle`, and
+`--force-non-empty` each admit present paths. Present paths that were not
+selected become `WorkspaceSummary` rows in the report's `kept` list, which
+`list_workspaces` also produces for `eph system ls`. A running container blocks
+every candidate unless `--force-live` is set; a live `run=` process blocks only
+`NonEmptyDirectory` candidates (`blocks_prune`).
 An 8-hex state directory without workspace metadata requires
 `--compatibility-v042`. A global lock prevents concurrent prune runs. A
 destructive pass also holds every candidate's `WorkspaceLock` before loading
