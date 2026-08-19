@@ -136,9 +136,10 @@ workspaces whose metadata `last_seen` is older than a duration (refreshed by
 every lifecycle command plus `env`, `run`, and `status`). `--force-non-empty`
 adds every recorded path that still contains files. Existing workspaces that
 were not selected are reported under "Kept" with their signals, the same table
-`eph system ls` prints. Each prune pass takes one daemon-wide Docker resource
-snapshot and partitions it by namespace in memory, so state-root size does not
-multiply Docker API calls. A recorded path that no longer resolves could mean
+`eph system ls` prints. Prune locks stale workspaces in batches of 64, takes
+one daemon-wide Docker resource snapshot per batch, and partitions it by
+namespace in memory, so state-root size neither multiplies Docker API calls
+nor exhausts open file descriptors on held locks. A recorded path that no longer resolves could mean
 the workspace was moved or renamed rather than deleted, so prune checks for a
 running container under that namespace and skips (reports, does not remove) a
 workspace that has one unless `--force-live` is passed. A live `run=` process

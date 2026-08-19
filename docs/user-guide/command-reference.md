@@ -307,9 +307,11 @@ Behavior:
   shown in the preview.
 - Each resource removal is logged to stderr as it happens; `-v` adds the
   lock, Docker inventory, and state-scan steps. The report stays on stdout
-  for callers that capture or pipe it. Prune lists each Docker resource type
-  once per pass and matches the resulting snapshot to workspace namespaces in
-  memory, so large state roots do not cause repeated Docker API calls.
+  for callers that capture or pipe it. Prune locks and inventories stale
+  workspaces in batches of 64, listing each Docker resource type once per
+  batch and matching the snapshot to workspace namespaces in memory, so large
+  state roots neither repeat Docker API calls per workspace nor hold more
+  lock files open than the process is allowed.
 - A workspace's recorded path only decides whether it is *stale*, not whether
   something is still running against it: before removing anything for a
   stale workspace, prune checks that workspace's actual Docker containers for

@@ -210,8 +210,9 @@ depth.
 classifies each recorded path (`PathState`: missing, not a directory, empty,
 no `.eph`, present), asks the `git` module for each present checkout's
 `MergeStatus` concurrently, and discovers namespaced Docker and process
-resources. It lists each Docker resource type once per pass, then partitions
-that snapshot by workspace namespace. `stale_reason` turns path state, merge
+resources. It locks candidates in batches of 64 (each held lock is an open
+file descriptor), lists each Docker resource type once per batch, then
+partitions that snapshot by workspace namespace. `stale_reason` turns path state, merge
 status, idle age, and options into a `StaleReason`; `--merged`, `--idle`, and
 `--force-non-empty` each admit present paths. Present paths that were not
 selected become `WorkspaceSummary` rows in the report's `kept` list, which
