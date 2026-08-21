@@ -308,7 +308,7 @@ worktree is gone. Live services receive stop hooks; every snapshotted service
 receives clean hooks. Missing-worktree hooks run from the state directory, so
 prefer programs on PATH and absolute paths over workspace-relative scripts.
 Hook failures are warnings and do not block prune; resource failures still do.
-Dry runs never execute hooks, and system prune has no `--skip-hooks` flag.
+The preview never executes hooks, and system prune has no `--skip-hooks` flag.
 
 ## Running one-off commands with the environment: `eph run`
 
@@ -465,18 +465,20 @@ return, so they run as normal commands.
   entry without identity requires manual process inspection and cleanup.
 - **Deleted workspaces are global state.** `eph system ls` shows every
   recorded workspace with its age, live processes, containers, and branch merge
-  status. `eph system prune --dry-run` lists resources for missing, empty, or
-  `.eph`-less workspace paths and shows the rest under "Kept". A real prune
-  confirms before removal. `--merged` selects clean worktrees whose branch is
+  status. `eph system prune` lists resources for missing, empty, or
+  `.eph`-less workspace paths, shows the rest under "Kept", and confirms
+  before removal; there is no dry-run flag. When stdin is not a terminal it
+  stops after that preview unless `--yes` is passed, so run it without
+  `--yes` to see the plan. `--merged` selects clean worktrees whose branch is
   merged into the default branch, `--idle 2d` selects workspaces no eph command
   touched for two days, and `--force-non-empty` selects every path that still
   contains files. Orphaned `run=` processes are terminated with their
   workspace; a running container requires `--force-live`. `--yolo` is the
   start-of-day sweep (`--merged --idle 12h --force-live`) and still confirms.
-  `--force` enables every override and skips confirmation; pair it with
-  `--dry-run` to preview that full scope. A real prune runs applicable stop and
-  clean hooks as best effort, using saved hook state when the worktree is gone;
-  hook failures are warnings.
+  `--force` enables every override and still confirms, so `--force` alone
+  previews the full scope and `--force --yes` removes it. A real prune runs
+  applicable stop and clean hooks as best effort, using saved hook state when
+  the worktree is gone; hook failures are warnings.
 - **Execution fails closed on unresolved references.** Hooks, service startup,
   health checks, and `eph run` stop before launching a child with a raw eph
   placeholder.

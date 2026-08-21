@@ -31,8 +31,10 @@ use tracing::{debug, info};
 /// Options for [`prune`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PruneOptions {
-    /// Print what would be removed without deleting Docker resources or state.
-    pub dry_run: bool,
+    /// Report what would be removed without deleting Docker resources or
+    /// state: the pass `eph system prune` shows before asking for
+    /// confirmation.
+    pub preview: bool,
     /// Prune state directories written by eph v0.4.2 and earlier.
     pub compatibility_v042: bool,
     /// Treat recorded workspace paths that still contain files as prune
@@ -84,7 +86,7 @@ impl PathState {
 }
 
 /// Whether `eph system prune`'s confirmation prompt should be shown, skipped,
-/// or refused for a real (non-dry-run) prune.
+/// or refused for a real prune.
 ///
 /// This is a plain function over booleans, not a method that reads
 /// `std::io::stdin()` itself, so the CLI layer's terminal check and its
@@ -99,16 +101,16 @@ pub enum ConfirmationOutcome {
     /// Show the "Remove these resources? [y/N]" prompt on stdin.
     Prompt,
     /// stdin is not a terminal and `--yes` was not passed, so there is no way
-    /// to ask and no consent to assume: refuse until the caller passes
-    /// `--yes`.
+    /// to ask and no consent to assume: stop after the preview until the
+    /// caller passes `--yes`.
     RequireYes,
 }
 
 /// Decide [`ConfirmationOutcome`] for a real prune.
 ///
 /// `docker system prune` always confirms before deleting anything; this
-/// mirrors that default while still letting scripts (`--yes`) and dry runs
-/// (`would_remove == false` once nothing is left to remove) skip the prompt.
+/// mirrors that default. Scripts skip the prompt with `--yes`, and a pass
+/// with nothing left to remove (`would_remove == false`) skips it too.
 #[must_use]
 pub fn confirmation_outcome(
     would_remove: bool,
@@ -170,7 +172,7 @@ impl std::fmt::Display for StaleReason {
     }
 }
 
-/// Counts of resources removed, or that would be removed during a dry run.
+/// Counts of resources removed, or that a preview would remove.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PruneCounts {
     /// Docker containers removed.
@@ -285,11 +287,9 @@ impl WorkspaceSummary {
 /// Summary returned by [`prune`].
 #[derive(Debug, Clone, Default)]
 pub struct PruneReport {
-    /// Whether this was a dry run.
-    pub dry_run: bool,
     /// Unix time the pass ran, the reference point for idle ages.
     pub now_unix_secs: u64,
-    /// Stale workspaces removed, or that would be removed during a dry run.
+    /// Stale workspaces removed, or that a preview would remove.
     pub pruned: Vec<PrunedWorkspace>,
     /// Metadata-backed workspaces that still exist and were not selected,
     /// oldest `last_seen` first, with the signals a user needs to decide
@@ -418,7 +418,6 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
         .context("failed to ping docker daemon")?;
     let now = current_unix_secs();
     let mut report = PruneReport {
-        dry_run: options.dry_run,
         now_unix_secs: now,
         ..PruneReport::default()
     };
@@ -479,12 +478,12 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
     // Each held lock is an open file descriptor, and a state root can hold
     // hundreds of stale workspaces (a default macOS shell allows 256 open
     // files), so candidates are locked and inventoried in bounded batches
-    // rather than all at once. Dry runs take no locks, but share the batching
+    // rather than all at once. Previews take no locks, but share the batching
     // so their Docker snapshots match a real run's.
     let mut candidates = candidates.into_iter().peekable();
     while candidates.peek().is_some() {
         let batch: Vec<PruneCandidate> = candidates.by_ref().take(LOCK_BATCH_SIZE).collect();
-        let mut workspace_locks = if options.dry_run {
+        let mut workspace_locks = if options.preview {
             Vec::new()
         } else {
             batch
@@ -514,7 +513,7 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
         }
     }
 
-    if !options.dry_run {
+    if !options.preview {
         sweep_orphan_lock_files(&root);
     }
 
@@ -744,7 +743,7 @@ async fn prune_candidate(
         return Ok(());
     }
 
-    if !options.dry_run
+    if !options.preview
         && let Some(metadata) = candidate.metadata.as_ref()
         && !metadata_still_prunable(&candidate.state_dir, metadata, candidate.merge, options)?
     {
@@ -781,8 +780,8 @@ fn gained_workspace_metadata(state_dir: &Path) -> bool {
 /// containers and `run=` processes for signs of life. Live resources block
 /// the prune (reported via [`PruneReport::skipped`]) unless
 /// `options.force_live` opts back into the old, unguarded behavior. This
-/// applies during `--dry-run` too, so the preview shown before the
-/// confirmation prompt matches what a real run would do.
+/// applies to the preview too, so what is shown before the confirmation
+/// prompt matches what a real run would do.
 ///
 /// Returns `Ok(None)` when the workspace was skipped for liveness rather than
 /// pruned.
@@ -855,7 +854,7 @@ async fn prune_workspace(
         .filter(|path| path.is_dir())
         .unwrap_or(&state_dir);
 
-    if options.dry_run {
+    if options.preview {
         debug!("Planning removal for workspace {short_id}");
     } else {
         info!("Removing resources for workspace {short_id}");
@@ -874,32 +873,32 @@ async fn prune_workspace(
     }
 
     if let Some(state) = &state {
-        terminate_live_processes(state, &short_id, options.dry_run, report, &mut counts).await;
+        terminate_live_processes(state, &short_id, options.preview, report, &mut counts).await;
     }
-    counts.containers = remove_containers(docker.client, containers, options.dry_run).await?;
+    counts.containers = remove_containers(docker.client, containers, options.preview).await?;
     counts.volumes = remove_volumes(
         docker.client,
         &docker.inventory.volumes,
         &prefix,
-        options.dry_run,
+        options.preview,
     )
     .await?;
     counts.networks = remove_networks(
         docker.client,
         &docker.inventory.networks,
         &prefix,
-        options.dry_run,
+        options.preview,
     )
     .await?;
     counts.images = remove_images(
         docker.client,
         &docker.inventory.images,
         &prefix,
-        options.dry_run,
+        options.preview,
     )
     .await?;
 
-    if !options.dry_run
+    if !options.preview
         && let (Some(snapshot), Some(metadata)) = (&hook_snapshot, &metadata)
     {
         let context = PruneHookContext {
@@ -916,7 +915,7 @@ async fn prune_workspace(
 
     if state_dir.exists() {
         counts.state_dirs = 1;
-        if !options.dry_run {
+        if !options.preview {
             info!("Removing state directory {}", state_dir.display());
             tokio::fs::remove_dir_all(&state_dir)
                 .await
@@ -1378,7 +1377,7 @@ fn count_live_processes(state: &ServiceState) -> usize {
 async fn terminate_live_processes(
     state: &ServiceState,
     short_id: &str,
-    dry_run: bool,
+    preview: bool,
     report: &mut PruneReport,
     counts: &mut PruneCounts,
 ) {
@@ -1399,7 +1398,7 @@ async fn terminate_live_processes(
 
         if proc::identity_matches(*pid, identity) {
             counts.processes += 1;
-            if !dry_run {
+            if !preview {
                 proc::terminate(*pid);
                 sleep(Duration::from_secs(2)).await;
                 proc::force_kill(*pid);
@@ -1455,13 +1454,13 @@ fn count_running_containers(containers: &[ContainerSummary]) -> usize {
 async fn remove_containers(
     docker: &Docker,
     containers: Vec<ContainerSummary>,
-    dry_run: bool,
+    preview: bool,
 ) -> Result<usize> {
     let mut removed = 0;
 
     for container in containers {
         removed += 1;
-        if dry_run {
+        if preview {
             continue;
         }
         let Some(id) = container.id else {
@@ -1485,7 +1484,7 @@ async fn remove_volumes(
     docker: &Docker,
     volumes: &[Volume],
     prefix: &str,
-    dry_run: bool,
+    preview: bool,
 ) -> Result<usize> {
     let mut removed = 0;
 
@@ -1494,7 +1493,7 @@ async fn remove_volumes(
             continue;
         }
         removed += 1;
-        if dry_run {
+        if preview {
             continue;
         }
         info!("Removing volume {}", volume.name);
@@ -1515,7 +1514,7 @@ async fn remove_networks(
     docker: &Docker,
     networks: &[Network],
     prefix: &str,
-    dry_run: bool,
+    preview: bool,
 ) -> Result<usize> {
     let mut removed = 0;
 
@@ -1527,7 +1526,7 @@ async fn remove_networks(
             continue;
         }
         removed += 1;
-        if dry_run {
+        if preview {
             continue;
         }
         info!("Removing network {name}");
@@ -1545,7 +1544,7 @@ async fn remove_images(
     docker: &Docker,
     images: &[ImageSummary],
     prefix: &str,
-    dry_run: bool,
+    preview: bool,
 ) -> Result<usize> {
     let mut removed = 0;
 
@@ -1564,7 +1563,7 @@ async fn remove_images(
         };
 
         removed += 1;
-        if dry_run {
+        if preview {
             continue;
         }
         info!("Removing image {tag}");
@@ -1810,7 +1809,7 @@ fn metadata_still_prunable(
 /// whichever process created the file first held the lock, and finishing
 /// (or a signal) cleaned it up. But a crash skips `Drop`, so the file, and
 /// the lock, outlived the process that made it, and every later prune,
-/// including `--dry-run`, failed until someone deleted it by hand.
+/// including a preview, failed until someone deleted it by hand.
 ///
 /// [`fd_lock::RwLock`] is an OS advisory lock (`flock` on Unix, `LockFileEx`
 /// on Windows) instead: the kernel releases it the instant the holding
@@ -1821,9 +1820,9 @@ fn metadata_still_prunable(
 ///
 /// The caller keeps the returned lock and its `try_write` guard as two locals
 /// in [`prune`], so the OS lock releases when `prune` returns. That matters
-/// because `eph system prune` calls [`prune`] twice, a dry-run preview and
-/// then the real pass, and the second call must be able to take the lock the
-/// first one held.
+/// because `eph system prune` calls [`prune`] twice, a preview and then the
+/// real pass, and the second call must be able to take the lock the first one
+/// held.
 fn open_prune_lock(root: &Path) -> Result<fd_lock::RwLock<File>> {
     std::fs::create_dir_all(root)
         .with_context(|| format!("failed to create state root: {}", root.display()))?;

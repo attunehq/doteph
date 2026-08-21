@@ -76,7 +76,7 @@ Behavior:
 - After a successful `up`, a filesystem-only scan checks whether any *other*
   workspace's recorded path has been deleted (a removed worktree or clone),
   and prints a one-line note on stderr pointing at
-  [`eph system prune`](#eph-system-prune---dry-run---force---compatibility-v042---force-non-empty---force-live---idle-duration---merged---yolo--y---yes)
+  [`eph system prune`](#eph-system-prune---force---compatibility-v042---force-non-empty---force-live---idle-duration---merged---yolo--y---yes)
   when it finds one. It never touches Docker, never fails the `up` itself, and
   never counts the current workspace.
 
@@ -220,7 +220,7 @@ If the checkout is behind its own upstream branch, the upstream tip is judged,
 since that is what got merged. The default branch's own checkout, and a fresh
 worktree sitting on the default branch's tip with no commits, read `unmerged`.
 
-## `eph system prune [--dry-run] [--force] [--compatibility-v042] [--force-non-empty] [--force-live] [--idle DURATION] [--merged] [--yolo] [-y] [--yes]`
+## `eph system prune [--force] [--compatibility-v042] [--force-non-empty] [--force-live] [--idle DURATION] [--merged] [--yolo] [-y] [--yes]`
 
 Cross-workspace prune for resources left behind by finished workspaces. It
 scans the eph state root (the platform default, or `EPH_STATE_ROOT` when set;
@@ -233,8 +233,7 @@ those signals.
 
 | Flag | Description |
 |------|-------------|
-| `--dry-run` | Print what would be removed without deleting anything, and without prompting. |
-| `--force` | Enable `--compatibility-v042`, `--force-non-empty`, `--force-live`, and `--yes`. |
+| `--force` | Enable `--compatibility-v042`, `--force-non-empty`, and `--force-live`. Still prompts for confirmation. |
 | `--compatibility-v042` | Also prune 8-character state directories that have no workspace metadata. |
 | `--force-non-empty` | Also prune workspaces whose recorded path still exists and contains files. |
 | `--force-live` | Remove a stale workspace's resources even if it still has a running container (or, for `--force-non-empty`, a live `run=` process). |
@@ -245,18 +244,23 @@ those signals.
 
 ```sh
 eph system prune
-eph system prune --dry-run
-eph system prune --idle 2d --dry-run
+eph system prune --idle 2d
 eph system prune --merged --idle 7d
 eph system prune --yolo
-eph system prune --force --dry-run
+eph system prune --yolo --yes
 eph system prune --force
-eph system prune --yes
+eph system prune --force --yes
 eph system prune --compatibility-v042
-eph system prune --force-non-empty --dry-run
+eph system prune --force-non-empty
 eph system prune --force-non-empty --yes
 eph system prune --force-live --yes
 ```
+
+There is no separate dry-run flag. Every run starts by printing what it would
+remove; it removes nothing until you answer `y` at the prompt or pass
+`-y`/`--yes`. To preview, run the selection you intend and answer `n`, or run
+it with stdin redirected from `/dev/null`, where prune prints the report and
+stops.
 
 ```text
 Would remove 2 workspaces (3 containers, 1 volume, 1 network, 1 image, 2 state directories):
@@ -287,9 +291,9 @@ table.
 Behavior:
 
 - `--force` is the complete destructive override. It includes legacy state,
-  existing non-empty workspace paths, and live resources, then removes the
-  selected resources without prompting. `--force --dry-run` previews that
-  complete scope without changing anything.
+  existing non-empty workspace paths, and live resources. `--force` alone
+  previews that complete scope and still asks; `--force --yes` removes it
+  without asking.
 - By default, a recorded workspace path is eligible only when it is missing,
   empty, no longer a directory, or no longer contains a `.eph` file (a
   half-removed worktree). `--merged` and `--idle` add existing workspaces by
@@ -297,7 +301,7 @@ Behavior:
   `last_seen` is refreshed by `up`, `dev`, `down`, `clean`, `env`, `run`, and
   `status`, so a workspace an agent reads every day never reads as idle.
   `--force-non-empty` makes every existing non-empty directory eligible. Each
-  is a global selection, so preview with `--dry-run` before removal. When
+  is a global selection, so read the preview before you confirm. When
   several apply, the report names the most specific reason: `merged branch`,
   then `idle workspace`, then `non-empty workspace directory`.
 - `--yolo` is the start-of-day sweep: `--merged --idle 12h --force-live`, so a
@@ -308,7 +312,7 @@ Behavior:
 - The "Kept" table lists every workspace that still exists and was not
   selected, oldest first, with its idle age, live `run=` processes, running
   and total containers, volumes, and branch status. It is printed with the
-  preview (and with `--dry-run`), not again after removal. The completion
+  preview, not again after removal. The completion
   report after a real removal is the one-line total plus anything the removal
   itself turned up (skips, hook warnings); the per-workspace list was already
   shown in the preview.
@@ -328,8 +332,8 @@ Behavior:
   and delete their volume data with no warning. If any container is running,
   the workspace is reported under "Skipped" instead ("stop them or re-run
   with --force-live") and left untouched. `--force-live` authorizes removing
-  it anyway. `--dry-run` applies the same checks, so its preview always
-  matches what a real run would do.
+  it anyway. The preview applies the same checks, so it always matches what
+  the removal would do.
 - A live `run=` process does not block a missing, empty, `.eph`-less, idle, or
   merged workspace; prune terminates it along with the rest. Its recorded
   identity includes the working directory eph launched it in, so a process
@@ -339,14 +343,14 @@ Behavior:
   exception is `--force-non-empty`, which carries no such signal: there a
   live `run=` process still blocks unless `--force-live` (or `--force`) is
   passed.
-- Unless `--dry-run`, prune prints what it is about to remove and then asks
+- Prune prints what it is about to remove and then asks
   `Remove resources for N workspaces? [y/N]` before deleting anything, the same way
   `docker system prune` does. Anything other than `y` or `yes` (a bare Enter
   included) aborts with nothing removed, and the command still exits
-  successfully. Pass `-y`/`--yes` or `--force` to skip the prompt; one is
-  required when stdin is not a terminal (a script or CI job, for instance),
-  where prune errors instead of hanging or silently proceeding. No prompt
-  appears when there is nothing to remove.
+  successfully. Pass `-y`/`--yes` to skip the prompt. When stdin is not a
+  terminal (a script or CI job, for instance) prune cannot ask, so without
+  `--yes` it prints the report, says nothing was removed, and exits
+  successfully. No prompt appears when there is nothing to remove.
 - Docker resources are removed by eph's workspace namespace
   (`eph-<short_id>-...`), so containers, built images, named volumes, Compose
   containers, and Compose networks can all be pruned even when the original
@@ -361,7 +365,7 @@ Behavior:
   unresolved hook variables are printed as warnings with captured output, then
   prune continues. A warning shared by several workspaces is printed once with
   the workspace count. Docker, process, and state removal errors still fail the
-  command. `--dry-run` never executes hooks.
+  command. The preview never executes hooks.
 - There is no prune-specific `--skip-hooks`. System prune is already best effort
   for hooks, so a broken cleanup script cannot block resource removal. State
   written before teardown snapshots were introduced still prunes and reports
@@ -375,7 +379,7 @@ Behavior:
   leaves processes prune cannot discover; stop those manually.
 - An 8-character state directory without `workspace.json` is skipped by
   default. `--compatibility-v042` prunes that directory by `short_id` namespace
-  alone. Preview this path with `--dry-run --compatibility-v042`.
+  alone. Run `--compatibility-v042` without `--yes` to preview that scope.
 - Prune holds an OS-level lock file (`prune.lock` in the state root) for its
   whole run, so two prunes never operate at once. The lock is released the
   instant the holding process exits, crash included, so a second prune

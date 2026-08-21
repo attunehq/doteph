@@ -177,7 +177,7 @@ sweeps lock files whose state directory is gone and that nothing holds.
 
 Two commands manage state directories in bulk: `eph clean` deletes the state
 directory for the current workspace along with its services and data, and
-[`eph system prune`](command-reference.md#eph-system-prune---dry-run---force---compatibility-v042---force-non-empty---force-live---idle-duration---merged---yolo--y---yes)
+[`eph system prune`](command-reference.md#eph-system-prune---force---compatibility-v042---force-non-empty---force-live---idle-duration---merged---yolo--y---yes)
 scans **all** state directories and removes leftovers for workspaces whose
 directory has since been deleted (a worktree you removed, for example), and
 can also select worktrees whose branch has been merged (`--merged`) or that
@@ -239,7 +239,7 @@ It runs stop hooks only when it stops a live service and clean hooks whenever it
 cleans a snapshotted service. A current valid `.eph` wins over saved hooks; when
 the file or worktree is unavailable, prune uses the saved snapshot. Hook failures
 become warnings and cleanup continues, while resource-removal failures remain
-fatal. Dry runs do not execute hooks.
+fatal. The preview before the confirmation prompt does not execute hooks.
 
 ### Three levels of teardown
 

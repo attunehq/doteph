@@ -11,11 +11,8 @@ use std::time::Duration;
 /// Arguments accepted by `eph system prune`.
 #[derive(Debug, ClapArgs)]
 pub(crate) struct Args {
-    /// Print what would be removed without deleting anything.
-    #[arg(long)]
-    dry_run: bool,
-
-    /// Enable every destructive override and skip confirmation.
+    /// Enable every destructive override. The confirmation prompt still
+    /// applies unless -y/--yes is also given.
     #[arg(long)]
     force: bool,
 
@@ -81,7 +78,6 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExecutionOptions {
-    dry_run: bool,
     compatibility_v042: bool,
     force_non_empty: bool,
     force_live: bool,
@@ -96,21 +92,23 @@ impl Args {
     /// path while remaining correct in another.
     fn execution_options(&self) -> ExecutionOptions {
         ExecutionOptions {
-            dry_run: self.dry_run,
             compatibility_v042: self.force || self.compatibility_v042,
             force_non_empty: self.force || self.force_non_empty,
             force_live: self.force || self.force_live || self.yolo,
             idle: self.idle.or(self.yolo.then_some(YOLO_IDLE)),
             merged: self.merged || self.yolo,
-            yes: self.force || self.yes,
+            yes: self.yes,
         }
     }
 
     /// Report what would be torn down, then confirm and perform the removal.
+    ///
+    /// Without `--yes`, a declined prompt or a non-terminal stdin ends the
+    /// command after the report.
     pub(crate) async fn run(self) -> Result<()> {
         let options = self.execution_options();
-        let preview_options = PruneOptions {
-            dry_run: true,
+        let prune_options = |preview| PruneOptions {
+            preview,
             compatibility_v042: options.compatibility_v042,
             force_non_empty: options.force_non_empty,
             force_live: options.force_live,
@@ -118,18 +116,19 @@ impl Args {
             merged: options.merged,
         };
 
-        let preview = eph::prune(preview_options).await?;
+        let preview = eph::prune(prune_options(true)).await?;
         print_preview(&preview);
-        if options.dry_run || preview.pruned.is_empty() {
+        if preview.pruned.is_empty() {
             return Ok(());
         }
 
         match eph::confirmation_outcome(true, options.yes, io::stdin().is_terminal()) {
             eph::ConfirmationOutcome::Proceed => {}
             eph::ConfirmationOutcome::RequireYes => {
-                anyhow::bail!(
-                    "stdin is not a terminal, so system prune cannot prompt for confirmation; pass -y/--yes or --force to remove these resources without asking"
+                println!(
+                    "\nNothing removed: stdin is not a terminal, so system prune cannot ask for confirmation. Pass -y/--yes to remove these resources."
                 );
+                return Ok(());
             }
             eph::ConfirmationOutcome::Prompt => {
                 print!(
@@ -152,15 +151,7 @@ impl Args {
             }
         }
 
-        let report = eph::prune(PruneOptions {
-            dry_run: false,
-            compatibility_v042: options.compatibility_v042,
-            force_non_empty: options.force_non_empty,
-            force_live: options.force_live,
-            idle: options.idle,
-            merged: options.merged,
-        })
-        .await?;
+        let report = eph::prune(prune_options(false)).await?;
         println!();
         print_completion(&report);
         Ok(())
@@ -168,8 +159,8 @@ impl Args {
 }
 
 /// The selection report: every workspace that would be removed and why,
-/// followed by the workspaces left alone. Printed for `--dry-run` and as the
-/// preview before the confirmation prompt.
+/// followed by the workspaces left alone. Printed before the confirmation
+/// prompt.
 fn print_preview(report: &PruneReport) {
     if report.pruned.is_empty() {
         println!("Nothing to prune.");
@@ -330,21 +321,21 @@ mod tests {
     }
 
     #[test]
-    fn force_enables_every_destructive_override_and_confirmation_bypass() {
+    fn force_enables_every_destructive_override_but_not_confirmation() {
         let options = parse(&["--force"]).execution_options();
 
         assert_eq!(
             options,
             ExecutionOptions {
-                dry_run: false,
                 compatibility_v042: true,
                 force_non_empty: true,
                 force_live: true,
                 idle: None,
                 merged: false,
-                yes: true,
+                yes: false,
             }
         );
+        assert!(parse(&["--force", "--yes"]).execution_options().yes);
     }
 
     #[test]
@@ -372,17 +363,6 @@ mod tests {
         assert!(parse_duration("2w").is_err());
         assert!(parse_duration("1.5h").is_err());
         assert!(parse_duration("h").is_err());
-    }
-
-    #[test]
-    fn force_can_preview_the_complete_destructive_scope() {
-        let options = parse(&["--force", "--dry-run"]).execution_options();
-
-        assert!(options.dry_run);
-        assert!(options.compatibility_v042);
-        assert!(options.force_non_empty);
-        assert!(options.force_live);
-        assert!(options.yes);
     }
 
     #[test]
@@ -436,7 +416,6 @@ mod tests {
         assert_eq!(
             options,
             ExecutionOptions {
-                dry_run: false,
                 compatibility_v042: false,
                 force_non_empty: false,
                 force_live: true,

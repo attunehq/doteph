@@ -225,7 +225,8 @@ destructive pass also holds every candidate's `WorkspaceLock` before loading
 the shared Docker inventory, which serializes prune against `up`, `down`,
 `clean`, and foreground `dev` startup without returning to per-workspace Docker
 listings. The binary-side `system_prune` module resolves `--force` into all
-three scope overrides plus confirmation bypass before it calls the library.
+three scope overrides before it calls the library; only `--yes` skips the
+prompt.
 For hook execution, prune prefers a readable, valid current `.eph` and falls
 back to the typed snapshot in `ServiceState`. It constructs the pre-teardown
 port environment once, runs clean hooks for every snapshotted service and stop

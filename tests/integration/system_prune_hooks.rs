@@ -78,7 +78,7 @@ impl PruneHookWorkspace {
 impl Drop for PruneHookWorkspace {
     fn drop(&mut self) {
         let _ = std::process::Command::new(env!("CARGO_BIN_EXE_eph"))
-            .args(["system", "prune", "--force"])
+            .args(["system", "prune", "--force", "--yes"])
             .current_dir(self.state_root.path())
             .env("EPH_STATE_ROOT", self.state_root.path())
             .output();
@@ -173,8 +173,10 @@ async fn force_prune_runs_the_full_lifecycle_for_a_live_service() {
     let up = workspace.eph(&["up"]).await;
     assert_success("eph up", &up);
 
-    let prune = workspace.prune(&["system", "prune", "--force"]).await;
-    assert_success("eph system prune --force", &prune);
+    let prune = workspace
+        .prune(&["system", "prune", "--force", "--yes"])
+        .await;
+    assert_success("eph system prune --force --yes", &prune);
 
     assert_eq!(
         std::fs::read_to_string(marker).unwrap().replace('\r', ""),
@@ -190,8 +192,10 @@ async fn recorded_backend_controls_liveness_after_the_source_kind_changes() {
     let marker = workspace.marker("recorded-backend");
     workspace.rewrite_eph(&lifecycle_config(&marker));
 
-    let prune = workspace.prune(&["system", "prune", "--force"]).await;
-    assert_success("eph system prune --force", &prune);
+    let prune = workspace
+        .prune(&["system", "prune", "--force", "--yes"])
+        .await;
+    assert_success("eph system prune --force --yes", &prune);
 
     assert_eq!(
         std::fs::read_to_string(marker).unwrap().replace('\r', ""),
@@ -210,8 +214,10 @@ async fn prune_runs_only_clean_hooks_for_an_already_stopped_service() {
         &workspace.eph(&["down", "--skip-hooks"]).await,
     );
 
-    let prune = workspace.prune(&["system", "prune", "--force"]).await;
-    assert_success("eph system prune --force", &prune);
+    let prune = workspace
+        .prune(&["system", "prune", "--force", "--yes"])
+        .await;
+    assert_success("eph system prune --force --yes", &prune);
 
     assert_eq!(
         std::fs::read_to_string(marker).unwrap().replace('\r', ""),
@@ -238,8 +244,10 @@ async fn missing_worktree_uses_the_saved_snapshot_and_state_directory_cwd() {
         .expect("failed to canonicalize test state directory");
     workspace.remove_workspace();
 
-    let prune = workspace.prune(&["system", "prune", "--force"]).await;
-    assert_success("eph system prune --force", &prune);
+    let prune = workspace
+        .prune(&["system", "prune", "--force", "--yes"])
+        .await;
+    assert_success("eph system prune --force --yes", &prune);
 
     assert_eq!(
         std::fs::read_to_string(marker).unwrap().replace('\r', ""),
@@ -269,8 +277,10 @@ async fn saved_ports_resolve_top_level_hook_environment_without_the_worktree() {
     assert_success("eph up", &workspace.eph(&["up"]).await);
     workspace.remove_workspace();
 
-    let prune = workspace.prune(&["system", "prune", "--force"]).await;
-    assert_success("eph system prune --force", &prune);
+    let prune = workspace
+        .prune(&["system", "prune", "--force", "--yes"])
+        .await;
+    assert_success("eph system prune --force --yes", &prune);
 
     let value = std::fs::read_to_string(marker).unwrap();
     assert!(
@@ -296,8 +306,10 @@ async fn every_hook_failure_warns_and_prune_still_removes_the_workspace() {
     assert_success("eph up", &workspace.eph(&["up"]).await);
     let state_dir = workspace.state_dir().await;
 
-    let prune = workspace.prune(&["system", "prune", "--force"]).await;
-    assert_success("eph system prune --force", &prune);
+    let prune = workspace
+        .prune(&["system", "prune", "--force", "--yes"])
+        .await;
+    assert_success("eph system prune --force --yes", &prune);
     let stdout = String::from_utf8_lossy(&prune.stdout);
 
     for phase in ["pre-clean", "pre-stop", "post-stop", "post-clean"] {
@@ -312,16 +324,14 @@ async fn every_hook_failure_warns_and_prune_still_removes_the_workspace() {
 }
 
 #[tokio::test]
-async fn dry_run_never_executes_hooks() {
+async fn preview_never_executes_hooks() {
     let workspace = PruneHookWorkspace::new("");
-    let marker = workspace.marker("dry-run");
+    let marker = workspace.marker("preview");
     workspace.rewrite_eph(&lifecycle_config(&marker));
     assert_success("eph up", &workspace.eph(&["up"]).await);
 
-    let preview = workspace
-        .prune(&["system", "prune", "--force", "--dry-run"])
-        .await;
-    assert_success("eph system prune --force --dry-run", &preview);
+    let preview = workspace.prune(&["system", "prune", "--force"]).await;
+    assert_success("eph system prune --force", &preview);
 
     assert!(!marker.exists());
     assert!(workspace.state_dir().await.exists());

@@ -181,7 +181,7 @@ System prune handles hook failures differently because one bad script must not
 block stale-workspace cleanup. It prints a warning containing the workspace,
 service, phase, command, stdout, and stderr, then continues with later hooks and
 resource removal. Fix the script for future lifecycle commands; there is no
-system-prune `--skip-hooks` flag, and `--dry-run` does not execute hooks.
+system-prune `--skip-hooks` flag, and the preview does not execute hooks.
 
 ## A port reference did not resolve
 
@@ -261,12 +261,13 @@ If the workspace directory itself was deleted, run `eph system prune` from
 anywhere. It scans all eph state directories and removes resources for
 recorded workspace paths that are missing, empty, or no longer hold a `.eph`
 file, terminating any `run=` process still running from a deleted directory.
-Use `eph system prune --dry-run` first to see the plan; its "Kept" table (or
-`eph system ls`) shows every workspace that still exists with its idle age,
+Every prune prints its plan and asks before removing anything; the "Kept"
+table (or `eph system ls`) shows every workspace that still exists with its idle age,
 live processes, containers, and branch status. Worktrees that agent tools
 never removed pile up there: select them with `eph system prune --merged`
 (branch merged into the default branch, clean tree) or `--idle 2d` (no eph
-command for two days), preview with `--dry-run`, then rerun with `--yes`. If
+command for two days), read the preview, then answer `y` or rerun with
+`--yes`. If
 a recorded path still contains files and none of those signals apply but you
 know the workspace can be discarded, use `--force-non-empty`. Add
 `--force-live` when the preview reports a running container. An 8-character
