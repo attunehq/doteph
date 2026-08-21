@@ -177,7 +177,7 @@ sweeps lock files whose state directory is gone and that nothing holds.
 
 Two commands manage state directories in bulk: `eph clean` deletes the state
 directory for the current workspace along with its services and data, and
-[`eph system prune`](command-reference.md#eph-system-prune---dry-run---force---compatibility-v042---force-non-empty---force-live---idle-duration---merged--y---yes)
+[`eph system prune`](command-reference.md#eph-system-prune---dry-run---force---compatibility-v042---force-non-empty---force-live---idle-duration---merged---yolo--y---yes)
 scans **all** state directories and removes leftovers for workspaces whose
 directory has since been deleted (a worktree you removed, for example), and
 can also select worktrees whose branch has been merged (`--merged`) or that

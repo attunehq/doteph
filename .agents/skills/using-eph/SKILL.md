@@ -471,7 +471,8 @@ return, so they run as normal commands.
   merged into the default branch, `--idle 2d` selects workspaces no eph command
   touched for two days, and `--force-non-empty` selects every path that still
   contains files. Orphaned `run=` processes are terminated with their
-  workspace; a running container requires `--force-live`.
+  workspace; a running container requires `--force-live`. `--yolo` is the
+  start-of-day sweep (`--merged --idle 12h --force-live`) and still confirms.
   `--force` enables every override and skips confirmation; pair it with
   `--dry-run` to preview that full scope. A real prune runs applicable stop and
   clean hooks as best effort, using saved hook state when the worktree is gone;

@@ -76,7 +76,7 @@ Behavior:
 - After a successful `up`, a filesystem-only scan checks whether any *other*
   workspace's recorded path has been deleted (a removed worktree or clone),
   and prints a one-line note on stderr pointing at
-  [`eph system prune`](#eph-system-prune---dry-run---force---compatibility-v042---force-non-empty---force-live---idle-duration---merged--y---yes)
+  [`eph system prune`](#eph-system-prune---dry-run---force---compatibility-v042---force-non-empty---force-live---idle-duration---merged---yolo--y---yes)
   when it finds one. It never touches Docker, never fails the `up` itself, and
   never counts the current workspace.
 
@@ -220,7 +220,7 @@ If the checkout is behind its own upstream branch, the upstream tip is judged,
 since that is what got merged. The default branch's own checkout, and a fresh
 worktree sitting on the default branch's tip with no commits, read `unmerged`.
 
-## `eph system prune [--dry-run] [--force] [--compatibility-v042] [--force-non-empty] [--force-live] [--idle DURATION] [--merged] [-y] [--yes]`
+## `eph system prune [--dry-run] [--force] [--compatibility-v042] [--force-non-empty] [--force-live] [--idle DURATION] [--merged] [--yolo] [-y] [--yes]`
 
 Cross-workspace prune for resources left behind by finished workspaces. It
 scans the eph state root (the platform default, or `EPH_STATE_ROOT` when set;
@@ -240,6 +240,7 @@ those signals.
 | `--force-live` | Remove a stale workspace's resources even if it still has a running container (or, for `--force-non-empty`, a live `run=` process). |
 | `--idle DURATION` | Also prune workspaces no eph command has touched for at least `DURATION` (`90s`, `30m`, `12h`, `2d`). |
 | `--merged` | Also prune workspaces whose git branch is merged into the repository's default branch and whose working tree is clean. |
+| `--yolo` | Enable `--merged`, `--idle 12h` (unless `--idle` is given), and `--force-live`. Still prompts for confirmation. |
 | `-y`, `--yes` | Skip the removal confirmation prompt. |
 
 ```sh
@@ -247,6 +248,7 @@ eph system prune
 eph system prune --dry-run
 eph system prune --idle 2d --dry-run
 eph system prune --merged --idle 7d
+eph system prune --yolo
 eph system prune --force --dry-run
 eph system prune --force
 eph system prune --yes
@@ -298,6 +300,11 @@ Behavior:
   is a global selection, so preview with `--dry-run` before removal. When
   several apply, the report names the most specific reason: `merged branch`,
   then `idle workspace`, then `non-empty workspace directory`.
+- `--yolo` is the start-of-day sweep: `--merged --idle 12h --force-live`, so a
+  workspace left running overnight is stopped along with its volumes rather
+  than skipped for its running container. An explicit `--idle` overrides the
+  12h default. It never touches a worktree or its commits, and it still
+  prompts, so pair it with `-y` for scripts.
 - The "Kept" table lists every workspace that still exists and was not
   selected, oldest first, with its idle age, live `run=` processes, running
   and total containers, volumes, and branch status. It is printed with the
