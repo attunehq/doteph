@@ -99,7 +99,7 @@ impl SelectionWorkspace {
 impl Drop for SelectionWorkspace {
     fn drop(&mut self) {
         let _ = std::process::Command::new(env!("CARGO_BIN_EXE_eph"))
-            .args(["system", "prune", "--force"])
+            .args(["system", "prune", "--force", "--yes"])
             .current_dir(self.state_root.path())
             .env("EPH_STATE_ROOT", self.state_root.path())
             .output();
@@ -203,8 +203,8 @@ async fn idle_selects_old_workspaces_and_reaps_their_processes() {
     let pids = workspace.recorded_pids(&state_dir);
     workspace.age_metadata(3 * 86_400).await;
 
-    let kept = workspace.eph(&["system", "prune", "--dry-run"]).await;
-    assert_success("eph system prune --dry-run", &kept);
+    let kept = workspace.eph(&["system", "prune"]).await;
+    assert_success("eph system prune", &kept);
     let kept_out = stdout(&kept);
     assert!(
         kept_out.contains("Kept 1 workspace")
@@ -214,9 +214,7 @@ async fn idle_selects_old_workspaces_and_reaps_their_processes() {
     );
     assert!(state_dir.exists());
 
-    let too_young = workspace
-        .eph(&["system", "prune", "--dry-run", "--idle", "7d"])
-        .await;
+    let too_young = workspace.eph(&["system", "prune", "--idle", "7d"]).await;
     assert_success("eph system prune --idle 7d", &too_young);
     assert!(
         !stdout(&too_young).contains("idle workspace"),
@@ -373,7 +371,7 @@ async fn merged_selects_only_merged_clean_worktrees() {
 
     let _ = run(
         repo.path().to_path_buf(),
-        vec!["system", "prune", "--force"],
+        vec!["system", "prune", "--force", "--yes"],
     )
     .await;
 }

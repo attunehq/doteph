@@ -148,8 +148,8 @@ process that still matches under a gone path is an orphan (a moved workspace
 reports the new directory and stops matching), and prune terminates it with
 the workspace. Only `--force-non-empty` candidates, selected with no signal of
 disuse, keep the process gate. The aggregate `--force` also enables
-legacy-state compatibility and confirmation bypass, so it represents the full
-destructive prune scope.
+legacy-state compatibility, so it represents the full destructive prune scope;
+confirmation is a separate decision that only `--yes` skips.
 For a selected workspace, prune reads and parses the current `.eph` when it is
 available; otherwise it falls back to the saved teardown hook snapshot. A valid
 current file wins, including when it removes all hooks. Live services receive
@@ -157,7 +157,7 @@ current file wins, including when it removes all hooks. Live services receive
 the clean hooks, and `post-clean` runs after namespace cleanup. Hooks use the
 workspace directory when it exists and the state directory otherwise. Their
 failures are warnings and do not interrupt prune, while Docker, process, and
-state removal failures remain fatal. Dry runs never execute hooks.
+state removal failures remain fatal. The preview pass never executes hooks.
 Before a destructive pass inventories Docker, prune acquires every candidate's
 lifecycle lock, the same lock used by `up`, `down`, `clean`, and foreground
 `dev` startup. A concurrent lifecycle command finishes first, then prune
@@ -167,11 +167,11 @@ For `run=` services every lifecycle command signals only PIDs whose current
 process identity matches the identity saved at launch. Startup stops the child
 and fails if that identity cannot be captured. Process entries without an
 identity are left alone; workspace-local teardown reports how to stop them manually, and
-system prune reports a warning. A real (non-dry-run) prune also asks for
-confirmation before removing anything, unless `--yes` is passed or there is
-nothing to remove;
-off a non-interactive terminal without `--yes` it refuses rather than
-guessing.
+system prune reports a warning. Every prune runs a preview pass first and
+asks for confirmation before removing anything, unless `--yes` is passed or
+there is nothing to remove;
+when stdin is not a terminal and `--yes` is absent it stops after the preview
+rather than guessing.
 
 ## File format
 

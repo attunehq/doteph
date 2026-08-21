@@ -478,7 +478,7 @@ is gone, they run from the workspace state directory and
 Prune treats every hook as best effort: a spawn error, unresolved variable, or
 non-zero exit is reported as a warning with stdout and stderr, and the remaining
 hooks and resources continue. Resource removal errors still fail prune.
-`--dry-run` never executes hooks, and system prune has no `--skip-hooks` flag.
+The preview never executes hooks, and system prune has no `--skip-hooks` flag.
 
 ## Roles and ordering
 

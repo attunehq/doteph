@@ -61,9 +61,10 @@ async fn workspace_short_id(workspace: &ForcePruneWorkspace) -> String {
         .to_string()
 }
 
-/// The aggregate flag must cross the real nested clap boundary, select every
-/// protected scope, remain non-destructive with `--dry-run`, and supply the
-/// confirmation required by a non-interactive invocation.
+/// The aggregate flag must cross the real nested clap boundary and select
+/// every protected scope. It does not confirm: without `--yes` a
+/// non-interactive invocation stops after the preview, and `--yes` supplies
+/// the confirmation it cannot ask for.
 #[tokio::test]
 async fn force_aggregates_prune_overrides_end_to_end() {
     let workspace = ForcePruneWorkspace::new(&format!("[app]\nrun={}\n", long_running_command()));
@@ -82,7 +83,7 @@ async fn force_aggregates_prune_overrides_end_to_end() {
     std::fs::create_dir(&incomplete_current_state).unwrap();
 
     let granular = workspace
-        .eph(&["system", "prune", "--force-non-empty", "--dry-run"])
+        .eph(&["system", "prune", "--force-non-empty"])
         .await;
     assert!(granular.status.success());
     let granular_stdout = String::from_utf8_lossy(&granular.stdout);
@@ -93,9 +94,7 @@ async fn force_aggregates_prune_overrides_end_to_end() {
         "specific overrides should remain independent: {granular_stdout}"
     );
 
-    let preview = workspace
-        .eph(&["system", "prune", "--force", "--dry-run"])
-        .await;
+    let preview = workspace.eph(&["system", "prune", "--force"]).await;
     assert!(preview.status.success());
     let preview_stdout = String::from_utf8_lossy(&preview.stdout);
     assert!(
@@ -105,11 +104,17 @@ async fn force_aggregates_prune_overrides_end_to_end() {
             && preview_stdout.contains("cannot be pruned safely"),
         "force preview should expose its complete safe scope: {preview_stdout}"
     );
+    assert!(
+        preview_stdout.contains("Nothing removed") && preview_stdout.contains("Pass -y/--yes"),
+        "a non-interactive prune without --yes should say why it stopped: {preview_stdout}"
+    );
     assert!(workspace_state.exists());
     assert!(legacy_state.exists());
     assert!(incomplete_current_state.exists());
 
-    let prune = workspace.eph(&["system", "prune", "--force"]).await;
+    let prune = workspace
+        .eph(&["system", "prune", "--force", "--yes"])
+        .await;
     assert!(
         prune.status.success(),
         "non-interactive forced prune failed: {}",
