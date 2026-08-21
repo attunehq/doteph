@@ -48,7 +48,16 @@ pub(crate) struct Args {
     /// Skip the removal confirmation prompt.
     #[arg(short = 'y', long)]
     yes: bool,
+
+    /// Reasonable defaults instead of the safest ones: --merged, --idle 12h
+    /// (unless --idle is given), and --force-live. Meant for a start-of-day
+    /// sweep; the confirmation prompt still applies.
+    #[arg(long)]
+    yolo: bool,
 }
+
+/// The idle threshold `--yolo` applies when no explicit `--idle` is given.
+const YOLO_IDLE: Duration = Duration::from_secs(12 * 3600);
 
 /// Parse `<n><unit>` with unit `s`, `m`, `h`, or `d`.
 fn parse_duration(text: &str) -> Result<Duration, String> {
@@ -90,9 +99,9 @@ impl Args {
             dry_run: self.dry_run,
             compatibility_v042: self.force || self.compatibility_v042,
             force_non_empty: self.force || self.force_non_empty,
-            force_live: self.force || self.force_live,
-            idle: self.idle,
-            merged: self.merged,
+            force_live: self.force || self.force_live || self.yolo,
+            idle: self.idle.or(self.yolo.then_some(YOLO_IDLE)),
+            merged: self.merged || self.yolo,
             yes: self.force || self.yes,
         }
     }
@@ -418,6 +427,33 @@ mod tests {
                 "0123456789abcdef  web post-stop hook failed: exit status 1",
             ]
         );
+    }
+
+    #[test]
+    fn yolo_selects_merged_and_idle_and_overrides_live_containers_only() {
+        let options = parse(&["--yolo"]).execution_options();
+
+        assert_eq!(
+            options,
+            ExecutionOptions {
+                dry_run: false,
+                compatibility_v042: false,
+                force_non_empty: false,
+                force_live: true,
+                idle: Some(YOLO_IDLE),
+                merged: true,
+                yes: false,
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_idle_wins_over_the_yolo_default() {
+        let options = parse(&["--yolo", "--idle", "2d"]).execution_options();
+
+        assert_eq!(options.idle, Some(Duration::from_secs(2 * 86_400)));
+        assert!(options.merged);
+        assert!(options.force_live);
     }
 
     #[test]
