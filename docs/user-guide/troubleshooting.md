@@ -21,6 +21,38 @@ eph -v up        # start with verbose (debug) logging on stderr
 macOS and Windows, make sure the Docker Desktop VM has fully started, not just
 begun launching.
 
+If `docker ps` works but `eph` still cannot connect, check which daemon each one
+picks. `eph` chooses the daemon the way the `docker` CLI does:
+
+1. `DOCKER_HOST`, when it is set and non-empty. As with the `docker` CLI, a set
+   `DOCKER_HOST` turns off context lookup. `eph` connects to it when it is a
+   `unix://` socket on Linux or macOS; any other value falls back to the
+   default socket in step 3.
+2. Otherwise the active docker context: `DOCKER_CONTEXT` if set, else the
+   context selected with `docker context use` (recorded in
+   `~/.docker/config.json`, or under `$DOCKER_CONFIG` if you set it).
+3. The `default` context, or no context at all, means the platform's default
+   socket (`/var/run/docker.sock`, or the `docker_engine` named pipe on
+   Windows).
+
+Colima, OrbStack, Rancher Desktop, and rootless Docker usually create and
+activate their own context rather than the default socket, so `eph` follows that
+context with no extra setup. List the contexts and see which one is active (it
+is marked `*`):
+
+```sh
+docker context ls
+echo "DOCKER_HOST=$DOCKER_HOST DOCKER_CONTEXT=$DOCKER_CONTEXT"
+```
+
+A stale `DOCKER_HOST` overrides the context, for the `docker` CLI too, so unset
+it if it points somewhere that is no longer running. `eph` reaches a context
+only over a local socket: a context whose endpoint is remote (`ssh://` or
+`tcp://`), or a selected context that no longer exists, fails with an error
+naming that context. Switch with `docker context use <name>`, or set
+`DOCKER_HOST` to a local socket such as
+`unix://$HOME/.colima/default/docker.sock`.
+
 ## "no .eph file found in ... or any parent directory"
 
 You are not inside a workspace. `eph` searches the current directory and walks

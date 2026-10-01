@@ -9,7 +9,9 @@
 //! latest GitHub release ([`update`]). The crate-internal `proc` module hides the
 //! platform split for the shell and PID control (`sh -c`/`cmd /C`, native
 //! liveness and teardown) so `run=` services and hooks work on Windows as well as
-//! Unix. The binary in `main.rs` is a thin clap front end over these APIs.
+//! Unix. The crate-internal `docker` module connects to the daemon the `docker`
+//! CLI would use, following `DOCKER_HOST` and the active docker context. The
+//! binary in `main.rs` is a thin clap front end over these APIs.
 
 #![warn(missing_docs)]
 #![deny(clippy::correctness)]
@@ -18,6 +20,7 @@
 #![warn(clippy::complexity)]
 #![warn(clippy::perf)]
 
+pub(crate) mod docker;
 pub mod env;
 pub mod git;
 pub(crate) mod hooks;

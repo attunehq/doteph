@@ -1554,15 +1554,7 @@ pub(crate) struct DockerClient {
 impl DockerClient {
     /// Connect to Docker daemon
     pub(crate) async fn connect() -> Result<Self> {
-        let client = Docker::connect_with_local_defaults()
-            .context("failed to connect to docker (is docker running?)")?;
-
-        // Verify connection
-        client
-            .ping()
-            .await
-            .context("failed to ping docker daemon")?;
-
+        let client = crate::docker::connect().await?;
         Ok(DockerClient { client })
     }
 

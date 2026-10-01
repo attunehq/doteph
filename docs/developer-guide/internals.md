@@ -17,6 +17,7 @@ src/
   workspace.rs   workspace discovery, IDs, names, state paths
   hooks.rs       persisted teardown hooks, environments, command execution
   service.rs     lifecycle engine, Docker adapter, persisted state
+  docker.rs      daemon connection following DOCKER_HOST and docker contexts
   proc.rs        platform shell and process identity/control
   prune.rs       stale-workspace discovery and resource removal
   env.rs         shell and JSON environment rendering

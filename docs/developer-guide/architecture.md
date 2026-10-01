@@ -223,7 +223,10 @@ boundary invariant.
 
 The image and Dockerfile paths use the `bollard` Docker API directly; the
 Compose and Dockerfile-build paths shell out to the `docker` CLI because those
-operations are awkward to reproduce over the API.
+operations are awkward to reproduce over the API. Both must reach the same
+daemon, so the `bollard` client resolves its endpoint the way the CLI does
+(`DOCKER_HOST`, then the active docker context; see `src/docker.rs`) instead of
+relying on bollard's defaults, which ignore contexts.
 
 ### Cross-platform process control
 

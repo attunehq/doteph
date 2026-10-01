@@ -12,7 +12,9 @@ connection string loaded in your shell. Budget about five minutes.
 ## Prerequisites
 
 - **Docker**, installed and running. `eph` talks to your local Docker daemon to
-  start containers. Confirm with `docker ps`.
+  start containers, using the same one the `docker` CLI does (`DOCKER_HOST`,
+  else the active docker context), so Colima, OrbStack, and Rancher Desktop
+  work without extra setup. Confirm with `docker ps`.
 - **A shell.** The non-container features (`run=` services, lifecycle hooks,
   and shell health checks) run through the platform shell: `sh -c` on Linux and
   macOS, `cmd /C` on Windows. Everything works natively on all three platforms;
