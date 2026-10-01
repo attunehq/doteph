@@ -409,13 +409,8 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
             ))
         }
     })?;
-    let docker = Docker::connect_with_local_defaults()
-        .context("failed to connect to docker (is docker running?)")?;
     debug!("Connecting to Docker");
-    docker
-        .ping()
-        .await
-        .context("failed to ping docker daemon")?;
+    let docker = crate::docker::connect().await?;
     let now = current_unix_secs();
     let mut report = PruneReport {
         now_unix_secs: now,
@@ -547,12 +542,7 @@ pub async fn prune(options: PruneOptions) -> Result<PruneReport> {
 /// reached.
 pub async fn list_workspaces() -> Result<Vec<WorkspaceSummary>> {
     let root = state_root()?;
-    let docker = Docker::connect_with_local_defaults()
-        .context("failed to connect to docker (is docker running?)")?;
-    docker
-        .ping()
-        .await
-        .context("failed to ping docker daemon")?;
+    let docker = crate::docker::connect().await?;
 
     let mut report = PruneReport::default();
     let mut inspected = Vec::new();
