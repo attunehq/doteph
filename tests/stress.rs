@@ -53,10 +53,13 @@ use common::{
 
 const POSTGRES_IMAGE: &str = "postgres:16-alpine";
 const REDIS_IMAGE: &str = "redis:7-alpine";
-// Pinned to an immutable RELEASE tag: `minio/minio` has no stable channel other
-// than the moving `latest`, and its `server` CLI / health endpoints have changed
-// across releases, so a float would let an unrelated MinIO release redden CI.
-const MINIO_IMAGE: &str = "minio/minio:RELEASE.2025-09-07T16-13-09Z";
+// MinIO no longer publishes images (`minio/minio` is gone from Docker Hub and
+// `quay.io/minio/minio` is private), so this uses `pgsty/minio`, a maintained
+// community build of the same server with the same `server` CLI and health
+// endpoints. Pinned to an immutable RELEASE tag: there is no stable channel
+// other than the moving `latest`, and the CLI and health endpoints have changed
+// across releases, so a float would let an unrelated release redden CI.
+const MINIO_IMAGE: &str = "pgsty/minio:RELEASE.2026-08-04T00-00-00Z";
 
 /// A full, realistic stack: a relational DB, a cache, and an object store, all
 /// wired together through interpolated connection URLs.
@@ -75,7 +78,7 @@ image=redis:7-alpine
 port=6379
 
 [minio]
-image=minio/minio:RELEASE.2025-09-07T16-13-09Z
+image=pgsty/minio:RELEASE.2026-08-04T00-00-00Z
 command=server /data --console-address :9001
 port.api=9000
 port.console=9001
