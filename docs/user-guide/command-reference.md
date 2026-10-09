@@ -168,8 +168,9 @@ For each declared service, `clean` runs `pre-clean`, then the same
 `pre-stop`/`post-stop` teardown as `down`, removes managed named volumes, and
 runs `post-clean`. Clean hooks run even for an already-stopped service. A
 failing `pre-clean` leaves that service untouched; a failing `post-clean` is
-reported after its resources are removed. `--skip-hooks` bypasses all four
-phases.
+reported after its resources are removed. A clean hook whose environment cannot
+resolve, because a service it references never got a port, is skipped with a
+warning and clean continues. `--skip-hooks` bypasses all four phases.
 
 Behavior beyond the declared services:
 

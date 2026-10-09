@@ -358,8 +358,9 @@ the workspace directory:
   removal. A pre-clean failure leaves that service's resources intact; a
   post-clean failure is propagated after its resources have been removed.
   Clean retains the last assigned ports across ordinary teardown so these hooks
-  receive the same resolved snapshot after `down`; a reference for a service
-  that has never had an assigned port remains a strict resolution error.
+  receive the same resolved snapshot after `down`. A reference for a service
+  that has never had an assigned port still fails resolution; clean, like
+  system prune, then skips that hook with a warning and continues the reset.
 
 Ordinary lifecycle commands treat hook failures as command failures. System
 prune records hook spawn, resolution, and exit failures as warnings with
