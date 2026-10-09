@@ -452,6 +452,9 @@ with these variables set.
   removed.** A failure aborts the rest of clean, but resources already removed
   stay removed. Re-running `eph clean` runs the clean hooks again, including for
   an already-stopped service.
+- **An unresolvable environment skips the hook.** If a clean hook's environment
+  references a service that never got a port, clean warns that the hook was
+  skipped and continues with the rest of the reset, as system prune does.
 
 ### Skipping hooks
 

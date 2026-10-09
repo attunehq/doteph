@@ -281,8 +281,10 @@ For a live service, clean runs `pre-clean`, `pre-stop`, stops and removes the
 backend, runs `post-stop`, removes managed named volumes, then runs
 `post-clean`. The clean-specific hooks also run when the service was already
 stopped; ordinary `down` never runs them. Clean retains the last assigned ports
-across `down`, so stopped-service hooks receive the same resolved URLs. A
-reference to a port that has never been assigned is still an error.
+across `down`, so stopped-service hooks receive the same resolved URLs. When a
+clean hook's environment references a port that has never been assigned, clean
+warns that the hook was skipped and keeps tearing down; other hooks still fail
+on an unresolved reference.
 
 `pre-start` and `post-start` run on **every** `eph up` (fresh create *or*
 restart); a failing `pre-start` aborts the `up` before its service starts and a

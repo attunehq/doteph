@@ -207,7 +207,10 @@ will not run that `post-stop` again. If a broken hook is wedging teardown:
 For `eph clean`, a failing `pre-clean` leaves the service and its volumes
 untouched. A failing `post-clean` is reported after that service and its managed
 volumes are removed. Clean hooks run again on the next `eph clean`, even when
-the service is already stopped.
+the service is already stopped. A clean hook whose environment cannot resolve
+(a referenced service never got a port, so `${svc.port}` has no value) is not a
+failure: clean prints `warning: <service> <phase> hook ... was skipped` and
+keeps tearing down.
 
 System prune handles hook failures differently because one bad script must not
 block stale-workspace cleanup. It prints a warning containing the workspace,
@@ -221,7 +224,8 @@ system-prune `--skip-hooks` flag, and the preview does not execute hooks.
 and ambiguous bare port references. A valid reference can still be unavailable
 at runtime when its service is stopped. In that case, `eph env` unsets the
 affected shell variable or omits the JSON key, warns on stderr, and exits
-non-zero. Other execution paths fail before launching a child.
+non-zero. Clean and system prune skip a teardown hook whose environment cannot
+resolve, with a warning. Other execution paths fail before launching a child.
 
 - **The service is not running.** Interpolation only resolves against running
   services. Run `eph up` first, and check with `eph status`.

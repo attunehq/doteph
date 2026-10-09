@@ -3870,7 +3870,9 @@ impl ServiceManager {
     /// Returns a [`CleanSummary`] describing what was removed.
     ///
     /// When `skip_hooks` is true, neither the clean-specific hooks nor the
-    /// teardown hooks are run, so a broken hook cannot block the reset.
+    /// teardown hooks are run, so a broken hook cannot block the reset. A
+    /// clean-specific hook whose environment cannot be resolved is skipped with
+    /// a warning rather than failing the reset.
     ///
     /// # Errors
     ///
@@ -3920,9 +3922,17 @@ impl ServiceManager {
         // `clean` of a workspace that never ran reports zeros.
         for name in start_order(eph).into_iter().rev() {
             let service = &eph.services[name];
-            if !skip_hooks && !service.pre_clean.is_empty() {
+            if !skip_hooks
+                && !service.pre_clean.is_empty()
+                && let Some(env) = self.clean_hook_env(
+                    eph,
+                    &clean_hook_services,
+                    service,
+                    "pre-clean",
+                    &service.pre_clean,
+                )
+            {
                 info!("Running pre-clean hooks for {}", name);
-                let env = self.hook_env(eph, &clean_hook_services, service)?;
                 for cmd in &service.pre_clean {
                     self.run_hook(cmd, &env)
                         .await
@@ -3966,9 +3976,17 @@ impl ServiceManager {
                 self.sweep_docker_leftovers(&prefix, &mut summary).await?;
             }
 
-            if !skip_hooks && !service.post_clean.is_empty() {
+            if !skip_hooks
+                && !service.post_clean.is_empty()
+                && let Some(env) = self.clean_hook_env(
+                    eph,
+                    &clean_hook_services,
+                    service,
+                    "post-clean",
+                    &service.post_clean,
+                )
+            {
                 info!("Running post-clean hooks for {}", name);
-                let env = self.hook_env(eph, &clean_hook_services, service)?;
                 for cmd in &service.post_clean {
                     self.run_hook(cmd, &env).await.with_context(|| {
                         format!("post-clean hook failed for service '{}'", name)
@@ -4640,8 +4658,8 @@ impl ServiceManager {
         eph: &EphFile,
         running: &HashMap<String, RunningService>,
         service: &Service,
-    ) -> Result<Vec<(String, String)>> {
-        Ok(hooks::hook_environment(
+    ) -> std::result::Result<Vec<(String, String)>, UnresolvedEnvironment> {
+        hooks::hook_environment(
             HookWorkspace::from_workspace(&self.workspace),
             eph.env_vars
                 .iter()
@@ -4651,7 +4669,38 @@ impl ServiceManager {
                 .env
                 .iter()
                 .map(|(name, value)| (name.as_str(), value.as_str())),
-        )?)
+        )
+    }
+
+    /// The environment for one phase of a service's clean hooks, or `None` when
+    /// it cannot be resolved.
+    ///
+    /// Resolution fails when a referenced service never got a port, for example
+    /// in a workspace brought up one role at a time or never brought up at all.
+    /// The hook has nothing to run against then, and aborting would strand every
+    /// service, volume, and state file clean has not reached yet. Like system
+    /// prune, warn once per skipped command and let clean continue. A hook that
+    /// resolves and then fails is still fatal.
+    fn clean_hook_env(
+        &self,
+        eph: &EphFile,
+        services: &HashMap<String, RunningService>,
+        service: &Service,
+        phase: &str,
+        commands: &[String],
+    ) -> Option<Vec<(String, String)>> {
+        match self.hook_env(eph, services, service) {
+            Ok(env) => Some(env),
+            Err(error) => {
+                for command in commands {
+                    warn!(
+                        "{} {phase} hook `{command}` was skipped: {error}",
+                        service.name
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// Run a hook command in the workspace directory with `env` overlaid on

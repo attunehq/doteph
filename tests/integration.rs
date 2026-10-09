@@ -1759,6 +1759,103 @@ async fn clean_hook_failures_preserve_phase_semantics() {
     ws.eph_ok(&["clean", "--skip-hooks"]).await;
 }
 
+/// A clean hook whose environment cannot resolve, because a service it
+/// references never got a port, is skipped with a warning the way system prune
+/// skips it. Clean then keeps going: other services' hooks still run, and every
+/// later service, its managed volume, and the state are still removed. Teardown
+/// runs `app` before `redis`, so aborting on `app`'s hook used to strand both.
+#[tokio::test]
+async fn clean_skips_hooks_whose_environment_cannot_resolve() {
+    let app_pre_clean = hook_touch("app-pre-clean");
+    let app_post_clean = hook_touch("app-post-clean");
+    let ws = TestWorkspace::new(&format!(
+        r#"
+[redis]
+image=redis:7-alpine
+port=6379
+volume=data:/data
+post-clean={}
+
+[cache]
+image=redis:7-alpine
+port=6379
+
+[app]
+run={}
+env.CACHE_URL=redis://localhost:${{cache.port}}
+pre-clean={app_pre_clean}
+post-clean={app_post_clean}
+
+[env]
+REDIS_URL=redis://localhost:${{redis.port}}
+"#,
+        hook_write_var("REDIS_URL", "redis-post-clean-url"),
+        run_sleep(300),
+    ));
+
+    ws.eph_ok(&["up", "redis"]).await;
+    let expected_redis_url = ws
+        .env_json()
+        .await
+        .get("REDIS_URL")
+        .expect("REDIS_URL should resolve while redis is running")
+        .clone();
+    let (prefix, state_dir) = container_prefix_and_state_dir(&ws).await;
+    assert!(state_dir.exists(), "up should have written workspace state");
+
+    let output = ws.eph(&["clean"]).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "clean should skip the unresolvable hooks and succeed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for (phase, command) in [
+        ("pre-clean", &app_pre_clean),
+        ("post-clean", &app_post_clean),
+    ] {
+        let warning = format!(
+            "warning: app {phase} hook `{command}` was skipped: could not resolve \
+             environment: CACHE_URL requires ${{cache.port}}"
+        );
+        assert!(
+            stderr.contains(&warning),
+            "expected {warning:?} on stderr, got: {stderr}"
+        );
+    }
+    assert!(
+        !ws.path().join("app-pre-clean").exists() && !ws.path().join("app-post-clean").exists(),
+        "a hook whose environment did not resolve must not run"
+    );
+
+    let redis_url = std::fs::read_to_string(ws.path().join("redis-post-clean-url"))
+        .expect("redis's post-clean resolves, so it should still run");
+    assert_eq!(redis_url.trim(), expected_redis_url);
+
+    assert!(
+        stdout.contains("Services stopped and removed: 1"),
+        "redis should still be removed after app's hooks were skipped: {stdout}"
+    );
+    assert!(
+        stdout.contains("Named volumes removed: 1"),
+        "redis's managed volume should still be removed: {stdout}"
+    );
+    assert!(
+        stdout.contains("Persisted state: removed"),
+        "the state directory should still be removed: {stdout}"
+    );
+    assert!(
+        common::docker_container_names(&format!("{prefix}-"))
+            .await
+            .is_empty(),
+        "clean should leave no workspace containers behind"
+    );
+    assert!(
+        !state_dir.exists(),
+        "clean should delete the state directory"
+    );
+}
+
 // ============================================================================
 // eph run
 // ============================================================================
