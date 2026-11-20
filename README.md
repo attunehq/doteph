@@ -2,6 +2,12 @@
 
 Ephemeral services per workspace. Like `.env` files, but for services.
 
+![Two git worktrees of the same repo each run eph up and get their own Postgres and Redis on different host ports](docs/assets/eph-demo.gif)
+
+*Two git worktrees of the same repo, one `.eph` asking for Postgres on 5432
+and Redis on 6379. Each `eph up` gets its own containers on its own host
+ports, so the two never collide.*
+
 When you work on multiple projects, or multiple checkouts of the same project,
 you need local services like Postgres, Redis, or MinIO without shared data or
 fixed Docker ports. `eph` gives each workspace its own namespaced services,
