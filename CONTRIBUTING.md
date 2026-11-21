@@ -108,6 +108,9 @@ changelog file.
 Every pull request and push to `main` runs the same build matrix as a dry run
 (no release is created), so cross-compilation breakage is caught before tagging.
 
+Patch releases are cut by the daily maintenance run; minor and major releases
+are Jess's call. See [Maintenance](docs/developer-guide/maintenance.md#releases).
+
 ### Installers
 
 [`scripts/install.sh`](scripts/install.sh) and

@@ -2,8 +2,8 @@
 
 eph is maintained by a daily agent run. Jess sets direction and decides
 anything risky; the agent owns routine upkeep: toolchain and dependency
-upgrades, security advisories, CI health, triaging and fixing new issues, and
-routine feature requests.
+upgrades, security advisories, CI health, triaging and fixing new issues,
+routine feature requests, and patch releases.
 
 This file is the policy that run follows. Change it here when the policy
 changes, so the next run picks it up.
@@ -33,7 +33,9 @@ through these steps in order, skipping any with nothing to do:
    GitHub Actions, then the `site/` npm tree.
 6. **Issues and external PRs.** Triage what is new, fix bugs, and implement
    routine feature requests.
-7. **Report.** End with a short summary in the thread, and message Jess only
+7. **Release.** Cut a patch release when [Releases](#releases) says one is
+   due.
+8. **Report.** End with a short summary in the thread, and message Jess only
    when something needs her.
 
 Keep each run bounded: at most one new feature PR per run, and stop opening new
@@ -150,13 +152,60 @@ Ask before merging, or before starting, when a change:
 - adds a product capability nobody asked for, or comes from an external
   request that Jess has not endorsed and that is more than a small fit with the
   existing design;
-- needs releasing. Never push a release tag; mention in the report when
-  unreleased fixes have piled up on `main`.
+- needs a minor or major release (see [Releases](#releases)), or would
+  delete or edit a published release.
 
 To ask, open the PR as a draft with the `needs-decision` label (or put the label
 on the issue), and say in it what needs deciding, the options, and what you
 recommend. Then message Jess. Do the rest of the run; one blocked item never
 blocks the others.
+
+## Releases
+
+Fixes and upgrades only reach users once they ship, so the run cuts patch
+releases itself. Updates are pull-only (users run `eph update` or the install
+script), and every change has already passed the full test suite and the
+release dry-run builds on every target.
+
+**What counts.** A change is releasable when it changes the shipped binary:
+a runtime dependency upgrade, a toolchain bump, a bug fix, or a routine
+additive feature. Changes to dev-dependencies, CI, `site/`, or docs do not
+call for a release on their own; they ride along with the next one.
+
+**When one is due.** Release when the latest tag (`git describe --tags
+--abbrev=0 origin/main`) is behind at least one releasable change that has
+soaked: it merged before this run started, and the `main` runs of CI and the
+Release dry run have been green on every commit since. A fix for a security
+advisory that reaches the shipped binary skips the soak and ships in the same
+run once its `main` checks are green. At most one release per run.
+
+**Version.** Always a patch bump (`v0.6.2` to `v0.6.3`). eph is pre-1.0, so a
+minor bump signals a breaking change; anything that would need one already
+needed Jess under [When To Ask Jess](#when-to-ask-jess). When the unreleased
+changes call for a minor or major bump, ask Jess with the proposed version and
+the draft notes instead of tagging.
+
+**How.**
+
+1. Pick the newest `main` commit where every check is green, and confirm the
+   changes since the last tag are all inside this policy.
+2. Tag it the way existing releases are tagged, an annotated tag whose message
+   is the version: `git tag -a v0.6.3 -m v0.6.3 <sha>`, then
+   `git push origin v0.6.3`. The Release workflow builds every target and
+   publishes the GitHub Release with auto-generated notes, which are the
+   changelog, so merged PR titles must read well on their own.
+3. Watch the Release run to completion (`gh run watch`).
+4. Verify what users get: run the Installers workflow
+   (`gh workflow run installers.yml`) and check it passes, then in a temp
+   directory install the previous release with `scripts/install.sh -v <prev>
+   -b <dir>`, run `<dir>/eph update`, and confirm `<dir>/eph --version` prints
+   the new tag.
+
+**When a release is bad.** If the Release run fails before publishing, fix the
+cause in a PR and tag the next patch version; never move or reuse a tag. If a
+published release is broken, ship the fix or a revert as the next patch right
+away and message Jess. Deleting or editing a published release is hers to
+decide.
 
 ## Merging
 
@@ -175,8 +224,9 @@ pass.
 
 ## Reporting
 
-End each run with a short summary in the thread: what merged, what is open and
-why, and what needs Jess. When something needs her, send one Slack message to
+End each run with a short summary in the thread: what merged, what was
+released, what is open and why, and what needs Jess. A routine patch release
+is not a decision and sends no message. When something needs her, send one Slack message to
 her Tuna DM (`tuna messages send D0AE5N604RE`) that names each decision, links
 the PR or issue, and gives your recommendation. A quiet day with nothing to
 decide sends no message.

@@ -17,8 +17,8 @@ see the [User Guide](../user-guide/README.md) instead.
    environment rendering, pruning, bundled skills, and updates. Start here to
    find where a change belongs.
 4. [Maintenance](maintenance.md): the policy for the daily agent run that
-   keeps the toolchain and dependencies current, triages issues, and ships
-   routine fixes, and what it escalates.
+   keeps the toolchain and dependencies current, triages issues, ships
+   routine fixes and patch releases, and what it escalates.
 
 See also [CONTRIBUTING.md](../../CONTRIBUTING.md) at the repo root for working
 style, pull-request expectations, and the release process.
