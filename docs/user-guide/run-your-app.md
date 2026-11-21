@@ -157,6 +157,20 @@ eph dev --watch "**/*.rs" --watch "*.toml"
 - Globs are relative to the workspace root with gitignore-style separators:
   `*` stays within a directory, `**` spans directories, so `*.toml` matches a
   top-level `Cargo.toml` while `**/*.rs` matches any Rust file.
+- A pattern starting with `!` excludes what it matches, and the last pattern
+  that matches a path wins, as in `.gitignore`. Use it to keep generated files
+  from restarting the stack, which matters when a startup step writes them and
+  would otherwise trigger a restart loop:
+
+  ```sh
+  eph dev --watch '**/*.go' --watch '**/*.templ' --watch '!**/*_templ.go'
+  ```
+
+  A later positive pattern re-includes a path an earlier `!` excluded. Single
+  quotes keep interactive bash and zsh from treating `!` as history
+  expansion. A pattern that really starts with `!` is written `\!`. An empty
+  pattern, a bare `!`, or a list of only `!` patterns is an error, since it
+  could never watch anything.
 - A restart is a full down and up, hooks included (`pre-stop`, `post-stop`,
   `pre-start`, `post-start`), not a bare process bounce, so a migration or
   codegen step reruns just as it would on a manual restart. Named volumes are
