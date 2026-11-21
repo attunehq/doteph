@@ -794,6 +794,14 @@ mod win {
     }
 }
 
+/// An empty [`System`] to refresh. sysinfo's constructor is fallible, but only
+/// on platforms sysinfo does not support; on every platform eph ships for
+/// (macOS, Linux, Windows) it always succeeds, so a failure is a build for an
+/// unsupported target rather than a runtime condition to handle.
+fn new_system() -> System {
+    System::new().expect("sysinfo supports every platform eph ships for")
+}
+
 /// Refresh a fresh [`System`] so it knows only about `pid`, returning it
 /// alongside the `sysinfo` [`Pid`]. Nothing beyond bare existence is collected
 /// (`ProcessRefreshKind::nothing()`), since callers only ask "is it there?";
@@ -801,7 +809,7 @@ mod win {
 /// therefore reads as not-present.
 fn snapshot(pid: NonZeroU32) -> (System, Pid) {
     let pid = Pid::from_u32(pid.get());
-    let mut system = System::new();
+    let mut system = new_system();
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,
@@ -815,7 +823,7 @@ fn snapshot(pid: NonZeroU32) -> (System, Pid) {
 /// process is not in the table at all.
 fn raw_identity(pid: NonZeroU32) -> Option<ProcessIdentity> {
     let pid = Pid::from_u32(pid.get());
-    let mut system = System::new();
+    let mut system = new_system();
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,
@@ -956,7 +964,7 @@ fn signal_tree(pid: NonZeroU32, signal: Signal) {
     // come with it, and collecting more (cwd, cmd, exe) opens and queries
     // every process on the machine, which turns teardown from milliseconds
     // into tens of seconds on a busy system.
-    let mut system = System::new();
+    let mut system = new_system();
     system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
 
     for target in process_tree(&system, Pid::from_u32(pid.get()))
@@ -1343,7 +1351,7 @@ mod tests {
     /// child before we try to tear the tree down.
     async fn wait_for_descendants(root: NonZeroU32) -> Vec<NonZeroU32> {
         for _ in 0..50 {
-            let mut system = System::new();
+            let mut system = new_system();
             system.refresh_processes_specifics(
                 ProcessesToUpdate::All,
                 true,
