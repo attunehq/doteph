@@ -304,9 +304,11 @@ accordingly:
 
 - Prefer **throwaway, dev-only** credentials. The whole point is ephemeral
   local services; they do not need real secrets.
-- If a `.eph` file must hold something sensitive, add it to `.gitignore` and
-  commit a `.eph.example` template instead.
-- Never commit a `.eph` file containing real secrets.
+- Put anything sensitive or machine-specific in a `.eph.local` next to the
+  `.eph`, and add `.eph.local` to `.gitignore`. eph merges it over the
+  committed file, so the shared `.eph` stays complete and secret-free. See
+  [Local overrides](eph-file.md#local-overrides-ephlocal).
+- Never commit a `.eph` or `.eph.local` file containing real secrets.
 
 ## Keeping data vs. starting fresh
 

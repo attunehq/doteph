@@ -8,7 +8,7 @@ use crate::git::{self, MergeStatus};
 use crate::hooks::{
     CleanupKind, HookWorkspace, TeardownHookService, TeardownHookSnapshot, run_hook,
 };
-use crate::parser;
+use crate::workspace;
 use crate::proc;
 use crate::service::{Backend, RunningService, ServiceState, WorkspaceLock};
 use crate::workspace::{WORKSPACE_METADATA_FILE, WorkspaceMetadata, state_root};
@@ -937,23 +937,15 @@ async fn select_teardown_hooks(
         return None;
     };
 
-    let eph_path = metadata.workspace_path.join(".eph");
     let mut current_error = None;
     if metadata.workspace_path.is_dir() {
-        match tokio::fs::read_to_string(&eph_path).await {
-            Ok(contents) => match parser::parse(&contents) {
-                Ok(eph) => return Some(TeardownHookSnapshot::capture(&eph)),
-                Err(error) => {
-                    current_error = Some(format!(
-                        "could not parse current {} for prune hooks: {error:#}",
-                        eph_path.display()
-                    ));
-                }
-            },
+        // Hooks may live in `.eph.local`, so read the same merged configuration
+        // every other command uses.
+        match workspace::load_config(&metadata.workspace_path) {
+            Ok(eph) => return Some(TeardownHookSnapshot::capture(&eph)),
             Err(error) => {
                 current_error = Some(format!(
-                    "could not read current {} for prune hooks: {error}",
-                    eph_path.display()
+                    "could not load current configuration for prune hooks: {error:#}"
                 ));
             }
         }
@@ -2272,7 +2264,7 @@ mod tests {
         assert_eq!(report.warnings.len(), 1);
         let warning = &report.warnings[0];
         assert_eq!(warning.short_id, metadata.short_id);
-        assert!(warning.message.contains("could not parse current"));
+        assert!(warning.message.contains("could not load current configuration"));
         assert!(warning.message.contains("no saved hook snapshot"));
         assert!(
             !warning

@@ -262,5 +262,6 @@ interpolation.
 - Start and load in CI in the **same** step:
   `eph up && eval "$(eph env)" && <cmd>`.
 - Tear down in an always-run step: `eph clean`.
-- Treat `.eph` as possibly containing dev credentials; do not print it to
-  logs or commit one with real secrets.
+- Treat `.eph` as possibly containing dev credentials, and a gitignored
+  `.eph.local` override as possibly containing real ones; do not print either
+  to logs or commit one with real secrets.

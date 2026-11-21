@@ -26,6 +26,7 @@ src/
 tests/
   common/mod.rs  integration helpers
   integration.rs CLI and live lifecycle coverage
+  integration/eph_local.rs .eph.local merging across commands
   integration/system_prune_hooks.rs focused prune-hook scenarios
   stress.rs      ignored heavyweight concurrency and backend-change cases
 ```
@@ -49,10 +50,30 @@ already been rejected. The checked model centers on:
 - `CommandOverride`, which owns parsed argv. Runtime code consumes `argv()` and
   never reparses the original string.
 
-The parser uses a `Context` state machine: `TopLevel`, `Env`, `RolesOrder`, or a
-service builder. A section remains active until another header appears. A bare
-variable below a service is therefore rejected with guidance to move it above
-the first section or into `[env]`.
+Parsing runs in three stages so a stack of layers is validated exactly like a
+single file:
+
+1. **Lex** (`Document::lex`) splits one file into top-level variables, linear
+   `roles_order=` lines, and sections, each entry carrying its file and line
+   (`Loc`). It checks only what is local to the file: line syntax, section
+   names, duplicate sections, and where variables may appear. A `Context`
+   state machine (`TopLevel`, `Env`, or a section) tracks the current header;
+   a section remains active until another header appears, so a bare variable
+   below a service lands in that service and is rejected later with guidance
+   to move it above the first section or into `[env]`.
+2. **Merge** (`Document::merge`) folds each override layer over the base:
+   sections by name, entries by key. An overriding key replaces every base
+   entry for that key in place (so repeatable keys are replaced as a list);
+   new keys and sections append in the override's order.
+3. **Build** (`Document::build`) applies every semantic rule below to the
+   merged entries and produces the `EphFile`. Errors cite each value's `Loc`,
+   so a cross-layer conflict names both files.
+
+`parser::parse` is lex + build for one unnamed string; `parser::parse_layers`
+lexes named layers and merges them first. `workspace::load_config` is the one
+place that decides which files are layers (`.eph`, then `.eph.local` if it
+exists; a platform override would slot in between) and is what every command
+calls.
 
 Boundary checks include:
 

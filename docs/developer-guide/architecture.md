@@ -150,9 +150,9 @@ the workspace. Only `--force-non-empty` candidates, selected with no signal of
 disuse, keep the process gate. The aggregate `--force` also enables
 legacy-state compatibility, so it represents the full destructive prune scope;
 confirmation is a separate decision that only `--yes` skips.
-For a selected workspace, prune reads and parses the current `.eph` when it is
-available; otherwise it falls back to the saved teardown hook snapshot. A valid
-current file wins, including when it removes all hooks. Live services receive
+For a selected workspace, prune loads the current `.eph` (merged with any
+`.eph.local`) when it is available; otherwise it falls back to the saved
+teardown hook snapshot. A valid current configuration wins, including when it removes all hooks. Live services receive
 `pre-clean`, `pre-stop`, stop, and `post-stop`; every snapshotted service receives
 the clean hooks, and `post-clean` runs after namespace cleanup. Hooks use the
 workspace directory when it exists and the state directory otherwise. Their

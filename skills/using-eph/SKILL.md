@@ -17,7 +17,9 @@ tear them down when the task is complete.
 ## Detect an eph workspace
 
 A workspace is any directory with a `.eph` file (eph searches upward from the
-current directory, like git).
+current directory, like git). An optional `.eph.local` beside it is a
+per-checkout override merged over `.eph` by every command; it never makes a
+workspace on its own.
 
 ```sh
 test -f .eph && echo "this project uses eph"
@@ -132,6 +134,16 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
   use `env.KEY=` inside its section.
 - Environment variable names beginning with `EPH_`, in any letter case, are
   reserved for eph metadata and rejected in every environment scope.
+- **`.eph.local` overrides `.eph`.** It is gitignored, may hold secrets, and is
+  merged key by key before validation: sections match by name, properties by
+  key (`port.http`, `env.DEBUG` are distinct keys), top-level variables by name
+  (above the first section or in `[env]`, same namespace). An override key
+  replaces the base value; for repeatable keys (`volume=`, hooks) it replaces
+  the whole base list. New keys and sections append. Only the merged result is
+  validated, so setting `run=` locally on an `image=` service is a duplicate
+  source error; errors name the file (`line 3 of .eph.local`). `eph info` lists
+  the loaded layers. Put machine-specific or secret values there instead of
+  editing a committed `.eph`, and do not commit or print it.
 - `volume=name:/path` is a per-workspace named volume; `healthcheck` for an image
   service runs with no shell (whitespace-split, `docker exec`); the lifecycle
   hooks run on the host via `sh -c` with eph's resolved environment injected (see
@@ -493,5 +505,6 @@ return, so they run as normal commands.
 2. Start and load in the **same** step so the env is fresh:
    `eph up && eval "$(eph env)" && <your command>`.
 3. Tear down in an always-run step (even on failure): `eph clean`.
-4. Treat `.eph` as possibly holding dev credentials: do not print it to logs or
-   commit one with real secrets.
+4. Treat `.eph` as possibly holding dev credentials, and `.eph.local` as
+   possibly holding real ones: do not print either to logs or commit one with
+   real secrets.

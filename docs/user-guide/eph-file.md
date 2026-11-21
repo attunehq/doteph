@@ -6,7 +6,8 @@ order: 3
 
 # The `.eph` File
 
-The `.eph` file is the entire configuration for a workspace. It extends `.env`
+The `.eph` file is the entire configuration for a workspace (plus an optional,
+uncommitted [`.eph.local`](#local-overrides-ephlocal) override). It extends `.env`
 syntax with INI-style `[sections]` for services; a plain `.env` file is already
 a valid `.eph` file, and you add services on top. This page is the complete
 format. If you have not read [Core Concepts](concepts.md), start there: this
@@ -466,10 +467,10 @@ wedging startup or teardown.
 ### Hooks during system prune
 
 `eph system prune` runs teardown hooks for each selected workspace. It reads a
-valid current `.eph` when one is available and otherwise uses the last teardown
-snapshot saved by `up`, `down`, `clean`, or `dev`, even if that command used
-`--skip-hooks`. A valid current file is authoritative, including when hooks were
-removed from it.
+valid current `.eph` (merged with any `.eph.local`) when one is available and
+otherwise uses the last teardown snapshot saved by `up`, `down`, `clean`, or
+`dev`, even if that command used `--skip-hooks`. A valid current configuration
+is authoritative, including when hooks were removed from it.
 
 A live service follows `pre-clean`, `pre-stop`, stop, and `post-stop`. A service
 that is already stopped skips both stop hooks. Every snapshotted service runs
@@ -668,6 +669,103 @@ For a `compose` service, `expose.<alias>=<compose-service>:<container-port>`
 resolves as `${service.port.<alias>}`. The short form
 `expose.<alias>=<container-port>` targets the Compose service whose name is the
 alias. Failure to query that exact mapping from Compose is a startup error.
+
+## Local overrides: `.eph.local`
+
+Some configuration belongs to one developer or one checkout: a fixed port you
+want to keep, a local seed directory, a credential, an extra service you only
+run while debugging. Put those in an optional `.eph.local` file next to the
+`.eph`, and keep the committed `.eph` free of machine-specific values. eph
+merges `.eph.local` over `.eph` before validating, interpolating, or planning
+anything, and every command (`check`, `up`, `down`, `env`, `run`, `dev`,
+`status`, `logs`, `clean`, and `eph system prune`'s hooks) sees the same
+merged result.
+
+**Add `.eph.local` to `.gitignore`.** It is meant to stay on your machine, and
+it may hold secrets such as real API keys or passwords. eph only reads it.
+
+```gitignore
+.eph.local
+```
+
+Committed `.eph`:
+
+```ini
+[postgres]
+image=postgres:16-alpine
+port=5432
+
+[env]
+LOG_LEVEL=info
+```
+
+Ignored `.eph.local`:
+
+```ini
+[postgres]
+port=6543
+volume=./local-seed:/docker-entrypoint-initdb.d
+
+[mailpit]
+image=axllent/mailpit:latest
+port=8025
+
+[env]
+LOG_LEVEL=debug
+```
+
+The effective configuration keeps `postgres`'s `image=`, replaces its `port=`,
+adds a `volume=`, adds the `mailpit` service, and replaces `LOG_LEVEL`.
+
+### Merge rules
+
+`.eph.local` uses the same syntax as `.eph`. It is merged key by key:
+
+- **Sections match by name.** A section that exists in both files is merged;
+  a section only in `.eph.local` is added as a new service. A new service must
+  be complete on its own (it needs a source, like any service).
+- **Properties match by key**, and named forms are distinct keys:
+  `port.http=` overrides `port.http=`, not `port.admin=` or `port=`, and
+  `env.DEBUG=` overrides only `env.DEBUG=`.
+- **Top-level variables are one namespace.** A variable matches by name
+  whether it sits above the first section or in an `[env]` section, in either
+  file.
+- **A key in the override replaces the base value**; a key the base does not
+  have is added.
+- **Repeatable keys are replaced as a whole list.** If `.eph.local` sets
+  `volume=` or a lifecycle hook (`pre-start=`, `post-start=`, `pre-stop=`,
+  `post-stop=`, `pre-clean=`, `post-clean=`) at all, its lines replace every
+  line of that key from `.eph`. If it does not mention the key, the base list
+  is kept. To add one hook to an existing list, repeat the base hooks in
+  `.eph.local` along with the new one.
+- **Order is deterministic.** Replaced keys and sections keep their position
+  from `.eph`; new keys and sections are appended in the order `.eph.local`
+  declares them. That order is what `eph env` prints and how services without
+  roles are started.
+- **`[roles_order]` edges match by role**, and a top-level `roles_order=` is
+  replaced as a whole. The two forms still cannot be mixed, even across files.
+
+There is no way to delete a key or a service from `.eph.local`; it can only
+replace and add.
+
+### Validation and precedence
+
+Only the merged result is validated, with every rule on this page. An override
+may replace a value, but it cannot leave an illegal state behind: setting
+`run=` in `.eph.local` for a service whose `.eph` declares `image=` gives that
+service two sources, which is an error. Duplicates *within* one file are still
+errors. Error messages name the file each value came from:
+
+```
+service 'postgres' declares more than one source: `image=` at line 2 of .eph
+and `run=` at line 2 of .eph.local; set exactly one of image/dockerfile/compose/run
+```
+
+`.eph.local` is read only from the directory that holds the discovered `.eph`.
+On its own it does not make a directory a workspace, and an `.eph.local` in a
+subdirectory is ignored. When both files exist, `.eph.local` takes precedence.
+`eph info` lists the layers it loaded, base first, and `eph check` names the
+override it merged.
 
 ## Complete example
 

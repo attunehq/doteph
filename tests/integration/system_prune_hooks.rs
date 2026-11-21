@@ -385,7 +385,7 @@ async fn current_valid_eph_wins_and_invalid_eph_falls_back_to_saved_hooks() {
     assert_success("fallback-source prune", &fallback_prune);
     let stdout = String::from_utf8_lossy(&fallback_prune.stdout);
     assert!(
-        stdout.contains("could not parse current") && stdout.contains("saved teardown snapshot"),
+        stdout.contains("could not load current configuration") && stdout.contains("saved teardown snapshot"),
         "fallback should be visible in warnings: {stdout}"
     );
     assert_eq!(
@@ -427,7 +427,7 @@ async fn old_state_without_a_hook_snapshot_still_prunes_with_a_warning() {
     assert!(
         stdout.contains("teardown hooks are unavailable")
             && stdout.contains("no saved hook snapshot")
-            && stdout.contains("could not parse current"),
+            && stdout.contains("could not load current configuration"),
         "missing compatibility warning: {stdout}"
     );
     assert!(!stdout.contains("using the saved teardown snapshot"));

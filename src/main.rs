@@ -14,7 +14,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use eph::parser::{self, EphFile, ServiceSource};
+use eph::parser::{EphFile, ServiceSource};
 use eph::{Hooks, LogOptions, RunningService, ServiceManager, Workspace, skills};
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
@@ -1362,6 +1362,10 @@ async fn cmd_check() -> Result<()> {
     let eph = load_eph_file(&workspace)?;
 
     println!("Valid .eph file: {}", workspace.eph_file_path().display());
+    // The base file is listed above; name each override merged over it.
+    for layer in workspace.config_layers().iter().skip(1) {
+        println!("Override: {}", layer.display());
+    }
     println!();
     println!("Environment variables: {}", eph.env_vars.len());
     for var in &eph.env_vars {
@@ -1402,6 +1406,10 @@ async fn cmd_info() -> Result<()> {
     println!("Short ID: {}", workspace.short_id);
     println!("Container prefix: {}", workspace.container_prefix());
     println!(".eph file: {}", workspace.eph_file_path().display());
+    println!("Config layers (later layers take precedence):");
+    for layer in workspace.config_layers() {
+        println!("  {}", layer.display());
+    }
     println!("State directory: {}", workspace.state_dir()?.display());
 
     Ok(())
@@ -1662,10 +1670,7 @@ fn print_update_status(current: &str, latest: &str, status: eph::update::Status)
 }
 
 fn load_eph_file(workspace: &Workspace) -> Result<EphFile> {
-    let path = workspace.eph_file_path();
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    parser::parse(&contents).with_context(|| format!("failed to parse {}", path.display()))
+    workspace.load_config()
 }
 
 #[cfg(test)]
@@ -1673,7 +1678,7 @@ mod tests {
     use super::*;
 
     fn parse_eph(input: &str) -> EphFile {
-        parser::parse(input).expect("test .eph should parse")
+        eph::parser::parse(input).expect("test .eph should parse")
     }
 
     fn args(strs: &[&str]) -> Vec<String> {
