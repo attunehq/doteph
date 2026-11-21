@@ -85,8 +85,10 @@ which:
 
 1. Builds binaries for seven targets: macOS (x86_64, arm64), Linux glibc
    (x86_64, arm64), Linux musl (x86_64, arm64), and Windows (x86_64). The
-   non-native targets cross-compile with [`cargo-cross`](https://github.com/cross-rs/cross);
-   `eph` is pure Rust with no system dependencies, so this needs no extra setup.
+   Linux arm64 and musl targets cross-compile with
+   [`cross`](https://github.com/cross-rs/cross), and Windows links with
+   Ubuntu's MinGW toolchain; `eph` is pure Rust with no system dependencies,
+   so this needs no extra setup.
 2. Packages each target as a `tar.gz` (binary plus `README.md`, `LICENSE`,
    `NOTICE`), generates a `checksums.txt`, and publishes a GitHub Release with
    auto-generated notes. The macOS binaries are published unsigned.

@@ -2,10 +2,10 @@
 #
 # Triggered on pull requests, main pushes, manual dry runs, and version tags
 # (v*). Builds binaries for all supported platforms in parallel: native macOS
-# and linux-gnu-x64, plus cross-compiled linux-arm64, musl, and windows targets
-# via cargo-cross. eph is pure Rust (bollard talks to Docker over a unix socket
-# or a Windows named pipe, with no TLS), so every target cross-compiles with no
-# system dependencies.
+# and linux-gnu-x64, linux-arm64 and musl targets cross-compiled via cross-rs
+# `cross`, and windows-gnu linked with Ubuntu's MinGW toolchain. eph is pure
+# Rust (bollard talks to Docker over a unix socket or a Windows named pipe, with
+# no TLS), so every target cross-compiles with no system dependencies.
 #
 # PR/main builds are dry runs that only prove the matrix compiles. A version tag
 # publishes the unsigned binaries in a GitHub Release with auto-generated notes
@@ -129,10 +129,12 @@ jobs:
                       runner: ubuntu-latest
                       cross: true
 
-                    # Windows build using cross (simpler than native MinGW setup).
+                    # Windows build linked with Ubuntu's MinGW toolchain. (cross-rs
+                    # 0.2.5's windows-gnu image fails with current stable Rust;
+                    # see cross-rs/cross#1819.)
                     - target: x86_64-pc-windows-gnu
                       runner: ubuntu-latest
-                      cross: true
+                      cross: false
 
         steps:
             - uses: actions/checkout@v7
@@ -142,11 +144,20 @@ jobs:
                   rustup toolchain install stable
                   rustup target add ${{ matrix.target }}
 
-            - name: Install cargo-cross
+            - name: Install MinGW linker
+              if: matrix.target == 'x86_64-pc-windows-gnu'
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+
+            # cross-rs `cross` builds inside its published Docker images, which
+            # carry each target's linker. (zijiren233's cargo-cross, used before,
+            # downloaded linkers from a GitHub repo that has since been deleted.)
+            - name: Install cross
               if: matrix.cross
               uses: taiki-e/install-action@v2
               with:
-                  tool: cargo-cross
+                  tool: cross
                   checksum: true
 
             - name: Setup Rust cache
@@ -158,12 +169,14 @@ jobs:
 
             # Inject the resolved version so the binary's `--version` matches the
             # tag without relying on git being present inside cross containers.
-            - name: Build with cargo cross
+            # cross only forwards host variables it is told to pass through.
+            - name: Build with cross
               if: matrix.cross
               env:
                   EPH_VERSION: ${{ needs.prepare.outputs.tag }}
+                  CROSS_BUILD_ENV_PASSTHROUGH: EPH_VERSION
                   TARGET: ${{ matrix.target }}
-              run: cargo cross build --target "$TARGET" --release --locked
+              run: cross build --target "$TARGET" --release --locked
 
             - name: Build native
               if: ${{ !matrix.cross }}
