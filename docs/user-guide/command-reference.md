@@ -568,9 +568,10 @@ eph logs -n 50 postgres       # last 50 lines
 
 ## `eph check`
 
-Parse and validate the `.eph` file without touching Docker. Reports the
-environment variables and services it found, or a parse error with a line
-number.
+Parse and validate the `.eph` file, with any
+[`.eph.local`](eph-file.md#local-overrides-ephlocal) override merged over it,
+without touching Docker. Reports the environment variables and services in the
+merged result, or a parse error naming the file and line at fault.
 
 ```sh
 eph check
@@ -578,6 +579,7 @@ eph check
 
 ```
 Valid .eph file: /home/you/projects/myapp/.eph
+Override: /home/you/projects/myapp/.eph.local
 
 Environment variables: 2
   DATABASE_URL
@@ -587,6 +589,8 @@ Services: 2
   postgres (image: postgres:16-alpine)
   redis (image: redis:7-alpine)
 ```
+
+The `Override:` line appears only when a `.eph.local` was merged.
 
 ## `eph info`
 
@@ -602,8 +606,15 @@ Workspace ID: a1b2c3d4e5f60718293a...  (full SHA-256)
 Short ID: a1b2c3d4e5f60718
 Container prefix: eph-a1b2c3d4e5f60718
 .eph file: /home/you/projects/myapp/.eph
+Config layers (later layers take precedence):
+  /home/you/projects/myapp/.eph
+  /home/you/projects/myapp/.eph.local
 State directory: /home/you/.local/share/eph/a1b2c3d4e5f60718
 ```
+
+`Config layers` lists the configuration files every command merges, lowest
+precedence first: always `.eph`, then `.eph.local` when it exists. `eph info`
+only lists them; run `eph check` to validate the merged result.
 
 Use the container prefix and short ID to find this workspace's resources with
 the `docker` CLI. The state directory's parent (the `eph` above the short ID)

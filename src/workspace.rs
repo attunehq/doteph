@@ -4,11 +4,25 @@
 //! its absolute path. This ensures multiple checkouts of the same project
 //! don't conflict with each other.
 
+use crate::parser::{self, EphFile, Layer};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// The workspace's base configuration file. Its presence is what makes a
+/// directory a workspace.
+pub const EPH_FILE: &str = ".eph";
+
+/// The optional per-checkout override merged over [`EPH_FILE`]. It never makes
+/// a directory a workspace on its own.
+pub const LOCAL_EPH_FILE: &str = ".eph.local";
+
+/// The optional layers merged over [`EPH_FILE`], lowest precedence first. A
+/// platform-specific override would slot in ahead of `.eph.local`, which keeps
+/// final precedence.
+const OVERRIDE_FILES: &[&str] = &[LOCAL_EPH_FILE];
 
 pub(crate) const WORKSPACE_METADATA_FILE: &str = "workspace.json";
 const WORKSPACE_METADATA_SCHEMA: u32 = 1;
@@ -192,7 +206,7 @@ impl Workspace {
         let mut current = start.to_path_buf();
 
         loop {
-            let eph_file = current.join(".eph");
+            let eph_file = current.join(EPH_FILE);
             if eph_file.exists() {
                 return Self::from_path(&current);
             }
@@ -209,7 +223,24 @@ impl Workspace {
     /// Get the path to the .eph file
     #[must_use]
     pub fn eph_file_path(&self) -> PathBuf {
-        self.path.join(".eph")
+        self.path.join(EPH_FILE)
+    }
+
+    /// The configuration files this workspace loads, lowest precedence first.
+    /// See [`config_layers`].
+    #[must_use]
+    pub fn config_layers(&self) -> Vec<PathBuf> {
+        config_layers(&self.path)
+    }
+
+    /// Load the workspace's effective configuration. See [`load_config`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a layer cannot be read or the merged result does not
+    /// parse.
+    pub fn load_config(&self) -> Result<EphFile> {
+        load_config(&self.path)
     }
 
     /// Get a container name prefix for this workspace
@@ -303,6 +334,57 @@ impl Workspace {
     pub fn log_file_path(&self, service: &str) -> Result<PathBuf> {
         Ok(self.logs_dir()?.join(format!("{service}.log")))
     }
+}
+
+/// The configuration files a workspace at `dir` loads, lowest precedence first:
+/// always the base `.eph`, then each optional override that exists.
+#[must_use]
+pub fn config_layers(dir: &Path) -> Vec<PathBuf> {
+    let mut layers = vec![dir.join(EPH_FILE)];
+    layers.extend(
+        OVERRIDE_FILES
+            .iter()
+            .map(|name| dir.join(name))
+            .filter(|path| path.exists()),
+    );
+    layers
+}
+
+/// Load the effective configuration of the workspace at `dir`: the base `.eph`
+/// with every override in [`config_layers`] merged over it (see
+/// [`parser::parse_layers`]). Every command that reads workspace
+/// configuration goes through here, so they all see the same merged file.
+///
+/// # Errors
+///
+/// Returns an error if a layer cannot be read (including a missing base
+/// `.eph`) or the merged result does not parse.
+pub fn load_config(dir: &Path) -> Result<EphFile> {
+    let paths = config_layers(dir);
+    let mut files = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let contents = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        files.push((name, contents));
+    }
+    let layers: Vec<Layer<'_>> = files
+        .iter()
+        .map(|(name, contents)| Layer { name, contents })
+        .collect();
+    parser::parse_layers(&layers).with_context(|| {
+        // "failed to parse /repo/.eph" or "... /repo/.eph merged with .eph.local";
+        // the inner error names the layer at fault.
+        let mut message = format!("failed to parse {}", paths[0].display());
+        if files.len() > 1 {
+            let overrides: Vec<&str> = files[1..].iter().map(|(name, _)| name.as_str()).collect();
+            message.push_str(&format!(" merged with {}", overrides.join(", ")));
+        }
+        message
+    })
 }
 
 /// Compute a unique ID for a workspace based on its path

@@ -24,6 +24,11 @@ subdirectory of your project.
 If no `.eph` file is found in the current directory or any parent, the command
 fails with `no .eph file found`.
 
+A `.eph.local` file next to the `.eph` is merged over it as a per-checkout
+override (see [Local overrides](eph-file.md#local-overrides-ephlocal)). It does
+not count when searching: a directory with only `.eph.local` is not a
+workspace.
+
 All relative paths and shell commands in your `.eph` file (volumes,
 `dockerfile=`, `compose=`, `run=`, health checks, and lifecycle hooks) resolve
 and execute **from the workspace root**, not from wherever you happen to run

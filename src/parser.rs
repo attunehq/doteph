@@ -37,7 +37,9 @@ use anyhow::{Context as _, Result, bail};
 use indexmap::IndexMap;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::fmt;
 use std::num::{NonZeroU16, NonZeroU64};
+use std::rc::Rc;
 
 // ============================================================================
 // AST Types
@@ -471,18 +473,399 @@ const KNOWN_PROPERTIES: &str = "image, dockerfile, compose, run, role, command, 
      port.<name>, expose.<name>, env.<KEY>, volume, pre-start, post-start, pre-stop, \
      post-stop, pre-clean, post-clean, healthcheck, ready-timeout, context";
 
-/// What the parser is currently reading: top-of-file variables, an `[env]`
-/// section, the `[roles_order]` section, or a service section.
+/// The reserved name shared by the linear `roles_order=` key and the
+/// `[roles_order]` section.
+const ROLES_ORDER: &str = "roles_order";
+
+/// Where a value was written: a line, plus the file it came from when the
+/// configuration was loaded from named layers (see [`parse_layers`]).
+///
+/// Displays as `line 3` or `line 3 of .eph.local`, so messages read the same
+/// for a single file and say which layer is at fault for a merged one.
+#[derive(Debug, Clone, Default)]
+struct Loc {
+    file: Option<Rc<str>>,
+    line: usize,
+}
+
+impl fmt::Display for Loc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.file {
+            Some(file) => write!(f, "line {} of {}", self.line, file),
+            None => write!(f, "line {}", self.line),
+        }
+    }
+}
+
+/// Where a section and each of its keys were first written, so a semantic
+/// error found after merging can point at the layer each value came from.
+#[derive(Default)]
+struct SectionLocs {
+    /// The section header (or, for the linear `roles_order=`, its line).
+    header: Loc,
+    /// The first line that set each key.
+    keys: HashMap<String, Loc>,
+}
+
+impl SectionLocs {
+    /// Remember where `key` was first set; later occurrences keep the first.
+    fn record(&mut self, key: &str, loc: &Loc) {
+        self.keys
+            .entry(key.to_string())
+            .or_insert_with(|| loc.clone());
+    }
+
+    /// Where `key` was first set, falling back to the section header for a key
+    /// the section never set (e.g. a missing `role=`).
+    fn of(&self, key: &str) -> &Loc {
+        self.keys.get(key).unwrap_or(&self.header)
+    }
+}
+
+/// One `KEY=VALUE` line, trimmed and with optional quotes stripped.
+struct Entry {
+    key: String,
+    value: String,
+    loc: Loc,
+}
+
+/// A `[name]` section and its entries, in declaration order.
+struct Section {
+    name: String,
+    header: Loc,
+    entries: Vec<Entry>,
+}
+
+/// The structure of one `.eph` layer: which line declares what, before any
+/// semantic validation.
+///
+/// Layers are merged at this level ([`Document::merge`]) and only the merged
+/// result is validated ([`Document::build`]), so a single file and a stack of
+/// layers go through exactly the same rules, and an override can never produce
+/// a state a single file could not.
+#[derive(Default)]
+struct Document {
+    /// Top-level variables: the top-of-file block and every `[env]` section
+    /// share one namespace, in declaration order.
+    env: Vec<Entry>,
+    /// Top-level `roles_order=` lines (the linear form). More than one is an
+    /// error, reported once the layers are merged.
+    roles_order: Vec<Entry>,
+    /// Service sections and the `[roles_order]` section, in declaration order.
+    /// Each name appears at most once.
+    sections: Vec<Section>,
+}
+
+/// Which part of the file a line belongs to while lexing.
 #[derive(Clone, Copy)]
 enum Context {
     /// Before the first section: bare `KEY=VALUE` lines are top-level variables.
     TopLevel,
     /// Inside an `[env]` section: every line is a top-level variable.
     Env,
-    /// Inside the `[roles_order]` section: every line is a `role=deps` edge.
-    RolesOrder,
-    /// Inside the service section at this index in the builders list.
-    Service(usize),
+    /// Inside the section at this index in [`Document::sections`].
+    Section(usize),
+}
+
+impl Document {
+    /// Split one layer into variables and sections, checking only what is
+    /// local to the file: line syntax, section names, duplicate sections, and
+    /// where variables may appear. `file` names the layer in diagnostics.
+    fn lex(input: &str, file: Option<&str>) -> Result<Self> {
+        // Windows editors love to prepend a UTF-8 BOM; without this it would end up
+        // glued to the first variable's name and break the emitted `export` line.
+        let input = input.strip_prefix('\u{feff}').unwrap_or(input);
+        let file: Option<Rc<str>> = file.map(Rc::from);
+
+        let mut doc = Self::default();
+        let mut context = Context::TopLevel;
+        for (index, line) in input.lines().enumerate() {
+            let loc = Loc {
+                file: file.clone(),
+                line: index + 1,
+            };
+            let line = line.trim();
+
+            // Skip empty lines and comments
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            // Check for section header [service_name]
+            if line.starts_with('[') && line.ends_with(']') {
+                let name = &line[1..line.len() - 1];
+                if name.is_empty() {
+                    bail!("empty section name at {}", loc);
+                }
+                // `[env]` is a reserved section for top-level variables. It may
+                // repeat: each occurrence just switches back to variable context,
+                // so variables can be grouped near the services they describe.
+                if name == "env" {
+                    context = Context::Env;
+                    continue;
+                }
+                // `[roles_order]` is a reserved section, not a service: its lines
+                // are `role=dependencies` edges rather than service properties.
+                if name != ROLES_ORDER {
+                    if let Some(canonical) = reserved_section_hint(name) {
+                        bail!(
+                            "unknown section [{}] at {}; did you mean [{}]?",
+                            name,
+                            loc,
+                            canonical
+                        );
+                    }
+                    if !is_valid_service_name(name) {
+                        bail!(
+                            "invalid service name '{}' at {}: service names are \
+                             lowercase letters, digits, and hyphens, starting with a \
+                             letter (they become container names, ${{name.property}} \
+                             references, and EPH_<NAME>_* variables)",
+                            name,
+                            loc
+                        );
+                    }
+                }
+                match doc.sections.iter().position(|s| s.name == name) {
+                    // A repeated `[roles_order]` keeps adding edges to the first.
+                    Some(existing) if name == ROLES_ORDER => context = Context::Section(existing),
+                    Some(existing) => bail!(
+                        "duplicate section [{}] at {} (first defined at {})",
+                        name,
+                        loc,
+                        doc.sections[existing].header
+                    ),
+                    None => {
+                        doc.sections.push(Section {
+                            name: name.to_string(),
+                            header: loc,
+                            entries: Vec::new(),
+                        });
+                        context = Context::Section(doc.sections.len() - 1);
+                    }
+                }
+                continue;
+            }
+
+            // Parse key=value
+            let Some((key, value)) = line.split_once('=') else {
+                bail!("invalid syntax at {}: expected KEY=VALUE", loc);
+            };
+            let entry = Entry {
+                key: key.trim().to_string(),
+                // Remove optional quotes from value
+                value: strip_quotes(value.trim()).to_string(),
+                loc,
+            };
+
+            match context {
+                // Top-of-file: bare variables, plus the linear `roles_order=` form.
+                Context::TopLevel if entry.key == ROLES_ORDER => doc.roles_order.push(entry),
+                Context::Env if entry.key == ROLES_ORDER => bail!(
+                    "{}: `roles_order=` is reserved and cannot be declared inside \
+                     [env]; declare it above the first section",
+                    entry.loc
+                ),
+                Context::TopLevel | Context::Env => doc.env.push(entry),
+                Context::Section(index) => doc.sections[index].entries.push(entry),
+            }
+        }
+        Ok(doc)
+    }
+
+    /// Merge `overlay` on top of this layer.
+    ///
+    /// Sections match by name and keys within a section by key (named forms
+    /// like `port.http` and `env.DEBUG` are distinct keys), top-level variables
+    /// match by name across the top-of-file block and `[env]`, and `[roles_order]`
+    /// edges match by role. See [`merge_entries`] for how keys combine. Sections
+    /// only the overlay declares are appended in its declaration order.
+    fn merge(mut self, overlay: Self) -> Self {
+        self.env = merge_entries(self.env, overlay.env);
+        self.roles_order = merge_entries(self.roles_order, overlay.roles_order);
+        for section in overlay.sections {
+            match self.sections.iter_mut().find(|s| s.name == section.name) {
+                Some(base) => {
+                    base.entries =
+                        merge_entries(std::mem::take(&mut base.entries), section.entries);
+                }
+                None => self.sections.push(section),
+            }
+        }
+        self
+    }
+
+    /// Validate the (possibly merged) document and turn it into an [`EphFile`].
+    fn build(self) -> Result<EphFile> {
+        // Every ${service.property} reference seen, validated against the full
+        // service list once every section is read so forward references work.
+        let mut refs: Vec<PlaceholderRef> = Vec::new();
+
+        let mut env_vars: Vec<EnvVar> = Vec::with_capacity(self.env.len());
+        // Top-level variable names already seen, for duplicate detection.
+        let mut env_locs: HashMap<&str, &Loc> = HashMap::new();
+        for Entry { key, value, loc } in &self.env {
+            if !is_valid_env_name(key) {
+                bail!(
+                    "invalid environment variable name '{}' at {}: names are \
+                     letters, digits, and underscores, not starting with a digit \
+                     (the shell rejects anything else at `eval` time)",
+                    key,
+                    loc
+                );
+            }
+            reject_reserved_env_name(key, loc, "top-level environment")?;
+            if let Some(first) = env_locs.insert(key, loc) {
+                bail!(
+                    "duplicate environment variable '{}' at {} (first defined at {})",
+                    key,
+                    loc,
+                    first
+                );
+            }
+            scan_placeholders(value, loc, &format!("the value of {}", key), &mut refs)?;
+            env_vars.push(EnvVar {
+                name: key.clone(),
+                value: value.clone(),
+            });
+        }
+
+        // The role graph, from whichever form the file uses. The linear
+        // `roles_order=a,b,c` key and the `[roles_order]` section are mutually
+        // exclusive; both desugar to one adjacency list.
+        let mut roles: Option<(RolesOrder, SectionLocs)> = match self.roles_order.as_slice() {
+            [] => None,
+            [entry] => Some((
+                RolesOrder {
+                    deps: desugar_linear_order(&split_roles_checked(&entry.value, &entry.loc)?),
+                },
+                SectionLocs {
+                    header: entry.loc.clone(),
+                    keys: HashMap::new(),
+                },
+            )),
+            [first, second, ..] => bail!(
+                "{}: duplicate top-level `roles_order=` (first set at {})",
+                second.loc,
+                first.loc
+            ),
+        };
+
+        // Each service section accumulates into a builder in declaration order,
+        // which keeps finalization (and any error it reports) deterministic.
+        let mut builders: Vec<ServiceBuilder> = Vec::new();
+        for section in self.sections {
+            if section.name == ROLES_ORDER {
+                if let Some((_, linear)) = &roles {
+                    bail!(
+                        "cannot use both a top-level `roles_order=` (at {}) and a \
+                         [roles_order] section (at {}); pick one",
+                        linear.header,
+                        section.header
+                    );
+                }
+                roles = Some(parse_roles_section(section)?);
+                continue;
+            }
+            let mut builder = ServiceBuilder {
+                name: section.name,
+                locs: SectionLocs {
+                    header: section.header,
+                    keys: HashMap::new(),
+                },
+                ..Default::default()
+            };
+            for Entry { key, value, loc } in &section.entries {
+                parse_service_property(&mut builder, key, value, loc, &mut refs)?;
+            }
+            builders.push(builder);
+        }
+
+        // Finalize each section into a concrete Service, rejecting any that never
+        // declared a source. This keeps the illegal "service with no source"
+        // state out of the returned EphFile entirely. Inserting in declaration
+        // order makes `services` iterate the same way. The locations outlive the
+        // builders so the role checks below can still cite them.
+        let mut services: IndexMap<String, Service> = IndexMap::with_capacity(builders.len());
+        let mut service_locs: Vec<SectionLocs> = Vec::with_capacity(builders.len());
+        for mut builder in builders {
+            let locs = std::mem::take(&mut builder.locs);
+            let service = builder.finish(&locs)?;
+            services.insert(service.name.clone(), service);
+            service_locs.push(locs);
+        }
+
+        // Every ${service.property} must name a defined service and a property
+        // that the service actually exposes.
+        for r in &refs {
+            validate_placeholder(r, &services)?;
+        }
+
+        // Check the graph and the services agree before handing back an
+        // `EphFile`, so "roles mode" is either fully specified or absent.
+        validate_roles(
+            &services,
+            &service_locs,
+            roles.as_ref().map(|(order, locs)| (order, locs)),
+        )?;
+
+        Ok(EphFile {
+            env_vars,
+            services,
+            roles_order: roles.map(|(order, _)| order),
+        })
+    }
+}
+
+/// Merge one layer's entries over another's, matching by key.
+///
+/// A key the overlay sets replaces *every* base entry for that key, so a
+/// repeatable key such as `volume=` or `post-start=` is replaced as a whole
+/// list rather than appended to, and a key the overlay omits keeps the base's
+/// entries. Replacements take the position of the base's first entry for the
+/// key, and keys only the overlay sets are appended in the overlay's order, so
+/// the merged order is deterministic.
+fn merge_entries(base: Vec<Entry>, overlay: Vec<Entry>) -> Vec<Entry> {
+    let mut replacements: IndexMap<String, Vec<Entry>> = IndexMap::new();
+    for entry in overlay {
+        replacements
+            .entry(entry.key.clone())
+            .or_default()
+            .push(entry);
+    }
+    let mut merged = Vec::with_capacity(base.len());
+    for entry in base {
+        match replacements.get_mut(&entry.key) {
+            // The first base entry for an overridden key takes the overlay's
+            // entries (leaving the group empty); later ones append nothing.
+            Some(group) => merged.append(group),
+            None => merged.push(entry),
+        }
+    }
+    // Whatever is left was never in the base: append it in overlay order.
+    merged.extend(replacements.into_values().flatten());
+    merged
+}
+
+/// Parse a `[roles_order]` section: each line is a `role=dep1,dep2` edge, and
+/// an empty value declares a root that depends on nothing.
+fn parse_roles_section(section: Section) -> Result<(RolesOrder, SectionLocs)> {
+    let mut deps: IndexMap<String, Vec<String>> = IndexMap::new();
+    let mut locs = SectionLocs {
+        header: section.header,
+        keys: HashMap::new(),
+    };
+    for Entry { key, value, loc } in &section.entries {
+        if key.is_empty() {
+            bail!("{}: empty role name in [roles_order]", loc);
+        }
+        if deps.contains_key(key) {
+            bail!("{}: duplicate role '{}' in [roles_order]", loc, key);
+        }
+        deps.insert(key.clone(), split_role_dependencies(value, key, loc)?);
+        locs.record(key, loc);
+    }
+    Ok((RolesOrder { deps }, locs))
 }
 
 /// A `${service.property}` reference found while parsing, kept for validation
@@ -490,7 +873,7 @@ enum Context {
 struct PlaceholderRef {
     service: String,
     property: String,
-    line: usize,
+    loc: Loc,
     /// Where the reference appeared, for the error message (e.g. "value of
     /// DATABASE_URL" or "env.PORT of service 'web'").
     context: String,
@@ -505,8 +888,8 @@ struct PlaceholderRef {
 #[derive(Default)]
 struct ServiceBuilder {
     name: String,
-    /// The line the section header appeared on, for duplicate-section errors.
-    first_line: usize,
+    /// Where the section and each property came from, for diagnostics.
+    locs: SectionLocs,
     role: Option<String>,
     source: Option<ServiceSource>,
     ports: Vec<PortMapping>,
@@ -531,13 +914,29 @@ struct ServiceBuilder {
 impl ServiceBuilder {
     /// Finalize the section into a [`Service`], requiring a concrete source and
     /// enforcing the property/source pairings that only make sense together.
-    fn finish(mut self) -> Result<Service> {
+    ///
+    /// Each pairing error names where both the property and the source were
+    /// set, because after merging they may come from different layers.
+    fn finish(mut self, locs: &SectionLocs) -> Result<Service> {
         let source = self.source.take().ok_or_else(|| {
             anyhow::anyhow!(
-                "service '{}' has no source defined (set one of image/dockerfile/compose/run)",
-                self.name
+                "service '{}' (at {}) has no source defined (set one of \
+                 image/dockerfile/compose/run)",
+                self.name,
+                locs.header
             )
         })?;
+        let source_key = source_key(&source);
+        // "`volume=` at line 4 of .eph.local, `run=` at line 2 of .eph"
+        let conflict = |key: &str| {
+            format!(
+                "`{}=` at {}, `{}=` at {}",
+                key,
+                locs.of(key),
+                source_key,
+                locs.of(source_key)
+            )
+        };
         // Auto-allocated ports (`port=auto`) only make sense for `run=` services:
         // those are host processes eph launches itself, so it can pick a free
         // port, inject it, and re-launch on a fresh one if the process hits a
@@ -547,14 +946,13 @@ impl ServiceBuilder {
         if !matches!(source, ServiceSource::Command(_))
             && let Some(p) = self.ports.iter().find(|p| p.is_auto())
         {
-            let which = p
-                .name()
-                .map_or_else(|| "port".to_string(), |n| format!("port.{n}"));
+            let which = port_key(p);
             bail!(
                 "service '{}' sets `{} = auto`, but auto-allocated ports are only \
-                 supported for `run=` services",
+                 supported for `run=` services ({})",
                 self.name,
-                which
+                which,
+                conflict(&which)
             );
         }
         // `command=` overrides an image's CMD; a `run=` service's command IS its
@@ -569,14 +967,16 @@ impl ServiceBuilder {
             bail!(
                 "service '{}' sets `command=`, which only applies to image= or \
                  dockerfile= services (a run= service's command is the run= value \
-                 itself; a compose service's command belongs in the compose file)",
-                self.name
+                 itself; a compose service's command belongs in the compose file) ({})",
+                self.name,
+                conflict("command")
             );
         }
         if self.build_context.is_some() && !matches!(source, ServiceSource::Dockerfile(_)) {
             bail!(
-                "service '{}' sets `context=`, which only applies to dockerfile= services",
-                self.name
+                "service '{}' sets `context=`, which only applies to dockerfile= services ({})",
+                self.name,
+                conflict("context")
             );
         }
         if !self.volumes.is_empty()
@@ -586,14 +986,17 @@ impl ServiceBuilder {
             )
         {
             bail!(
-                "service '{}' sets `volume=`, which only applies to image= or dockerfile= services",
-                self.name
+                "service '{}' sets `volume=`, which only applies to image= or \
+                 dockerfile= services ({})",
+                self.name,
+                conflict("volume")
             );
         }
         if self.ready_timeout_secs.is_some() && self.healthcheck.is_none() {
             bail!(
-                "service '{}' sets `ready-timeout=` without a `healthcheck=` to time",
-                self.name
+                "service '{}' sets `ready-timeout=` (at {}) without a `healthcheck=` to time",
+                self.name,
+                locs.of("ready-timeout")
             );
         }
         // `expose.<name>=` names ports of services inside a compose project;
@@ -601,24 +1004,26 @@ impl ServiceBuilder {
         // meaningless for the other backend, so a mix-up is caught here.
         let ports = if matches!(source, ServiceSource::Compose(_)) {
             if let Some(p) = self.ports.first() {
-                let which = p
-                    .name()
-                    .map_or_else(|| "port".to_string(), |n| format!("port.{n}"));
+                let which = port_key(p);
                 bail!(
                     "compose service '{}' declares `{}`; compose services name \
-                     their ports with `expose.<alias>=<compose-service>:<container-port>` instead",
+                     their ports with `expose.<alias>=<compose-service>:<container-port>` \
+                     instead ({})",
                     self.name,
-                    which
+                    which,
+                    conflict(&which)
                 );
             }
             self.expose
         } else {
             if let Some(p) = self.expose.first() {
+                let which = port_key(p);
                 bail!(
-                    "service '{}' declares `expose.{}`, which only applies to \
-                     compose= services; use `port=` or `port.<name>=` instead",
+                    "service '{}' declares `{}`, which only applies to compose= \
+                     services; use `port=` or `port.<name>=` instead ({})",
                     self.name,
-                    p.name().unwrap_or_default()
+                    which,
+                    conflict(&which)
                 );
             }
             self.ports
@@ -645,14 +1050,38 @@ impl ServiceBuilder {
         })
     }
 
-    /// True if a port with this name (or an unnamed port, for `None`) has
-    /// already been declared via either `port` or `expose`.
-    fn has_port_named(&self, name: Option<&str>) -> bool {
+    /// Where a port with this name (or the unnamed port, for `None`) was
+    /// already declared via `port`, `port.<name>`, or `expose.<name>`, if it was.
+    fn declared_port(&self, name: Option<&str>) -> Option<&Loc> {
         let runtime_name = name.unwrap_or("default");
         self.ports
             .iter()
             .chain(self.expose.iter())
-            .any(|port| port.runtime_name() == runtime_name)
+            .find(|port| port.runtime_name() == runtime_name)
+            .map(|port| self.locs.of(&port_key(port)))
+    }
+}
+
+/// The property key that declares a source (`image`, `run`, ...).
+fn source_key(source: &ServiceSource) -> &'static str {
+    match source {
+        ServiceSource::Image(_) => "image",
+        ServiceSource::Dockerfile(_) => "dockerfile",
+        ServiceSource::Compose(_) => "compose",
+        ServiceSource::Command(_) => "run",
+    }
+}
+
+/// The property key that declared a port (`port`, `port.<name>`, or
+/// `expose.<alias>`).
+fn port_key(port: &PortMapping) -> String {
+    match port {
+        PortMapping::Fixed { name: None, .. } | PortMapping::Auto { name: None } => "port".into(),
+        PortMapping::Fixed {
+            name: Some(name), ..
+        }
+        | PortMapping::Auto { name: Some(name) } => format!("port.{name}"),
+        PortMapping::Compose { alias, .. } => format!("expose.{alias}"),
     }
 }
 
@@ -710,244 +1139,96 @@ impl ServiceBuilder {
 /// assert!(eph::parser::parse("[redis]\nport=6379\n").is_err());
 /// ```
 pub fn parse(input: &str) -> Result<EphFile> {
-    // Windows editors love to prepend a UTF-8 BOM; without this it would end up
-    // glued to the first variable's name and break the emitted `export` line.
-    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
+    Document::lex(input, None)?.build()
+}
 
-    let mut env_vars: Vec<EnvVar> = Vec::new();
-    // Top-level variable names already seen, for duplicate detection. The
-    // top-of-file block and every [env] section share one namespace.
-    let mut env_lines: HashMap<String, usize> = HashMap::new();
-    // Preserve insertion order of service sections so that finalization (and
-    // any error it reports) is deterministic.
-    let mut builders: Vec<ServiceBuilder> = Vec::new();
-    let mut index_by_name: HashMap<String, usize> = HashMap::new();
-    let mut context = Context::TopLevel;
-    // Every ${service.property} reference seen, validated against the full
-    // service list after the whole file is read so forward references work.
-    let mut refs: Vec<PlaceholderRef> = Vec::new();
+/// One named configuration file in a layered workspace configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct Layer<'a> {
+    /// The name diagnostics use for this file (e.g. `.eph.local`).
+    pub name: &'a str,
+    /// The file's contents.
+    pub contents: &'a str,
+}
 
-    // The role graph, accumulated from whichever form the file uses. The linear
-    // `roles_order=a,b,c` key and the `[roles_order]` section are mutually
-    // exclusive; `roles_order_dag` holds the section form's adjacency list.
-    let mut roles_order_linear: Option<Vec<String>> = None;
-    let mut roles_order_dag: Option<IndexMap<String, Vec<String>>> = None;
-
-    for (line_num, line) in input.lines().enumerate() {
-        let line_num = line_num + 1; // 1-indexed
-        let line = line.trim();
-
-        // Skip empty lines and comments
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Check for section header [service_name]
-        if line.starts_with('[') && line.ends_with(']') {
-            let name = &line[1..line.len() - 1];
-            if name.is_empty() {
-                bail!("empty section name at line {}", line_num);
-            }
-            // `[roles_order]` is a reserved section, not a service: its lines are
-            // `role=dependencies` edges rather than service properties.
-            if name == "roles_order" {
-                if roles_order_linear.is_some() {
-                    bail!(
-                        "line {}: cannot use both a top-level `roles_order=` and a \
-                         [roles_order] section; pick one",
-                        line_num
-                    );
-                }
-                roles_order_dag.get_or_insert_with(IndexMap::new);
-                context = Context::RolesOrder;
-                continue;
-            }
-            // `[env]` is a reserved section for top-level variables. It may
-            // repeat: each occurrence just switches back to variable context, so
-            // variables can be grouped near the services they describe.
-            if name == "env" {
-                context = Context::Env;
-                continue;
-            }
-            if let Some(canonical) = reserved_section_hint(name) {
-                bail!(
-                    "unknown section [{}] at line {}; did you mean [{}]?",
-                    name,
-                    line_num,
-                    canonical
-                );
-            }
-            if !is_valid_service_name(name) {
-                bail!(
-                    "invalid service name '{}' at line {}: service names are \
-                     lowercase letters, digits, and hyphens, starting with a letter \
-                     (they become container names, ${{name.property}} references, \
-                     and EPH_<NAME>_* variables)",
-                    name,
-                    line_num
-                );
-            }
-            if let Some(&existing) = index_by_name.get(name) {
-                bail!(
-                    "duplicate section [{}] at line {} (first defined at line {})",
-                    name,
-                    line_num,
-                    builders[existing].first_line
-                );
-            }
-            builders.push(ServiceBuilder {
-                name: name.to_string(),
-                first_line: line_num,
-                ..Default::default()
-            });
-            index_by_name.insert(name.to_string(), builders.len() - 1);
-            context = Context::Service(builders.len() - 1);
-            continue;
-        }
-
-        // Parse key=value
-        let Some((key, value)) = line.split_once('=') else {
-            bail!("invalid syntax at line {}: expected KEY=VALUE", line_num);
-        };
-
-        let key = key.trim();
-        let value = value.trim();
-
-        // Remove optional quotes from value
-        let value = strip_quotes(value);
-
-        match context {
-            // Inside `[roles_order]`, every line is a `role=dep1,dep2` edge (an
-            // empty value declares a root that depends on nothing).
-            Context::RolesOrder => {
-                let dag = roles_order_dag
-                    .as_mut()
-                    .expect("dag is initialized on entering [roles_order]");
-                if key.is_empty() {
-                    bail!("line {}: empty role name in [roles_order]", line_num);
-                }
-                if dag.contains_key(key) {
-                    bail!(
-                        "line {}: duplicate role '{}' in [roles_order]",
-                        line_num,
-                        key
-                    );
-                }
-                dag.insert(
-                    key.to_string(),
-                    split_role_dependencies(value, key, line_num)?,
-                );
-            }
-
-            // Top-of-file: bare variables, plus the linear `roles_order=` form.
-            Context::TopLevel if key == "roles_order" => {
-                if roles_order_dag.is_some() {
-                    bail!(
-                        "line {}: cannot use both a top-level `roles_order=` and a \
-                         [roles_order] section; pick one",
-                        line_num
-                    );
-                }
-                if roles_order_linear.is_some() {
-                    bail!("line {}: duplicate top-level `roles_order=`", line_num);
-                }
-                roles_order_linear = Some(split_roles_checked(value, line_num)?);
-            }
-
-            Context::TopLevel | Context::Env => {
-                if key == "roles_order" {
-                    // Only reachable in Context::Env thanks to the arm above.
-                    bail!(
-                        "line {}: `roles_order=` is reserved and cannot be declared \
-                         inside [env]; declare it above the first section",
-                        line_num
-                    );
-                }
-                if !is_valid_env_name(key) {
-                    bail!(
-                        "invalid environment variable name '{}' at line {}: names \
-                         are letters, digits, and underscores, not starting with a \
-                         digit (the shell rejects anything else at `eval` time)",
-                        key,
-                        line_num
-                    );
-                }
-                reject_reserved_env_name(key, line_num, "top-level environment")?;
-                if let Some(first) = env_lines.get(key) {
-                    bail!(
-                        "duplicate environment variable '{}' at line {} (first \
-                         defined at line {})",
-                        key,
-                        line_num,
-                        first
-                    );
-                }
-                scan_placeholders(value, line_num, &format!("the value of {}", key), &mut refs)?;
-                env_lines.insert(key.to_string(), line_num);
-                env_vars.push(EnvVar {
-                    name: key.to_string(),
-                    value: value.to_string(),
-                });
-            }
-
-            Context::Service(index) => {
-                let service = &mut builders[index];
-                parse_service_property(service, key, value, line_num, &mut refs)?;
-            }
-        }
+/// Parse a stack of `.eph` layers, lowest precedence first, into one
+/// effective [`EphFile`].
+///
+/// Each layer is checked for syntax on its own, then the layers are merged
+/// structurally (later layers override earlier ones) and the merged result is
+/// validated with exactly the rules [`parse`] applies to a single file.
+/// Sections match by name; properties within a section match by key, including
+/// named forms such as `port.http` and `env.DEBUG`; top-level variables match
+/// by name whether they sit above the first section or in `[env]`. An
+/// overriding key replaces the base value, and for repeatable keys such as
+/// `volume=` and the lifecycle hooks it replaces every base occurrence. New keys
+/// and sections are appended in the overriding layer's order.
+///
+/// The first layer must also be valid on its own, so an override can never
+/// mask an error in the base. Diagnostics name the layer each offending value
+/// came from.
+///
+/// # Errors
+///
+/// Returns an error if any layer is malformed, if the first layer is invalid
+/// on its own, or if the merged result breaks any rule listed under [`parse`].
+/// Returns an error for an empty `layers`.
+///
+/// # Examples
+///
+/// ```
+/// use eph::parser::{Layer, parse_layers};
+///
+/// # fn main() -> anyhow::Result<()> {
+/// let eph = parse_layers(&[
+///     Layer { name: ".eph", contents: "[db]\nimage=postgres:16\nport=5432\n" },
+///     Layer { name: ".eph.local", contents: "[db]\nport=6543\n" },
+/// ])?;
+/// assert_eq!(eph.services["db"].ports[0].container_port(), Some(6543));
+/// # Ok(())
+/// # }
+/// ```
+pub fn parse_layers(layers: &[Layer<'_>]) -> Result<EphFile> {
+    // The base file is committed and the overrides are per-checkout, so the
+    // base has to stand on its own: otherwise an override that happens to set
+    // the same key would hide an error (say, a duplicated `image=`) that every
+    // checkout without that override still hits.
+    if let [base, overrides @ ..] = layers
+        && !overrides.is_empty()
+    {
+        Document::lex(base.contents, Some(base.name))?
+            .build()
+            .with_context(|| {
+                format!(
+                    "{} must be valid on its own, without per-checkout overrides",
+                    base.name
+                )
+            })?;
     }
 
-    // Finalize each section into a concrete Service, rejecting any that never
-    // declared a source. This keeps the illegal "service with no source" state
-    // out of the returned EphFile entirely. `builders` is in declaration order,
-    // and inserting in that order makes `services` iterate the same way.
-    let mut services: IndexMap<String, Service> = IndexMap::with_capacity(builders.len());
-    for builder in builders {
-        let service = builder.finish()?;
-        services.insert(service.name.clone(), service);
+    let mut merged: Option<Document> = None;
+    for layer in layers {
+        let doc = Document::lex(layer.contents, Some(layer.name))?;
+        merged = Some(match merged {
+            Some(base) => base.merge(doc),
+            None => doc,
+        });
     }
-
-    // Every ${service.property} must name a defined service and a property that
-    // the service actually exposes. Checked after the whole file is read so
-    // forward references work without weakening the returned model.
-    for r in &refs {
-        validate_placeholder(r, &services)?;
-    }
-
-    // Collapse the two spellings into one graph: the linear form desugars into an
-    // adjacency list (each role depends on the one before it), the section form
-    // is already one. Then check the graph and the services agree before handing
-    // back an `EphFile`, so "roles mode" is either fully specified or absent.
-    let roles_order = match (roles_order_linear, roles_order_dag) {
-        (Some(linear), None) => Some(RolesOrder {
-            deps: desugar_linear_order(&linear),
-        }),
-        (None, Some(deps)) => Some(RolesOrder { deps }),
-        (None, None) => None,
-        // The parse loop rejects declaring both, so this pair cannot occur.
-        (Some(_), Some(_)) => unreachable!("both roles_order forms present"),
-    };
-    validate_roles(&services, roles_order.as_ref())?;
-
-    Ok(EphFile {
-        env_vars,
-        services,
-        roles_order,
-    })
+    merged.context("no configuration layers to parse")?.build()
 }
 
 /// Parse a non-empty comma-separated role list without discarding typo-shaped
 /// empty or duplicate segments.
-fn split_roles_checked(value: &str, line_num: usize) -> Result<Vec<String>> {
-    split_role_list(value, line_num, "roles_order", false)
+fn split_roles_checked(value: &str, loc: &Loc) -> Result<Vec<String>> {
+    split_role_list(value, loc, "roles_order", false)
 }
 
 /// Parse one `[roles_order]` dependency list. A wholly empty value declares a
 /// root role; commas still denote segments and therefore cannot be empty.
-fn split_role_dependencies(value: &str, role: &str, line_num: usize) -> Result<Vec<String>> {
+fn split_role_dependencies(value: &str, role: &str, loc: &Loc) -> Result<Vec<String>> {
     split_role_list(
         value,
-        line_num,
+        loc,
         &format!("dependencies of role '{}'", role),
         true,
     )
@@ -955,7 +1236,7 @@ fn split_role_dependencies(value: &str, role: &str, line_num: usize) -> Result<V
 
 fn split_role_list(
     value: &str,
-    line_num: usize,
+    loc: &Loc,
     context: &str,
     allow_empty_list: bool,
 ) -> Result<Vec<String>> {
@@ -963,22 +1244,17 @@ fn split_role_list(
         if allow_empty_list {
             return Ok(Vec::new());
         }
-        bail!("line {}: {} must list at least one role", line_num, context);
+        bail!("{}: {} must list at least one role", loc, context);
     }
 
     let mut roles = Vec::new();
     for segment in value.split(',') {
         let role = segment.trim();
         if role.is_empty() {
-            bail!("line {}: empty role in {}", line_num, context);
+            bail!("{}: empty role in {}", loc, context);
         }
         if roles.iter().any(|existing| existing == role) {
-            bail!(
-                "line {}: duplicate role '{}' in {}",
-                line_num,
-                role,
-                context
-            );
+            bail!("{}: duplicate role '{}' in {}", loc, role, context);
         }
         roles.push(role.to_string());
     }
@@ -1012,42 +1288,55 @@ fn desugar_linear_order(roles: &[String]) -> IndexMap<String, Vec<String>> {
 /// - every role in the graph has at least one service; and
 /// - the graph is acyclic.
 ///
-/// In legacy mode (no roles anywhere) there is nothing to check.
+/// In legacy mode (no roles anywhere) there is nothing to check. `service_locs`
+/// lines up with `services` and, like the graph's locations, lets each error
+/// cite both sides of a mismatch.
 fn validate_roles(
     services: &IndexMap<String, Service>,
-    roles_order: Option<&RolesOrder>,
+    service_locs: &[SectionLocs],
+    roles_order: Option<(&RolesOrder, &SectionLocs)>,
 ) -> Result<()> {
-    let any_role = services.values().any(|s| s.role.is_some());
-    let Some(order) = roles_order else {
+    let services_with_locs = || services.values().zip(service_locs);
+    let Some((order, order_locs)) = roles_order else {
         // No graph. Legal only if no service is tagged either.
-        if any_role {
+        if let Some((service, locs)) = services_with_locs().find(|(s, _)| s.role.is_some()) {
             bail!(
-                "services declare a `role=` but the file has no `roles_order`; add a \
-                 top-level `roles_order=...` or a [roles_order] section listing the roles"
+                "service '{}' declares a `role=` (at {}) but the file has no \
+                 `roles_order`; add a top-level `roles_order=...` or a [roles_order] \
+                 section listing the roles",
+                service.name,
+                locs.of("role")
             );
         }
         return Ok(());
     };
 
     if order.deps.is_empty() {
-        bail!("roles_order is empty; list at least one role");
+        bail!(
+            "roles_order (at {}) is empty; list at least one role",
+            order_locs.header
+        );
     }
 
     // Every service must be tagged, and with a role the graph knows.
-    for service in services.values() {
+    for (service, locs) in services_with_locs() {
         let Some(role) = &service.role else {
             bail!(
-                "service '{}' has no `role=`, but this file uses `roles_order`; every \
-                 service must declare a role when roles_order is set",
-                service.name
+                "service '{}' (at {}) has no `role=`, but this file uses `roles_order` \
+                 (at {}); every service must declare a role when roles_order is set",
+                service.name,
+                locs.header,
+                order_locs.header
             );
         };
         if !order.deps.contains_key(role) {
             bail!(
-                "service '{}' has role '{}', which is not listed in roles_order (known \
-                 roles: {})",
+                "service '{}' has role '{}' (at {}), which is not listed in roles_order \
+                 (at {}; known roles: {})",
                 service.name,
                 role,
+                locs.of("role"),
+                order_locs.header,
                 order.deps.keys().cloned().collect::<Vec<_>>().join(", ")
             );
         }
@@ -1059,9 +1348,10 @@ fn validate_roles(
         for dep in deps {
             if !order.deps.contains_key(dep) {
                 bail!(
-                    "roles_order: role '{}' depends on unknown role '{}'",
+                    "roles_order: role '{}' depends on unknown role '{}' (at {})",
                     role,
-                    dep
+                    dep,
+                    order_locs.of(role)
                 );
             }
         }
@@ -1070,8 +1360,9 @@ fn validate_roles(
             .any(|s| s.role.as_deref() == Some(role.as_str()))
         {
             bail!(
-                "roles_order lists role '{}', but no service declares it",
-                role
+                "roles_order lists role '{}' (at {}), but no service declares it",
+                role,
+                order_locs.of(role)
             );
         }
     }
@@ -1113,16 +1404,16 @@ pub(crate) fn is_valid_env_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn reject_reserved_env_name(name: &str, line_num: usize, context: &str) -> Result<()> {
+fn reject_reserved_env_name(name: &str, loc: &Loc, context: &str) -> Result<()> {
     if name
         .get(..4)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("EPH_"))
     {
         bail!(
-            "reserved environment variable '{}' in {} at line {}: EPH_* names are managed by eph",
+            "reserved environment variable '{}' in {} at {}: EPH_* names are managed by eph",
             name,
             context,
-            line_num
+            loc
         );
     }
     Ok(())
@@ -1171,7 +1462,7 @@ fn strip_quotes(s: &str) -> &str {
 /// messages.
 fn scan_placeholders(
     value: &str,
-    line: usize,
+    loc: &Loc,
     context: &str,
     refs: &mut Vec<PlaceholderRef>,
 ) -> Result<()> {
@@ -1185,10 +1476,10 @@ fn scan_placeholders(
         if let Some(tail) = rest.strip_prefix("${") {
             let Some(end) = tail.find('}') else {
                 bail!(
-                    "unterminated '${{' in {} at line {}; close it with '}}', or \
+                    "unterminated '${{' in {} at {}; close it with '}}', or \
                      write a literal '${{' as '$${{'",
                     context,
-                    line
+                    loc
                 );
             };
             let content = &tail[..end];
@@ -1197,17 +1488,17 @@ fn scan_placeholders(
                     refs.push(PlaceholderRef {
                         service: service.to_string(),
                         property: property.to_string(),
-                        line,
+                        loc: loc.clone(),
                         context: context.to_string(),
                     });
                 }
                 _ => bail!(
-                    "invalid interpolation '${{{}}}' in {} at line {}: expected \
+                    "invalid interpolation '${{{}}}' in {} at {}: expected \
                      ${{service.property}} (e.g. ${{postgres.port}}); write a \
                      literal '${{' as '$${{'",
                     content,
                     context,
-                    line
+                    loc
                 ),
             }
             i += 2 + end + 1;
@@ -1222,7 +1513,7 @@ fn scan_placeholders(
 /// ordinary shell parameter expansion such as `${PORT}` or `${HOME:-/tmp}`.
 fn scan_command_placeholders(
     value: &str,
-    line: usize,
+    loc: &Loc,
     context: &str,
     refs: &mut Vec<PlaceholderRef>,
 ) {
@@ -1245,7 +1536,7 @@ fn scan_command_placeholders(
                 refs.push(PlaceholderRef {
                     service: service.to_string(),
                     property: property.to_string(),
-                    line,
+                    loc: loc.clone(),
                     context: context.to_string(),
                 });
             }
@@ -1262,10 +1553,10 @@ fn validate_placeholder(
 ) -> Result<()> {
     let Some(service) = services.get(&reference.service) else {
         bail!(
-            "unknown service '{}' referenced from {} at line {} (known services: {})",
+            "unknown service '{}' referenced from {} at {} (known services: {})",
             reference.service,
             reference.context,
-            reference.line,
+            reference.loc,
             services.keys().cloned().collect::<Vec<_>>().join(", ")
         );
     };
@@ -1274,18 +1565,18 @@ fn validate_placeholder(
         "host" => Ok(()),
         "port" if service.ports.len() == 1 => Ok(()),
         "port" if service.ports.is_empty() => bail!(
-            "service '{}' exposes no ports, so '${{{}.port}}' in {} at line {} cannot resolve",
+            "service '{}' exposes no ports, so '${{{}.port}}' in {} at {} cannot resolve",
             reference.service,
             reference.service,
             reference.context,
-            reference.line
+            reference.loc
         ),
         "port" => bail!(
-            "service '{}' exposes multiple ports, so '${{{}.port}}' in {} at line {} is ambiguous; use one of: {}",
+            "service '{}' exposes multiple ports, so '${{{}.port}}' in {} at {} is ambiguous; use one of: {}",
             reference.service,
             reference.service,
             reference.context,
-            reference.line,
+            reference.loc,
             service
                 .ports
                 .iter()
@@ -1310,42 +1601,39 @@ fn validate_placeholder(
                     format!("known named ports: {}", known.join(", "))
                 };
                 bail!(
-                    "unknown port '{}' on service '{}' referenced from {} at line {} ({})",
+                    "unknown port '{}' on service '{}' referenced from {} at {} ({})",
                     name,
                     reference.service,
                     reference.context,
-                    reference.line,
+                    reference.loc,
                     suffix
                 )
             }
         }
         property => bail!(
-            "unknown interpolation property '{}' on service '{}' referenced from {} at line {}; expected host, port, or port.<name>",
+            "unknown interpolation property '{}' on service '{}' referenced from {} at {}; expected host, port, or port.<name>",
             property,
             reference.service,
             reference.context,
-            reference.line
+            reference.loc
         ),
     }
 }
 
 /// Parse a port value as either `auto` (`None`) or a non-zero fixed port.
-fn parse_port_value(value: &str, line_num: usize) -> Result<Option<NonZeroU16>> {
+fn parse_port_value(value: &str, loc: &Loc) -> Result<Option<NonZeroU16>> {
     if value.eq_ignore_ascii_case("auto") {
         return Ok(None);
     }
     let port: u16 = value
         .parse()
-        .with_context(|| format!("invalid port number at line {}", line_num))?;
-    NonZeroU16::new(port).map(Some).with_context(|| {
-        format!(
-            "invalid port number at line {}: port must be non-zero",
-            line_num
-        )
-    })
+        .with_context(|| format!("invalid port number at {}", loc))?;
+    NonZeroU16::new(port)
+        .map(Some)
+        .with_context(|| format!("invalid port number at {}: port must be non-zero", loc))
 }
 
-fn parse_compose_expose(value: &str, alias: &str, line_num: usize) -> Result<(String, NonZeroU16)> {
+fn parse_compose_expose(value: &str, alias: &str, loc: &Loc) -> Result<(String, NonZeroU16)> {
     let (service, port) = value
         .split_once(':')
         .map_or((alias, value), |(service, port)| {
@@ -1353,21 +1641,17 @@ fn parse_compose_expose(value: &str, alias: &str, line_num: usize) -> Result<(St
         });
     if !is_valid_compose_service_name(service) {
         bail!(
-            "invalid Compose service name '{}' in expose.{} at line {}",
+            "invalid Compose service name '{}' in expose.{} at {}",
             service,
             alias,
-            line_num
+            loc
         );
     }
     let port: u16 = port
         .parse()
-        .with_context(|| format!("invalid port number at line {}", line_num))?;
-    let port = NonZeroU16::new(port).with_context(|| {
-        format!(
-            "invalid port number at line {}: port must be non-zero",
-            line_num
-        )
-    })?;
+        .with_context(|| format!("invalid port number at {}", loc))?;
+    let port = NonZeroU16::new(port)
+        .with_context(|| format!("invalid port number at {}: port must be non-zero", loc))?;
     Ok((service.to_string(), port))
 }
 
@@ -1380,15 +1664,16 @@ fn set_once<T>(
     value: T,
     key: &str,
     service: &str,
-    line_num: usize,
+    loc: &Loc,
+    first: &Loc,
 ) -> Result<()> {
     if slot.is_some() {
         bail!(
-            "duplicate '{}' in service '{}' at line {}; it was already set earlier \
-             in the section",
+            "duplicate '{}' in service '{}' at {}; it was already set at {}",
             key,
             service,
-            line_num
+            loc,
+            first
         );
     }
     *slot = Some(value);
@@ -1397,14 +1682,19 @@ fn set_once<T>(
 
 /// Set a service's source, rejecting a second one whatever its spelling:
 /// `image=` twice, or `image=` plus `run=`, both leave the file's intent
-/// ambiguous.
-fn set_source(service: &mut ServiceBuilder, source: ServiceSource, line_num: usize) -> Result<()> {
-    if service.source.is_some() {
+/// ambiguous. After merging, the two may come from different layers, so the
+/// error names both.
+fn set_source(service: &mut ServiceBuilder, source: ServiceSource, loc: &Loc) -> Result<()> {
+    if let Some(existing) = &service.source {
+        let existing = source_key(existing);
         bail!(
-            "service '{}' declares more than one source at line {}; set exactly \
-             one of image/dockerfile/compose/run",
+            "service '{}' declares more than one source: `{}=` at {} and `{}=` at {}; \
+             set exactly one of image/dockerfile/compose/run",
             service.name,
-            line_num
+            existing,
+            service.locs.of(existing),
+            source_key(&source),
+            loc
         );
     }
     service.source = Some(source);
@@ -1415,7 +1705,7 @@ fn parse_service_property(
     service: &mut ServiceBuilder,
     key: &str,
     value: &str,
-    line_num: usize,
+    loc: &Loc,
     refs: &mut Vec<PlaceholderRef>,
 ) -> Result<()> {
     // Most properties are meaningless with an empty value, and an empty value
@@ -1442,28 +1732,25 @@ fn parse_service_property(
     );
     if needs_value && value.is_empty() {
         bail!(
-            "empty value for '{}' in service '{}' at line {}",
+            "empty value for '{}' in service '{}' at {}",
             key,
             service.name,
-            line_num
+            loc
         );
     }
 
+    service.locs.record(key, loc);
     match key {
-        "image" => set_source(service, ServiceSource::Image(value.to_string()), line_num)?,
-        "dockerfile" => set_source(
-            service,
-            ServiceSource::Dockerfile(value.to_string()),
-            line_num,
-        )?,
-        "compose" => set_source(service, ServiceSource::Compose(value.to_string()), line_num)?,
+        "image" => set_source(service, ServiceSource::Image(value.to_string()), loc)?,
+        "dockerfile" => set_source(service, ServiceSource::Dockerfile(value.to_string()), loc)?,
+        "compose" => set_source(service, ServiceSource::Compose(value.to_string()), loc)?,
         // Shell command to run (non-Docker)
-        "run" => set_source(service, ServiceSource::Command(value.to_string()), line_num)?,
+        "run" => set_source(service, ServiceSource::Command(value.to_string()), loc)?,
         // The role this service belongs to (see `Service::role`).
         "role" => {
             let v = value.to_string();
             let name = service.name.clone();
-            set_once(&mut service.role, v, key, &name, line_num)?;
+            set_once(&mut service.role, v, key, &name, loc, service.locs.of(key))?;
         }
         // Container command override (for use with image/dockerfile)
         "command" => {
@@ -1473,19 +1760,21 @@ fn parse_service_property(
                 v,
                 key,
                 &service.name,
-                line_num,
+                loc,
+                service.locs.of(key),
             )?;
         }
         "port" => {
-            if service.has_port_named(None) {
+            if let Some(first) = service.declared_port(None) {
                 bail!(
-                    "duplicate 'port' in service '{}' at line {}; name additional \
-                     ports with port.<name>=",
+                    "duplicate 'port' in service '{}' at {} (first declared at {}); \
+                     name additional ports with port.<name>=",
                     service.name,
-                    line_num
+                    loc,
+                    first
                 );
             }
-            let mapping = match parse_port_value(value, line_num)? {
+            let mapping = match parse_port_value(value, loc)? {
                 Some(port) => PortMapping::Fixed { name: None, port },
                 None => PortMapping::Auto { name: None },
             };
@@ -1515,44 +1804,50 @@ fn parse_service_property(
         "healthcheck" => {
             scan_command_placeholders(
                 value,
-                line_num,
+                loc,
                 &format!("healthcheck of service '{}'", service.name),
                 refs,
             );
             let v = value.to_string();
-            set_once(&mut service.healthcheck, v, key, &service.name, line_num)?;
+            set_once(
+                &mut service.healthcheck,
+                v,
+                key,
+                &service.name,
+                loc,
+                service.locs.of(key),
+            )?;
         }
         "ready-timeout" => {
             let secs: u64 = value
                 .parse()
-                .with_context(|| format!("invalid timeout at line {}", line_num))?;
+                .with_context(|| format!("invalid timeout at {}", loc))?;
             let secs = NonZeroU64::new(secs).with_context(|| {
-                format!(
-                    "invalid timeout at line {}: ready-timeout must be non-zero",
-                    line_num
-                )
+                format!("invalid timeout at {}: ready-timeout must be non-zero", loc)
             })?;
             set_once(
                 &mut service.ready_timeout_secs,
                 secs,
                 key,
                 &service.name,
-                line_num,
+                loc,
+                service.locs.of(key),
             )?;
         }
         key if key.starts_with("port.") => {
             let port_name = &key[5..];
-            validate_port_name(port_name, "port", &service.name, line_num)?;
-            if service.has_port_named(Some(port_name)) {
+            validate_port_name(port_name, "port", &service.name, loc)?;
+            if let Some(first) = service.declared_port(Some(port_name)) {
                 bail!(
-                    "duplicate 'port.{}' in service '{}' at line {}",
+                    "duplicate 'port.{}' in service '{}' at {} (first declared at {})",
                     port_name,
                     service.name,
-                    line_num
+                    loc,
+                    first
                 );
             }
             let name = Some(port_name.to_string());
-            let mapping = match parse_port_value(value, line_num)? {
+            let mapping = match parse_port_value(value, loc)? {
                 Some(port) => PortMapping::Fixed { name, port },
                 None => PortMapping::Auto { name },
             };
@@ -1563,29 +1858,29 @@ fn parse_service_property(
             if !is_valid_env_name(env_name) {
                 bail!(
                     "invalid environment variable name '{}' in 'env.{}' of service \
-                     '{}' at line {}",
+                     '{}' at {}",
                     env_name,
                     env_name,
                     service.name,
-                    line_num
+                    loc
                 );
             }
             reject_reserved_env_name(
                 env_name,
-                line_num,
+                loc,
                 &format!("service '{}' environment", service.name),
             )?;
             if service.env.contains_key(env_name) {
                 bail!(
-                    "duplicate 'env.{}' in service '{}' at line {}",
+                    "duplicate 'env.{}' in service '{}' at {}",
                     env_name,
                     service.name,
-                    line_num
+                    loc
                 );
             }
             scan_placeholders(
                 value,
-                line_num,
+                loc,
                 &format!("env.{} of service '{}'", env_name, service.name),
                 refs,
             )?;
@@ -1594,16 +1889,17 @@ fn parse_service_property(
         // For compose-based services, expose maps service ports
         key if key.starts_with("expose.") => {
             let port_name = &key[7..];
-            validate_port_name(port_name, "expose", &service.name, line_num)?;
-            if service.has_port_named(Some(port_name)) {
+            validate_port_name(port_name, "expose", &service.name, loc)?;
+            if let Some(first) = service.declared_port(Some(port_name)) {
                 bail!(
-                    "duplicate 'expose.{}' in service '{}' at line {}",
+                    "duplicate 'expose.{}' in service '{}' at {} (first declared at {})",
                     port_name,
                     service.name,
-                    line_num
+                    loc,
+                    first
                 );
             }
-            let (compose_service, port) = parse_compose_expose(value, port_name, line_num)?;
+            let (compose_service, port) = parse_compose_expose(value, port_name, loc)?;
             service.expose.push(PortMapping::Compose {
                 alias: port_name.to_string(),
                 service: compose_service,
@@ -1613,13 +1909,20 @@ fn parse_service_property(
         // Build context for Dockerfiles
         "context" => {
             let v = value.to_string();
-            set_once(&mut service.build_context, v, key, &service.name, line_num)?;
+            set_once(
+                &mut service.build_context,
+                v,
+                key,
+                &service.name,
+                loc,
+                service.locs.of(key),
+            )?;
         }
         "roles_order" => {
             bail!(
-                "'roles_order' at line {} must be declared at top level, above the \
+                "'roles_order' at {} must be declared at top level, above the \
                  first section, not inside service '{}'",
-                line_num,
+                loc,
                 service.name
             );
         }
@@ -1631,13 +1934,13 @@ fn parse_service_property(
             if is_valid_env_name(key) && key.chars().next().is_some_and(|c| c.is_ascii_uppercase())
             {
                 bail!(
-                    "'{}' at line {} looks like an environment variable, but it is \
+                    "'{}' at {} looks like an environment variable, but it is \
                      inside service '{}' (sections do not end at blank lines). To \
                      set it in the container, write env.{}=...; to export it from \
                      `eph env`, move it into an [env] section or above the first \
                      section",
                     key,
-                    line_num,
+                    loc,
                     service.name,
                     key
                 );
@@ -1651,9 +1954,9 @@ fn parse_service_property(
                 ""
             };
             bail!(
-                "unknown service property '{}' at line {} (known properties: {}){}",
+                "unknown service property '{}' at {} (known properties: {}){}",
                 key,
-                line_num,
+                loc,
                 KNOWN_PROPERTIES,
                 env_hint
             );
@@ -1665,23 +1968,23 @@ fn parse_service_property(
 /// Validate a `port.<name>`/`expose.<name>` port name: same shape as a service
 /// name (it becomes part of `${service.port.<name>}` and `EPH_<SVC>_PORT_<NAME>`),
 /// and never empty (a bare `port.=` is always an editing accident).
-fn validate_port_name(name: &str, kind: &str, service: &str, line_num: usize) -> Result<()> {
+fn validate_port_name(name: &str, kind: &str, service: &str, loc: &Loc) -> Result<()> {
     if name.is_empty() {
         bail!(
-            "empty port name in '{}.' of service '{}' at line {}; write {}.<name>=<port>",
+            "empty port name in '{}.' of service '{}' at {}; write {}.<name>=<port>",
             kind,
             service,
-            line_num,
+            loc,
             kind
         );
     }
     if !is_valid_service_name(name) {
         bail!(
-            "invalid port name '{}' in service '{}' at line {}: port names are \
+            "invalid port name '{}' in service '{}' at {}: port names are \
              lowercase letters, digits, and hyphens, starting with a letter",
             name,
             service,
-            line_num
+            loc
         );
     }
     Ok(())
@@ -2837,5 +3140,268 @@ port.api=5000
         );
         assert_eq!(out, "redis-host:redis-port/${db.port}");
         assert_eq!(unresolved, vec![("db".to_string(), "port".to_string())]);
+    }
+
+    // ------------------------------------------------------------------------
+    // Layered configuration (.eph + .eph.local)
+    // ------------------------------------------------------------------------
+
+    /// Parse a base `.eph` with a `.eph.local` merged over it.
+    fn layered(base: &str, local: &str) -> Result<EphFile> {
+        parse_layers(&[
+            Layer {
+                name: ".eph",
+                contents: base,
+            },
+            Layer {
+                name: ".eph.local",
+                contents: local,
+            },
+        ])
+    }
+
+    fn layered_err(base: &str, local: &str) -> String {
+        format!("{:#}", layered(base, local).unwrap_err())
+    }
+
+    fn env_pairs(eph: &EphFile) -> Vec<(&str, &str)> {
+        eph.env_vars
+            .iter()
+            .map(|v| (v.name.as_str(), v.value.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_base_layer_alone_parses_like_a_single_file() {
+        let base = "A=1\n[db]\nimage=postgres:16\nport=5432\npost-start=migrate\n[env]\nB=2\n";
+        let only_base = parse_layers(&[Layer {
+            name: ".eph",
+            contents: base,
+        }])
+        .unwrap();
+        assert_eq!(only_base, parse(base).unwrap());
+        assert!(parse_layers(&[]).is_err());
+    }
+
+    #[test]
+    fn an_empty_local_layer_changes_nothing() {
+        let base = "A=1\n[db]\nimage=postgres:16\nport=5432\n";
+        assert_eq!(
+            layered(base, "# nothing here\n").unwrap(),
+            parse(base).unwrap()
+        );
+    }
+
+    /// The example from the feature request: keep, replace, add, add a
+    /// section, and replace a variable. The base alone is invalid (`port=auto`
+    /// on an image service), which shows that only the merged result is
+    /// validated.
+    #[test]
+    fn local_layer_replaces_adds_and_appends() {
+        let base = "[postgres]\nimage=postgres:16-alpine\nport=5433\n\n[env]\nLOG_LEVEL=info\n";
+        let local = "[postgres]\nport=5432\nvolume=./local-seed:/docker-entrypoint-initdb.d\n\n\
+                     [mailpit]\nimage=axllent/mailpit:latest\nport=8025\n\n[env]\nLOG_LEVEL=debug\n";
+
+        let eph = layered(base, local).unwrap();
+        let postgres = &eph.services["postgres"];
+        assert_eq!(
+            postgres.source,
+            ServiceSource::Image("postgres:16-alpine".into())
+        );
+        assert_eq!(postgres.ports.len(), 1);
+        assert_eq!(postgres.ports[0].container_port(), Some(5432));
+        assert_eq!(
+            postgres.volumes,
+            vec!["./local-seed:/docker-entrypoint-initdb.d"]
+        );
+        assert_eq!(
+            eph.services.keys().collect::<Vec<_>>(),
+            vec!["postgres", "mailpit"]
+        );
+        assert_eq!(env_pairs(&eph), vec![("LOG_LEVEL", "debug")]);
+    }
+
+    #[test]
+    fn top_level_and_env_section_variables_share_one_namespace() {
+        // A top-of-file variable is replaced from an [env] section and vice
+        // versa; replacements keep the base position, new names append.
+        let base = "A=1\nB=2\n[db]\nimage=postgres:16\n[env]\nC=3\n";
+        let local = "D=4\nC=30\n[env]\nA=10\n";
+        let eph = layered(base, local).unwrap();
+        assert_eq!(
+            env_pairs(&eph),
+            vec![("A", "10"), ("B", "2"), ("C", "30"), ("D", "4")]
+        );
+    }
+
+    #[test]
+    fn named_properties_match_by_their_full_key() {
+        let base = "[web]\nrun=serve\nport.http=8080\nport.admin=9090\nenv.DEBUG=0\nenv.KEEP=yes\n";
+        let local = "[web]\nport.http=8081\nport.metrics=9100\nenv.DEBUG=1\nenv.NEW=added\n";
+        let web = &layered(base, local).unwrap().services["web"];
+        let ports: Vec<(&str, Option<u16>)> = web
+            .ports
+            .iter()
+            .map(|p| (p.runtime_name(), p.container_port()))
+            .collect();
+        assert_eq!(
+            ports,
+            vec![
+                ("http", Some(8081)),
+                ("admin", Some(9090)),
+                ("metrics", Some(9100))
+            ]
+        );
+        assert_eq!(web.env["DEBUG"], "1");
+        assert_eq!(web.env["KEEP"], "yes");
+        assert_eq!(web.env["NEW"], "added");
+    }
+
+    #[test]
+    fn repeatable_keys_are_replaced_as_a_whole_list() {
+        let base = "[db]\nimage=postgres:16\nvolume=a:/a\nvolume=b:/b\n\
+                    post-start=one\npost-start=two\npre-stop=stop\n";
+        // The override sets volume= once and post-start= twice, and leaves
+        // pre-stop= alone.
+        let local = "[db]\nvolume=c:/c\npost-start=three\npost-start=four\n";
+        let db = &layered(base, local).unwrap().services["db"];
+        assert_eq!(db.volumes, vec!["c:/c"]);
+        assert_eq!(db.post_start, vec!["three", "four"]);
+        assert_eq!(db.pre_stop, vec!["stop"]);
+    }
+
+    #[test]
+    fn merged_order_is_deterministic() {
+        // Sections: base order, then override-only sections in override order.
+        let base = "[a]\nimage=a\n[b]\nimage=b\n[c]\nimage=c\n";
+        let local = "[e]\nimage=e\n[b]\nimage=b2\n[d]\nimage=d\n";
+        let eph = layered(base, local).unwrap();
+        assert_eq!(
+            eph.services.keys().collect::<Vec<_>>(),
+            vec!["a", "b", "c", "e", "d"]
+        );
+        assert_eq!(eph.services["b"].source, ServiceSource::Image("b2".into()));
+        // The same merge twice gives the same result.
+        assert_eq!(eph, layered(base, local).unwrap());
+    }
+
+    #[test]
+    fn roles_order_merges_by_role() {
+        let base = "[roles_order]\ndep=\napp=dep\n\n[db]\nimage=postgres:16\nrole=dep\n\
+                    [web]\nrun=serve\nrole=app\n";
+        // A new tier between them, with a service for it.
+        let local = "[roles_order]\ncache=dep\napp=cache\n\n[redis]\nimage=redis:7\nrole=cache\n";
+        let eph = layered(base, local).unwrap();
+        assert_eq!(eph.start_order(), vec!["db", "redis", "web"]);
+    }
+
+    #[test]
+    fn a_duplicate_source_across_layers_names_both_files() {
+        let msg = layered_err(
+            "[db]\nimage=postgres:16\n",
+            "\n[db]\nrun=postgres -D data\n",
+        );
+        assert!(msg.contains("more than one source"), "got: {msg}");
+        assert!(msg.contains("`image=` at line 2 of .eph"), "got: {msg}");
+        assert!(msg.contains("`run=` at line 3 of .eph.local"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_property_incompatible_with_the_base_source_names_both_files() {
+        let msg = layered_err("[web]\nrun=serve\n", "[web]\nvolume=./data:/data\n");
+        assert!(msg.contains("volume="), "got: {msg}");
+        assert!(
+            msg.contains("`volume=` at line 2 of .eph.local"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("`run=` at line 2 of .eph"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_port_name_collision_across_layers_names_both_files() {
+        let msg = layered_err(
+            "[web]\nrun=serve\nport=8080\n",
+            "[web]\nport.default=8081\n",
+        );
+        assert!(msg.contains("duplicate 'port.default'"), "got: {msg}");
+        assert!(msg.contains("line 2 of .eph.local"), "got: {msg}");
+        assert!(
+            msg.contains("first declared at line 3 of .eph"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_override_service_missing_a_role_names_both_files() {
+        let base = "roles_order=dep\n[db]\nimage=postgres:16\nrole=dep\n";
+        let msg = layered_err(base, "[mailpit]\nimage=axllent/mailpit\n");
+        assert!(msg.contains("'mailpit'"), "got: {msg}");
+        assert!(msg.contains("line 1 of .eph.local"), "got: {msg}");
+        assert!(msg.contains("line 1 of .eph)"), "got: {msg}");
+    }
+
+    #[test]
+    fn mixing_roles_order_forms_across_layers_names_both_files() {
+        let base = "roles_order=dep\n[db]\nimage=postgres:16\nrole=dep\n";
+        let msg = layered_err(base, "[roles_order]\ndep=\n");
+        assert!(msg.contains("cannot use both"), "got: {msg}");
+        assert!(msg.contains("line 1 of .eph)"), "got: {msg}");
+        assert!(msg.contains("line 1 of .eph.local"), "got: {msg}");
+    }
+
+    #[test]
+    fn errors_inside_the_local_layer_point_at_it() {
+        let base = "[db]\nimage=postgres:16\n";
+        // Syntax.
+        let msg = layered_err(base, "[db]\nnot a key value\n");
+        assert!(msg.contains("line 2 of .eph.local"), "got: {msg}");
+        // A duplicate within the override itself is still a duplicate.
+        let msg = layered_err(base, "[db]\nhealthcheck=a\nhealthcheck=b\n");
+        assert!(msg.contains("duplicate 'healthcheck'"), "got: {msg}");
+        assert!(
+            msg.contains("line 3 of .eph.local") && msg.contains("line 2 of .eph.local"),
+            "got: {msg}"
+        );
+        let msg = layered_err(base, "X=1\n[env]\nX=2\n");
+        assert!(
+            msg.contains("duplicate environment variable 'X' at line 3 of .eph.local"),
+            "got: {msg}"
+        );
+        // A bad reference.
+        let msg = layered_err(base, "[env]\nURL=${dbb.port}\n");
+        assert!(msg.contains("unknown service 'dbb'"), "got: {msg}");
+        assert!(msg.contains("line 2 of .eph.local"), "got: {msg}");
+        // An override-only section must be a complete service.
+        let msg = layered_err(base, "[mailpit]\nport=8025\n");
+        assert!(msg.contains("no source"), "got: {msg}");
+        assert!(msg.contains("line 1 of .eph.local"), "got: {msg}");
+    }
+
+    /// `.eph.local` is per-checkout, so it must not hide an error in the
+    /// committed `.eph` that every other checkout still hits, even when it sets
+    /// the very key the base got wrong.
+    #[test]
+    fn an_override_cannot_mask_an_error_in_the_base() {
+        let msg = layered_err(
+            "[db]\nimage=postgres:15\nimage=postgres:16\n",
+            "[db]\nimage=postgres:17\n",
+        );
+        assert!(msg.contains(".eph must be valid on its own"), "got: {msg}");
+        assert!(msg.contains("line 3 of .eph"), "got: {msg}");
+
+        let msg = layered_err("A=1\nA=2\n[db]\nimage=postgres:16\n", "A=3\n");
+        assert!(
+            msg.contains("duplicate environment variable 'A'"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn errors_inside_the_base_layer_point_at_it() {
+        let msg = layered_err("[db]\nimage=postgres:16\nbogus=1\n", "[db]\nport=5432\n");
+        assert!(
+            msg.contains("unknown service property 'bogus' at line 3 of .eph "),
+            "got: {msg}"
+        );
     }
 }
