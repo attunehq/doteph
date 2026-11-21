@@ -3,7 +3,7 @@
 # Triggered on pull requests, main pushes, manual dry runs, and version tags
 # (v*). Builds binaries for all supported platforms in parallel: native macOS
 # and linux-gnu-x64, plus cross-compiled linux-arm64, musl, and windows targets
-# via cargo-cross. eph is pure Rust (bollard talks to Docker over a unix socket
+# via cross-rs `cross`. eph is pure Rust (bollard talks to Docker over a unix socket
 # or a Windows named pipe, with no TLS), so every target cross-compiles with no
 # system dependencies.
 #
@@ -142,11 +142,14 @@ jobs:
                   rustup toolchain install stable
                   rustup target add ${{ matrix.target }}
 
-            - name: Install cargo-cross
+            # cross-rs `cross` builds inside its published Docker images, which
+            # carry each target's linker. (zijiren233's cargo-cross, used before,
+            # downloaded linkers from a GitHub repo that has since been deleted.)
+            - name: Install cross
               if: matrix.cross
               uses: taiki-e/install-action@v2
               with:
-                  tool: cargo-cross
+                  tool: cross
                   checksum: true
 
             - name: Setup Rust cache
@@ -158,12 +161,14 @@ jobs:
 
             # Inject the resolved version so the binary's `--version` matches the
             # tag without relying on git being present inside cross containers.
-            - name: Build with cargo cross
+            # cross only forwards host variables it is told to pass through.
+            - name: Build with cross
               if: matrix.cross
               env:
                   EPH_VERSION: ${{ needs.prepare.outputs.tag }}
+                  CROSS_BUILD_ENV_PASSTHROUGH: EPH_VERSION
                   TARGET: ${{ matrix.target }}
-              run: cargo cross build --target "$TARGET" --release --locked
+              run: cross build --target "$TARGET" --release --locked
 
             - name: Build native
               if: ${{ !matrix.cross }}
