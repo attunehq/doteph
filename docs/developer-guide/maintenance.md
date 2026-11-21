@@ -82,9 +82,10 @@ Upgrade aggressively. Stale dependencies are a bigger long-run risk than new
 ones.
 
 - **Compatible updates:** `cargo update`, verify, one PR.
-- **Major updates:** list them with
-  `cargo +nightly -Zunstable-options update --breaking --dry-run`, then
-  upgrade each by editing `Cargo.toml`. Read the changelog and adapt the code.
+- **Major updates:** list them with `cargo upgrade --incompatible --dry-run`
+  (from [cargo-edit](https://github.com/killercup/cargo-edit); cargo's own
+  unstable `update --breaking` is gone from current nightlies), then upgrade
+  each by editing `Cargo.toml`. Read the changelog and adapt the code.
   Keep the existing requirement style (`"1"`, `"0.21"`); `Cargo.lock` holds the
   exact version.
 - **bollard** is eph's Docker client. On a major upgrade, check the changelog
