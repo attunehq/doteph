@@ -16,6 +16,9 @@ see the [User Guide](../user-guide/README.md) instead.
    parser, workspace resolution, lifecycle manager, process control, state,
    environment rendering, pruning, bundled skills, and updates. Start here to
    find where a change belongs.
+4. [Maintenance](maintenance.md): the policy for the daily agent run that
+   keeps the toolchain and dependencies current, triages issues, and ships
+   routine fixes, and what it escalates.
 
 See also [CONTRIBUTING.md](../../CONTRIBUTING.md) at the repo root for working
 style, pull-request expectations, and the release process.

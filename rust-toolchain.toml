@@ -1,0 +1,8 @@
+# Pinned so Rust upgrades land as deliberate PRs (with any new clippy lints
+# fixed in the same change) instead of breaking unrelated PRs when stable moves.
+# The daily maintenance run bumps this, and `rust-version` in Cargo.toml, to
+# each new stable release; see docs/developer-guide/maintenance.md.
+[toolchain]
+channel = "1.100.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

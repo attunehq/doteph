@@ -12,10 +12,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Installs the toolchain pinned in rust-toolchain.toml.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        run: rustup toolchain install
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -42,10 +41,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Installs the toolchain pinned in rust-toolchain.toml.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+        run: rustup toolchain install
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -73,8 +71,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      # Installs the toolchain pinned in rust-toolchain.toml.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
