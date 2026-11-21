@@ -133,7 +133,10 @@ enum Commands {
         ///
         /// Repeatable; each value is a glob relative to the workspace root, with
         /// gitignore-style separators (`*` stays within a directory, `**` spans
-        /// them): `--watch "**/*.rs" --watch "*.toml"`. On a change eph tears the
+        /// them): `--watch "**/*.rs" --watch "*.toml"`. A leading `!` excludes
+        /// matching paths and the last matching pattern wins, as in `.gitignore`:
+        /// `--watch '**/*.go' --watch '!**/*_templ.go'` skips generated files (a
+        /// leading `\!` matches a literal `!`). On a change eph tears the
         /// stack down (pre-stop hooks and all) and brings it back up (post-start
         /// hooks and all), so a restart is a full `eph down` + `eph dev`, not a
         /// bare process bounce. Without `--watch` the stack never restarts.

@@ -407,7 +407,7 @@ gate, is in [Running Your App](run-your-app.md#eph-dev-the-foreground-loop).
 | Flag | Description |
 |------|-------------|
 | `--clean` | On the final stop, tear the whole workspace down with `eph clean` (drops named volumes and their data) instead of the default `eph down`. |
-| `--watch GLOB` | Restart the stack when a file matching GLOB changes. Repeatable; globs are relative to the workspace root with gitignore-style separators. |
+| `--watch GLOB` | Restart the stack when a file matching GLOB changes. Repeatable; globs are relative to the workspace root with gitignore-style separators. A leading `!` excludes matching paths, and the last matching pattern wins (`\!` matches a literal leading `!`). |
 | `--skip-hooks` | Bring the stack up and tear it down without running any lifecycle hooks, matching `eph up --skip-hooks` / `eph down --skip-hooks` together. |
 
 ```sh
@@ -416,6 +416,7 @@ eph dev web          # foreground a specific run= service by name
 eph dev --clean      # full reset on the final stop
 eph dev --skip-hooks # bring up and tear down with no lifecycle hooks
 eph dev --watch "**/*.rs" --watch "*.toml"   # restart on source changes
+eph dev --watch '**/*.go' --watch '!**/*_templ.go'   # ...but not on generated files
 ```
 
 Behavior:
@@ -443,6 +444,10 @@ Behavior:
   hooks finish, so a watching preview cannot go live before seeding is done.
 - A `--watch` restart is a full down and up (all hooks fire, volumes always
   kept); changes are debounced, and churn under `.git` is ignored.
+- `--watch` patterns are ordered rules, as in `.gitignore`: a pattern starting
+  with `!` excludes the paths it matches, the last pattern that matches a path
+  decides, and a later positive pattern re-includes. An empty pattern, a bare
+  `!`, or a list of only `!` patterns is an error.
 
 ## `eph status`
 

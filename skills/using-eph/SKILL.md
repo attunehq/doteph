@@ -396,7 +396,10 @@ foreground, most notably `eph logs -f`. Commands that return on their own
 - With no SERVICE the sole `run=` service is foregrounded; `eph dev <service>`
   picks one when the `.eph` defines several.
 - `--watch <glob>` is repeatable. It restarts the services `eph dev` started
-  when a matching workspace-relative path changes. A restart runs the full
+  when a matching workspace-relative path changes. A leading `!` excludes, and
+  the last matching pattern wins: `--watch '**/*.go' --watch '!**/*_templ.go'`
+  keeps generated files from causing restart loops. Single-quote `!` patterns;
+  a list of only `!` patterns is an error. A restart runs the full
   stop/start hook sequence, keeps named volumes, ignores `.git`, and leaves
   adopted prewarmed services running.
 - In watch mode an app crash leaves the session waiting for a matching change;

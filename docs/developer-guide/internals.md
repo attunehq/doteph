@@ -268,8 +268,9 @@ Role flags select whole dependency or dependent closures. Positional service
 selection in roles mode selects only that service from its own role, plus whole
 dependency roles for `up` or dependent roles for `down`.
 
-`watch.rs` normalizes paths relative to the workspace, ignores `.git`, filters
-configured globs, and coalesces filesystem bursts for `eph dev --watch`.
+`watch.rs` normalizes paths relative to the workspace, ignores `.git`, applies
+the configured patterns as ordered include and `!` exclude rules (the last
+matching pattern wins), and coalesces filesystem bursts for `eph dev --watch`.
 
 ## Tests
 
