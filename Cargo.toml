@@ -22,7 +22,7 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1"
 bollard = "0.21"
 clap = { version = "4", features = ["derive"] }
-dirs = "6"
+dirs = "7"
 # Canonicalizing a workspace path with std on Windows yields the extended-length
 # `\\?\C:\...` form. Docker's Windows volume parser rejects that as a bind-mount
 # source, and it also leaks into display output. dunce::canonicalize returns a
