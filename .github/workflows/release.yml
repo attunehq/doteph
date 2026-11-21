@@ -141,7 +141,8 @@ jobs:
 
             - name: Install Rust toolchain
               run: |
-                  rustup toolchain install stable
+                  # Installs the toolchain pinned in rust-toolchain.toml.
+                  rustup toolchain install
                   rustup target add ${{ matrix.target }}
 
             - name: Install MinGW linker

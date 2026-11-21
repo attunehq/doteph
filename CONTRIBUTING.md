@@ -11,8 +11,13 @@ the short version: setup, working style, and the PR/release process.
 
 ## Local Setup
 
-Install Rust (stable), Git, and Docker. Docker must be running for the
-integration tests.
+Install Rust with [rustup](https://rustup.rs), Git, and Docker. The Rust
+version is pinned in `rust-toolchain.toml`, and rustup installs it on the first
+`cargo` command. Docker must be running for the integration tests.
+
+Routine upkeep (toolchain and dependency upgrades, issue triage, small fixes)
+is done by a daily agent run; see
+[Maintenance](docs/developer-guide/maintenance.md).
 
 ```sh
 git clone https://github.com/attunehq/doteph.git

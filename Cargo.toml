@@ -11,7 +11,10 @@ authors = ["Jessica Black <me@jessica.black>"]
 repository = "https://github.com/attunehq/doteph"
 homepage = "https://github.com/attunehq/doteph"
 readme = "README.md"
-rust-version = "1.88"
+# Tracks the toolchain pinned in rust-toolchain.toml, so the minimum is the
+# version CI actually tests, and cargo's MSRV-aware resolver never holds a
+# dependency back for a Rust version eph does not build with.
+rust-version = "1.100"
 keywords = ["docker", "services", "dotenv", "workspace", "devtools"]
 categories = ["command-line-utilities", "development-tools"]
 

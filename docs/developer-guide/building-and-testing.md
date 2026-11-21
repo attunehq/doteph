@@ -2,8 +2,11 @@
 
 ## Toolchain
 
-- **Rust** (stable) for building. The crate targets edition 2024 and a
-  minimum Rust version of 1.88 (see `Cargo.toml`).
+- **Rust** via [rustup](https://rustup.rs). The exact version is pinned in
+  `rust-toolchain.toml`, and rustup installs it on the first `cargo` command
+  in the repo. The crate targets edition 2024, and `rust-version` in
+  `Cargo.toml` tracks the pin. New Rust releases arrive as their own PR from
+  the [daily maintenance run](maintenance.md).
 - **Rust nightly** for formatting only (`make format` runs
   `cargo +nightly fmt`).
 - **Git**.
