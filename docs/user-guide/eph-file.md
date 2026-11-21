@@ -750,7 +750,9 @@ replace and add.
 
 ### Validation and precedence
 
-Only the merged result is validated, with every rule on this page. An override
+`.eph` must be valid on its own, because it is what every other checkout
+(and CI) loads without your override: `.eph.local` cannot hide an error in it.
+The merged result is then validated with every rule on this page. An override
 may replace a value, but it cannot leave an illegal state behind: setting
 `run=` in `.eph.local` for a service whose `.eph` declares `image=` gives that
 service two sources, which is an error. Duplicates *within* one file are still

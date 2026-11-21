@@ -385,7 +385,8 @@ async fn current_valid_eph_wins_and_invalid_eph_falls_back_to_saved_hooks() {
     assert_success("fallback-source prune", &fallback_prune);
     let stdout = String::from_utf8_lossy(&fallback_prune.stdout);
     assert!(
-        stdout.contains("could not load current configuration") && stdout.contains("saved teardown snapshot"),
+        stdout.contains("could not load current configuration")
+            && stdout.contains("saved teardown snapshot"),
         "fallback should be visible in warnings: {stdout}"
     );
     assert_eq!(

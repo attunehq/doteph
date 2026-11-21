@@ -686,7 +686,8 @@ impl Document {
         for section in overlay.sections {
             match self.sections.iter_mut().find(|s| s.name == section.name) {
                 Some(base) => {
-                    base.entries = merge_entries(std::mem::take(&mut base.entries), section.entries);
+                    base.entries =
+                        merge_entries(std::mem::take(&mut base.entries), section.entries);
                 }
                 None => self.sections.push(section),
             }
@@ -827,7 +828,10 @@ impl Document {
 fn merge_entries(base: Vec<Entry>, overlay: Vec<Entry>) -> Vec<Entry> {
     let mut replacements: IndexMap<String, Vec<Entry>> = IndexMap::new();
     for entry in overlay {
-        replacements.entry(entry.key.clone()).or_default().push(entry);
+        replacements
+            .entry(entry.key.clone())
+            .or_default()
+            .push(entry);
     }
     let mut merged = Vec::with_capacity(base.len());
     for entry in base {
@@ -1160,12 +1164,15 @@ pub struct Layer<'a> {
 /// `volume=` and the lifecycle hooks it replaces every base occurrence. New keys
 /// and sections are appended in the overriding layer's order.
 ///
-/// Diagnostics name the layer each offending value came from.
+/// The first layer must also be valid on its own, so an override can never
+/// mask an error in the base. Diagnostics name the layer each offending value
+/// came from.
 ///
 /// # Errors
 ///
-/// Returns an error if any layer is malformed, or if the merged result breaks
-/// any rule listed under [`parse`]. Returns an error for an empty `layers`.
+/// Returns an error if any layer is malformed, if the first layer is invalid
+/// on its own, or if the merged result breaks any rule listed under [`parse`].
+/// Returns an error for an empty `layers`.
 ///
 /// # Examples
 ///
@@ -1182,6 +1189,23 @@ pub struct Layer<'a> {
 /// # }
 /// ```
 pub fn parse_layers(layers: &[Layer<'_>]) -> Result<EphFile> {
+    // The base file is committed and the overrides are per-checkout, so the
+    // base has to stand on its own: otherwise an override that happens to set
+    // the same key would hide an error (say, a duplicated `image=`) that every
+    // checkout without that override still hits.
+    if let [base, overrides @ ..] = layers
+        && !overrides.is_empty()
+    {
+        Document::lex(base.contents, Some(base.name))?
+            .build()
+            .with_context(|| {
+                format!(
+                    "{} must be valid on its own, without per-checkout overrides",
+                    base.name
+                )
+            })?;
+    }
+
     let mut merged: Option<Document> = None;
     for layer in layers {
         let doc = Document::lex(layer.contents, Some(layer.name))?;
@@ -1190,9 +1214,7 @@ pub fn parse_layers(layers: &[Layer<'_>]) -> Result<EphFile> {
             None => doc,
         });
     }
-    merged
-        .context("no configuration layers to parse")?
-        .build()
+    merged.context("no configuration layers to parse")?.build()
 }
 
 /// Parse a non-empty comma-separated role list without discarding typo-shaped
@@ -1606,12 +1628,9 @@ fn parse_port_value(value: &str, loc: &Loc) -> Result<Option<NonZeroU16>> {
     let port: u16 = value
         .parse()
         .with_context(|| format!("invalid port number at {}", loc))?;
-    NonZeroU16::new(port).map(Some).with_context(|| {
-        format!(
-            "invalid port number at {}: port must be non-zero",
-            loc
-        )
-    })
+    NonZeroU16::new(port)
+        .map(Some)
+        .with_context(|| format!("invalid port number at {}: port must be non-zero", loc))
 }
 
 fn parse_compose_expose(value: &str, alias: &str, loc: &Loc) -> Result<(String, NonZeroU16)> {
@@ -1631,12 +1650,8 @@ fn parse_compose_expose(value: &str, alias: &str, loc: &Loc) -> Result<(String, 
     let port: u16 = port
         .parse()
         .with_context(|| format!("invalid port number at {}", loc))?;
-    let port = NonZeroU16::new(port).with_context(|| {
-        format!(
-            "invalid port number at {}: port must be non-zero",
-            loc
-        )
-    })?;
+    let port = NonZeroU16::new(port)
+        .with_context(|| format!("invalid port number at {}: port must be non-zero", loc))?;
     Ok((service.to_string(), port))
 }
 
@@ -1727,11 +1742,7 @@ fn parse_service_property(
     service.locs.record(key, loc);
     match key {
         "image" => set_source(service, ServiceSource::Image(value.to_string()), loc)?,
-        "dockerfile" => set_source(
-            service,
-            ServiceSource::Dockerfile(value.to_string()),
-            loc,
-        )?,
+        "dockerfile" => set_source(service, ServiceSource::Dockerfile(value.to_string()), loc)?,
         "compose" => set_source(service, ServiceSource::Compose(value.to_string()), loc)?,
         // Shell command to run (non-Docker)
         "run" => set_source(service, ServiceSource::Command(value.to_string()), loc)?,
@@ -1812,10 +1823,7 @@ fn parse_service_property(
                 .parse()
                 .with_context(|| format!("invalid timeout at {}", loc))?;
             let secs = NonZeroU64::new(secs).with_context(|| {
-                format!(
-                    "invalid timeout at {}: ready-timeout must be non-zero",
-                    loc
-                )
+                format!("invalid timeout at {}: ready-timeout must be non-zero", loc)
             })?;
             set_once(
                 &mut service.ready_timeout_secs,
@@ -3190,10 +3198,9 @@ port.api=5000
     /// validated.
     #[test]
     fn local_layer_replaces_adds_and_appends() {
-        let base = "[postgres]\nimage=postgres:16-alpine\nport=auto\n\n[env]\nLOG_LEVEL=info\n";
+        let base = "[postgres]\nimage=postgres:16-alpine\nport=5433\n\n[env]\nLOG_LEVEL=info\n";
         let local = "[postgres]\nport=5432\nvolume=./local-seed:/docker-entrypoint-initdb.d\n\n\
                      [mailpit]\nimage=axllent/mailpit:latest\nport=8025\n\n[env]\nLOG_LEVEL=debug\n";
-        assert!(parse(base).is_err(), "base alone should be invalid");
 
         let eph = layered(base, local).unwrap();
         let postgres = &eph.services["postgres"];
@@ -3290,7 +3297,10 @@ port.api=5000
 
     #[test]
     fn a_duplicate_source_across_layers_names_both_files() {
-        let msg = layered_err("[db]\nimage=postgres:16\n", "\n[db]\nrun=postgres -D data\n");
+        let msg = layered_err(
+            "[db]\nimage=postgres:16\n",
+            "\n[db]\nrun=postgres -D data\n",
+        );
         assert!(msg.contains("more than one source"), "got: {msg}");
         assert!(msg.contains("`image=` at line 2 of .eph"), "got: {msg}");
         assert!(msg.contains("`run=` at line 3 of .eph.local"), "got: {msg}");
@@ -3300,7 +3310,10 @@ port.api=5000
     fn a_property_incompatible_with_the_base_source_names_both_files() {
         let msg = layered_err("[web]\nrun=serve\n", "[web]\nvolume=./data:/data\n");
         assert!(msg.contains("volume="), "got: {msg}");
-        assert!(msg.contains("`volume=` at line 2 of .eph.local"), "got: {msg}");
+        assert!(
+            msg.contains("`volume=` at line 2 of .eph.local"),
+            "got: {msg}"
+        );
         assert!(msg.contains("`run=` at line 2 of .eph"), "got: {msg}");
     }
 
@@ -3312,7 +3325,10 @@ port.api=5000
         );
         assert!(msg.contains("duplicate 'port.default'"), "got: {msg}");
         assert!(msg.contains("line 2 of .eph.local"), "got: {msg}");
-        assert!(msg.contains("first declared at line 3 of .eph"), "got: {msg}");
+        assert!(
+            msg.contains("first declared at line 3 of .eph"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -3361,9 +3377,31 @@ port.api=5000
         assert!(msg.contains("line 1 of .eph.local"), "got: {msg}");
     }
 
+    /// `.eph.local` is per-checkout, so it must not hide an error in the
+    /// committed `.eph` that every other checkout still hits, even when it sets
+    /// the very key the base got wrong.
+    #[test]
+    fn an_override_cannot_mask_an_error_in_the_base() {
+        let msg = layered_err(
+            "[db]\nimage=postgres:15\nimage=postgres:16\n",
+            "[db]\nimage=postgres:17\n",
+        );
+        assert!(msg.contains(".eph must be valid on its own"), "got: {msg}");
+        assert!(msg.contains("line 3 of .eph"), "got: {msg}");
+
+        let msg = layered_err("A=1\nA=2\n[db]\nimage=postgres:16\n", "A=3\n");
+        assert!(
+            msg.contains("duplicate environment variable 'A'"),
+            "got: {msg}"
+        );
+    }
+
     #[test]
     fn errors_inside_the_base_layer_point_at_it() {
         let msg = layered_err("[db]\nimage=postgres:16\nbogus=1\n", "[db]\nport=5432\n");
-        assert!(msg.contains("unknown service property 'bogus' at line 3 of .eph "), "got: {msg}");
+        assert!(
+            msg.contains("unknown service property 'bogus' at line 3 of .eph "),
+            "got: {msg}"
+        );
     }
 }

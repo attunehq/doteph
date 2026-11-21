@@ -8,9 +8,9 @@ use crate::git::{self, MergeStatus};
 use crate::hooks::{
     CleanupKind, HookWorkspace, TeardownHookService, TeardownHookSnapshot, run_hook,
 };
-use crate::workspace;
 use crate::proc;
 use crate::service::{Backend, RunningService, ServiceState, WorkspaceLock};
+use crate::workspace;
 use crate::workspace::{WORKSPACE_METADATA_FILE, WorkspaceMetadata, state_root};
 use anyhow::{Context, Result};
 use bollard::Docker;
@@ -2264,7 +2264,11 @@ mod tests {
         assert_eq!(report.warnings.len(), 1);
         let warning = &report.warnings[0];
         assert_eq!(warning.short_id, metadata.short_id);
-        assert!(warning.message.contains("could not load current configuration"));
+        assert!(
+            warning
+                .message
+                .contains("could not load current configuration")
+        );
         assert!(warning.message.contains("no saved hook snapshot"));
         assert!(
             !warning
