@@ -22,7 +22,7 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1"
 bollard = "0.21"
 clap = { version = "4", features = ["derive"] }
-dirs = "6"
+dirs = "7"
 # Canonicalizing a workspace path with std on Windows yields the extended-length
 # `\\?\C:\...` form. Docker's Windows volume parser rejects that as a bind-mount
 # source, and it also leaks into display output. dunce::canonicalize returns a
@@ -72,7 +72,7 @@ socket2 = "0.6"
 # Native PID liveness + termination so `run=` services work without a POSIX
 # `kill` (Windows has none). Only the process-inspection surface is needed, so
 # the default features (disks, network, components, users) are turned off.
-sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 # `eph update` stages the downloaded binary in a temp file before self-replace
 # swaps it over the running executable, and unit tests build throwaway archives.
 tempfile = "3"
