@@ -45,7 +45,7 @@ futures-util = "0.3"
 globset = "0.4"
 hex = "0.4"
 indexmap = { version = "2", features = ["serde"] }
-notify = "8"
+notify = "9"
 # `eph update` swaps the running binary for a freshly downloaded release. A live
 # executable cannot simply be overwritten on Windows; self-replace encapsulates
 # the platform split (an atomic rename on Unix, the move-aside-and-clean-up dance
