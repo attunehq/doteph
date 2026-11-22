@@ -6,7 +6,8 @@ order: 3
 
 # The `.eph` File
 
-The `.eph` file is the entire configuration for a workspace (plus an optional,
+The `.eph` file is the entire configuration for a workspace (plus optional
+[platform overrides](#platform-overrides) such as `.eph.windows` and an optional,
 uncommitted [`.eph.local`](#local-overrides-ephlocal) override). It extends `.env`
 syntax with INI-style `[sections]` for services; a plain `.env` file is already
 a valid `.eph` file, and you add services on top. This page is the complete
@@ -752,7 +753,9 @@ replace and add.
 
 `.eph` must be valid on its own, because it is what every other checkout
 (and CI) loads without your override: `.eph.local` cannot hide an error in it.
-The merged result is then validated with every rule on this page. An override
+(With [platform overrides](#platform-overrides), the rule covers the committed
+files together: `.eph` merged with this host's platform files must be valid
+without `.eph.local`.) The merged result is then validated with every rule on this page. An override
 may replace a value, but it cannot leave an illegal state behind: setting
 `run=` in `.eph.local` for a service whose `.eph` declares `image=` gives that
 service two sources, which is an error. Duplicates *within* one file are still
@@ -768,6 +771,83 @@ On its own it does not make a directory a workspace, and an `.eph.local` in a
 subdirectory is ignored. When both files exist, `.eph.local` takes precedence.
 `eph info` lists the layers it loaded, base first, and `eph check` names the
 override it merged.
+
+## Platform overrides
+
+A shared `.eph` sometimes needs different host commands, paths, or settings on
+Windows, Linux, and macOS, or on different CPU architectures. Rather than
+keeping full copies per platform, commit the differences in optional platform
+override files next to the `.eph`. eph merges the ones for the host it is
+running on, with the same [merge rules](#merge-rules) as `.eph.local`, before
+validating, interpolating, or planning anything.
+
+The file names follow Docker's platform components, `os[/arch[/variant]]`, with
+each `/` written as `.`, and use Docker's names: `darwin` for macOS, `amd64`
+for x86-64, `arm64` for 64-bit ARM.
+
+| Host | Files eph loads, in order |
+| --- | --- |
+| Linux, x86-64 | `.eph.linux`, `.eph.linux.amd64` |
+| Linux, 64-bit ARM | `.eph.linux`, `.eph.linux.arm64`, `.eph.linux.arm64.v8` |
+| macOS, Apple silicon | `.eph.darwin`, `.eph.darwin.arm64`, `.eph.darwin.arm64.v8` |
+| macOS, Intel | `.eph.darwin`, `.eph.darwin.amd64` |
+| Windows, x86-64 | `.eph.windows`, `.eph.windows.amd64` |
+
+Every level is optional; a missing file is skipped. An OS-wide file holds what
+all of that OS's machines share, and narrower files hold what differs by
+architecture. A variant file is loaded only when eph knows the variant for
+certain: `arm64` is always `v8` (Docker normalizes it the same way), and eph does
+not guess one for `amd64`. `eph info` prints the detected platform as `Host
+platform: linux/arm64/v8`.
+
+The platform describes the machine running eph, as eph was built for it (an
+x86-64 eph under Rosetta on an Apple silicon Mac reports `darwin/amd64`). It does
+not come from the Docker daemon, and it does not choose the platform of any
+container image; to pin an image's platform, use the image's own tag or digest.
+
+Committed `.eph`:
+
+```ini
+[api]
+run=./scripts/serve.sh
+port=auto
+
+[postgres]
+image=postgres:16-alpine
+port=5432
+```
+
+Committed `.eph.windows`:
+
+```ini
+[api]
+run=scripts\serve.cmd
+```
+
+On Windows, `api` runs `scripts\serve.cmd`; everywhere else it runs
+`./scripts/serve.sh`.
+
+### Precedence
+
+From lowest to highest, later files win:
+
+1. `.eph`
+2. `.eph.<os>`
+3. `.eph.<os>.<arch>`
+4. `.eph.<os>.<arch>.<variant>`, when the variant is known
+5. `.eph.local`
+
+Platform overrides are committed with the project, so unlike `.eph.local` they
+are merged *before* the stack is validated: `.eph` may leave something for them
+to fill in, such as a service whose `run=` differs per OS and so lives only in
+the platform files. Validation then runs on the merged result for the host. A
+`.eph` that only works with a platform file fails on any platform without one,
+so give every platform you support its file, or keep a working default in
+`.eph`.
+
+Like `.eph.local`, platform files are read only from the directory that holds
+the discovered `.eph`, and on their own they do not make a directory a
+workspace.
 
 ## Complete example
 

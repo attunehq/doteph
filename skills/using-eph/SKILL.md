@@ -18,8 +18,9 @@ tear them down when the task is complete.
 
 A workspace is any directory with a `.eph` file (eph searches upward from the
 current directory, like git). An optional `.eph.local` beside it is a
-per-checkout override merged over `.eph` by every command; it never makes a
-workspace on its own.
+per-checkout override merged over `.eph` by every command, and committed
+platform overrides (`.eph.windows`, `.eph.linux.arm64`, ...) merge in between on
+matching hosts; none of them makes a workspace on its own.
 
 ```sh
 test -f .eph && echo "this project uses eph"
@@ -144,6 +145,15 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
   source error; errors name the file (`line 3 of .eph.local`). `eph info` lists
   the loaded layers. Put machine-specific or secret values there instead of
   editing a committed `.eph`, and do not commit or print it.
+- **Platform overrides are committed per-OS/arch layers.** Docker platform
+  names with `.` for `/`: `.eph.<os>`, `.eph.<os>.<arch>`,
+  `.eph.<os>.<arch>.<variant>` (`darwin` for macOS, `amd64`, `arm64`; `arm64` is
+  always variant `v8`). Precedence: `.eph` < OS < arch < variant < `.eph.local`,
+  same merge rules. They merge before validation, so `.eph` may leave a per-OS
+  `run=` to them; `.eph.local` still cannot mask an error in the committed
+  stack. `eph info` prints `Host platform:`; the host is the machine running
+  eph, not a container image platform. To change behavior for one OS, edit its
+  platform file rather than adding conditionals to `.eph`.
 - `volume=name:/path` is a per-workspace named volume; `healthcheck` for an image
   service runs with no shell (whitespace-split, `docker exec`); the lifecycle
   hooks run on the host via `sh -c` with eph's resolved environment injected (see

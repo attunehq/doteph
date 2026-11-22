@@ -5,6 +5,7 @@
 //! don't conflict with each other.
 
 use crate::parser::{self, EphFile, Layer};
+use crate::platform::HostPlatform;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,11 +19,6 @@ pub const EPH_FILE: &str = ".eph";
 /// The optional per-checkout override merged over [`EPH_FILE`]. It never makes
 /// a directory a workspace on its own.
 pub const LOCAL_EPH_FILE: &str = ".eph.local";
-
-/// The optional layers merged over [`EPH_FILE`], lowest precedence first. A
-/// platform-specific override would slot in ahead of `.eph.local`, which keeps
-/// final precedence.
-const OVERRIDE_FILES: &[&str] = &[LOCAL_EPH_FILE];
 
 pub(crate) const WORKSPACE_METADATA_FILE: &str = "workspace.json";
 const WORKSPACE_METADATA_SCHEMA: u32 = 1;
@@ -336,14 +332,32 @@ impl Workspace {
     }
 }
 
-/// The configuration files a workspace at `dir` loads, lowest precedence first:
-/// always the base `.eph`, then each optional override that exists.
+/// The configuration files a workspace at `dir` loads on this host, lowest
+/// precedence first. See [`config_layers_for`].
 #[must_use]
 pub fn config_layers(dir: &Path) -> Vec<PathBuf> {
+    config_layers_for(dir, &HostPlatform::current())
+}
+
+/// The configuration files a workspace at `dir` loads on `platform`, lowest
+/// precedence first: always the base `.eph`, then each optional override that
+/// exists, in this order:
+///
+/// 1. `.eph.<os>`, such as `.eph.linux`
+/// 2. `.eph.<os>.<arch>`, such as `.eph.linux.arm64`
+/// 3. `.eph.<os>.<arch>.<variant>`, such as `.eph.linux.arm64.v8`, when the
+///    variant is known
+/// 4. `.eph.local`
+///
+/// See [`HostPlatform::override_files`] for how the platform names are spelled.
+#[must_use]
+pub fn config_layers_for(dir: &Path, platform: &HostPlatform) -> Vec<PathBuf> {
     let mut layers = vec![dir.join(EPH_FILE)];
     layers.extend(
-        OVERRIDE_FILES
-            .iter()
+        platform
+            .override_files()
+            .into_iter()
+            .chain([LOCAL_EPH_FILE.to_string()])
             .map(|name| dir.join(name))
             .filter(|path| path.exists()),
     );
@@ -373,7 +387,11 @@ pub fn load_config(dir: &Path) -> Result<EphFile> {
     }
     let layers: Vec<Layer<'_>> = files
         .iter()
-        .map(|(name, contents)| Layer { name, contents })
+        .map(|(name, contents)| Layer {
+            name,
+            contents,
+            per_checkout: name == LOCAL_EPH_FILE,
+        })
         .collect();
     parser::parse_layers(&layers).with_context(|| {
         // "failed to parse /repo/.eph" or "... /repo/.eph merged with .eph.local";
@@ -487,6 +505,80 @@ fn current_unix_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write `names` (all empty) into a fresh directory.
+    fn dir_with(names: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for name in names {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        dir
+    }
+
+    fn layer_names(dir: &Path, platform: &HostPlatform) -> Vec<String> {
+        config_layers_for(dir, platform)
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// With every candidate present, precedence runs base, OS, architecture,
+    /// variant, then `.eph.local`, whatever order the files were created in;
+    /// other platforms' files are never loaded.
+    #[test]
+    fn config_layers_run_from_base_through_platform_to_local() {
+        let dir = dir_with(&[
+            ".eph.local",
+            ".eph.linux.arm64.v8",
+            ".eph.linux.arm64",
+            ".eph.linux",
+            ".eph",
+            ".eph.linux.amd64",
+            ".eph.windows",
+            ".eph.windows.amd64",
+            ".eph.darwin",
+        ]);
+        assert_eq!(
+            layer_names(dir.path(), &HostPlatform::from_rust("linux", "aarch64")),
+            [
+                ".eph",
+                ".eph.linux",
+                ".eph.linux.arm64",
+                ".eph.linux.arm64.v8",
+                ".eph.local"
+            ]
+        );
+        assert_eq!(
+            layer_names(dir.path(), &HostPlatform::from_rust("linux", "x86_64")),
+            [".eph", ".eph.linux", ".eph.linux.amd64", ".eph.local"]
+        );
+        assert_eq!(
+            layer_names(dir.path(), &HostPlatform::from_rust("windows", "x86_64")),
+            [".eph", ".eph.windows", ".eph.windows.amd64", ".eph.local"]
+        );
+        assert_eq!(
+            layer_names(dir.path(), &HostPlatform::from_rust("macos", "aarch64")),
+            [".eph", ".eph.darwin", ".eph.local"]
+        );
+    }
+
+    /// Missing override files are skipped, so any one level can be used alone.
+    #[test]
+    fn config_layers_skip_missing_overrides() {
+        let linux_arm = HostPlatform::from_rust("linux", "aarch64");
+        let dir = dir_with(&[".eph"]);
+        assert_eq!(layer_names(dir.path(), &linux_arm), [".eph"]);
+        let dir = dir_with(&[".eph", ".eph.linux.arm64.v8"]);
+        assert_eq!(
+            layer_names(dir.path(), &linux_arm),
+            [".eph", ".eph.linux.arm64.v8"]
+        );
+        let dir = dir_with(&[".eph", ".eph.linux.arm64"]);
+        assert_eq!(
+            layer_names(dir.path(), &linux_arm),
+            [".eph", ".eph.linux.arm64"]
+        );
+    }
 
     /// Serializes the `EPH_STATE_ROOT` tests below: `std::env::set_var` mutates
     /// process-wide state, and `cargo test` runs tests concurrently, so two of
