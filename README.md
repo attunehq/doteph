@@ -128,8 +128,8 @@ same pages are readable in-repo:
 
 ## License
 
-`eph` is licensed under the [MIT License](LICENSE), Copyright (c) 2026
-Attune, Inc.
+`eph` is licensed under the [Apache License, Version 2.0](LICENSE),
+Copyright (c) 2026 Attune, Inc.
 
 The repository also vendors third-party Rust coding-guidance skills under
 [`.agents/skills/`](.agents/skills/) (notably the MIT-licensed
