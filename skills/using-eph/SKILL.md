@@ -134,6 +134,15 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
   use `env.KEY=` inside its section.
 - Environment variable names beginning with `EPH_`, in any letter case, are
   reserved for eph metadata and rejected in every environment scope.
+- **`env-file=.env` imports a `.env` file's variables** (above the first
+  section or in `[env]`, repeatable, path relative to `.eph`). Each imported
+  file sits beneath the file that imports it: the `.eph`'s own variables win,
+  later imports win over earlier ones, and the order is `.eph`'s imports,
+  `.eph`, `.eph.local`'s imports, `.eph.local`. A missing file is an error, so
+  import gitignored files (`.env.local`) from `.eph.local`. Imported files hold
+  only variables (optional `export ` prefix), and eph rejects lines dotenv
+  loaders read differently: an unquoted ` #`, multi-line values, backslashes in
+  double quotes, and `${OTHER_VAR}` references.
 - **`.eph.local` overrides `.eph`.** It is gitignored, may hold secrets, and is
   merged key by key before validation: sections match by name, properties by
   key (`port.http`, `env.DEBUG` are distinct keys), top-level variables by name

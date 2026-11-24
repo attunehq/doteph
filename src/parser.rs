@@ -32,6 +32,15 @@
 //! have to guess whether the key was a service property or a variable. The
 //! old parser guessed (any unknown `SCREAMING_SNAKE_CASE` key silently ended
 //! the section); this one refuses and tells you where the variable belongs.
+//!
+//! # Env files
+//!
+//! A top-level `env-file=PATH` line imports the variables of a `.env` file.
+//! Each imported file is a lower-precedence layer beneath the file that
+//! imports it, so the importing file's own variables win, and a later import
+//! wins over an earlier one. The parser never touches the filesystem: callers
+//! of [`parse_layers`] supply a reader that turns a path, as written, into the
+//! file's contents.
 
 use anyhow::{Context as _, Result, bail};
 use indexmap::IndexMap;
@@ -69,6 +78,21 @@ pub struct EphFile {
     /// service role is a node, every node has at least one service, every edge
     /// points at a known role, no cycles).
     pub roles_order: Option<RolesOrder>,
+    /// The `env-file=` imports whose variables are part of
+    /// [`env_vars`](Self::env_vars), in precedence order (lowest first).
+    pub env_files: Vec<EnvFileImport>,
+}
+
+/// One `env-file=` line: a `.env` file whose variables were imported.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EnvFileImport {
+    /// The path as written, relative to the directory holding the `.eph`.
+    pub path: String,
+    /// The configuration file that declared the import (e.g. `.eph.local`),
+    /// when the configuration was loaded from named layers.
+    pub declared_in: Option<String>,
+    /// The line of the `env-file=` declaration.
+    pub line: usize,
 }
 
 /// The role dependency graph for a `.eph` file in "roles mode".
@@ -477,6 +501,12 @@ const KNOWN_PROPERTIES: &str = "image, dockerfile, compose, run, role, command, 
 /// `[roles_order]` section.
 const ROLES_ORDER: &str = "roles_order";
 
+/// The top-level key that imports a `.env` file. It is deliberately not a
+/// legal variable name, so it can never collide with a variable, and an eph
+/// release that predates it rejects the line instead of silently treating it
+/// as a variable and dropping the file's contents.
+const ENV_FILE: &str = "env-file";
+
 /// Where a value was written: a line, plus the file it came from when the
 /// configuration was loaded from named layers (see [`parse_layers`]).
 ///
@@ -523,6 +553,7 @@ impl SectionLocs {
 }
 
 /// One `KEY=VALUE` line, trimmed and with optional quotes stripped.
+#[derive(Clone)]
 struct Entry {
     key: String,
     value: String,
@@ -530,6 +561,7 @@ struct Entry {
 }
 
 /// A `[name]` section and its entries, in declaration order.
+#[derive(Clone)]
 struct Section {
     name: String,
     header: Loc,
@@ -543,7 +575,7 @@ struct Section {
 /// result is validated ([`Document::build`]), so a single file and a stack of
 /// layers go through exactly the same rules, and an override can never produce
 /// a state a single file could not.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Document {
     /// Top-level variables: the top-of-file block and every `[env]` section
     /// share one namespace, in declaration order.
@@ -551,6 +583,10 @@ struct Document {
     /// Top-level `roles_order=` lines (the linear form). More than one is an
     /// error, reported once the layers are merged.
     roles_order: Vec<Entry>,
+    /// `env-file=` lines, in precedence order (lowest first). Each layer's are
+    /// expanded into variables by [`expand_env_files`] before layers merge, so
+    /// these are kept only to report which files were imported.
+    env_files: Vec<Entry>,
     /// Service sections and the `[roles_order]` section, in declaration order.
     /// Each name appears at most once.
     sections: Vec<Section>,
@@ -661,6 +697,10 @@ impl Document {
             match context {
                 // Top-of-file: bare variables, plus the linear `roles_order=` form.
                 Context::TopLevel if entry.key == ROLES_ORDER => doc.roles_order.push(entry),
+                // `env-file=` imports go wherever variables go.
+                Context::TopLevel | Context::Env if entry.key == ENV_FILE => {
+                    doc.env_files.push(entry);
+                }
                 Context::Env if entry.key == ROLES_ORDER => bail!(
                     "{}: `roles_order=` is reserved and cannot be declared inside \
                      [env]; declare it above the first section",
@@ -683,6 +723,8 @@ impl Document {
     fn merge(mut self, overlay: Self) -> Self {
         self.env = merge_entries(self.env, overlay.env);
         self.roles_order = merge_entries(self.roles_order, overlay.roles_order);
+        // Imports are not overridden: every layer's imports apply, beneath it.
+        self.env_files.extend(overlay.env_files);
         for section in overlay.sections {
             match self.sections.iter_mut().find(|s| s.name == section.name) {
                 Some(base) => {
@@ -809,11 +851,178 @@ impl Document {
             roles.as_ref().map(|(order, locs)| (order, locs)),
         )?;
 
+        let env_files = self
+            .env_files
+            .into_iter()
+            .map(|entry| EnvFileImport {
+                path: entry.value,
+                declared_in: entry.loc.file.as_deref().map(str::to_string),
+                line: entry.loc.line,
+            })
+            .collect();
+
         Ok(EphFile {
             env_vars,
             services,
             roles_order: roles.map(|(order, _)| order),
+            env_files,
         })
+    }
+}
+
+/// Reads the contents of an env file, given its path exactly as written in an
+/// `env-file=` line. Callers resolve the path (relative to the workspace).
+pub type EnvFileReader<'r> = dyn FnMut(&str) -> Result<String> + 'r;
+
+/// Replace one layer's `env-file=` lines with the variables they import:
+/// each imported file becomes a layer beneath `doc`, in declaration order, so
+/// `doc`'s own variables win over every import and a later import wins over an
+/// earlier one.
+fn expand_env_files(doc: Document, read: &mut EnvFileReader<'_>) -> Result<Document> {
+    let mut expanded = Document::default();
+    for entry in &doc.env_files {
+        if entry.value.is_empty() {
+            bail!(
+                "{}: empty `env-file=`; give the path of a .env file, relative to \
+                 the directory holding the .eph file",
+                entry.loc
+            );
+        }
+        let contents = read(&entry.value)
+            .with_context(|| format!("{}: cannot read env file '{}'", entry.loc, entry.value))?;
+        let env = lex_env_file(&contents, &entry.value)?;
+        expanded = expanded.merge(Document {
+            env,
+            ..Document::default()
+        });
+    }
+    Ok(expanded.merge(doc))
+}
+
+/// Lex an imported env file: `KEY=VALUE` lines, comments, and blank lines,
+/// with an optional leading `export `.
+///
+/// Anything beyond variables (sections, nested `env-file=`) is rejected, and
+/// so is anything a dotenv loader would read differently from eph, because an
+/// env file usually has a second reader (the app's own dotenv library) and the
+/// two must agree on every value. See [`env_file_value`]. Duplicate names are
+/// rejected here, per file, because a later layer that sets the same name
+/// would otherwise hide the duplicate.
+fn lex_env_file(input: &str, name: &str) -> Result<Vec<Entry>> {
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
+    let file: Rc<str> = Rc::from(name);
+    let mut entries = Vec::new();
+    let mut seen: HashMap<String, Loc> = HashMap::new();
+    for (index, line) in input.lines().enumerate() {
+        let loc = Loc {
+            file: Some(file.clone()),
+            line: index + 1,
+        };
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            bail!(
+                "{}: env files hold only variables, but found the section header \
+                 {}; services belong in the .eph file",
+                loc,
+                line
+            );
+        }
+        let line = line
+            .strip_prefix("export")
+            .filter(|rest| rest.starts_with([' ', '\t']))
+            .map_or(line, str::trim_start);
+        let Some((key, raw)) = line.split_once('=') else {
+            bail!("invalid syntax at {}: expected KEY=VALUE", loc);
+        };
+        let key = key.trim();
+        if key == ENV_FILE {
+            bail!(
+                "{}: env files cannot import other env files; declare every \
+                 `env-file=` in .eph or .eph.local",
+                loc
+            );
+        }
+        let value = env_file_value(raw.trim(), &loc)?;
+        scan_placeholders(value, &loc, &format!("the value of {key}"), &mut Vec::new()).map_err(
+            |err| {
+                anyhow::anyhow!(
+                    "{err}. Env files use the same ${{service.property}} \
+                     interpolation as .eph; eph does not expand references to \
+                     other variables the way some dotenv loaders do"
+                )
+            },
+        )?;
+        if let Some(first) = seen.insert(key.to_string(), loc.clone()) {
+            bail!(
+                "duplicate environment variable '{}' at {} (first defined at {})",
+                key,
+                loc,
+                first
+            );
+        }
+        entries.push(Entry {
+            key: key.to_string(),
+            value: value.to_string(),
+            loc,
+        });
+    }
+    Ok(entries)
+}
+
+/// The value of one env file line, with optional quotes stripped, or an error
+/// when dotenv loaders and eph would disagree about it.
+///
+/// eph's value rules are simpler than any dotenv dialect, so a value is only
+/// accepted when every common loader reads it the same way eph does:
+///
+/// - a quoted value must be one matching pair of quotes with nothing after
+///   it (no multi-line values, no trailing comment);
+/// - a double-quoted value may not contain a backslash, since loaders differ on
+///   escape sequences such as `\n` (single quotes are literal everywhere);
+/// - an unquoted value may not contain whitespace followed by `#`, which
+///   loaders strip as a trailing comment but eph would keep.
+fn env_file_value<'v>(raw: &'v str, loc: &Loc) -> Result<&'v str> {
+    match raw.chars().next() {
+        Some(quote @ ('"' | '\'')) => {
+            let value = strip_quotes(raw);
+            if value.len() == raw.len() {
+                bail!(
+                    "{}: the {} quote opening this value is not closed at the end \
+                     of the line; env files take one value per line, so multi-line \
+                     values and text after the closing quote (such as a comment) \
+                     are not supported",
+                    loc,
+                    if quote == '"' { "double" } else { "single" }
+                );
+            }
+            if quote == '"' && value.contains('\\') {
+                bail!(
+                    "{}: backslash in a double-quoted value; dotenv loaders disagree \
+                     on escape sequences like \\n, so eph does not guess. Use single \
+                     quotes for a literal value",
+                    loc
+                );
+            }
+            Ok(value)
+        }
+        _ => {
+            if raw
+                .char_indices()
+                .any(|(i, c)| c == '#' && raw[..i].ends_with([' ', '\t']))
+            {
+                bail!(
+                    "{}: ' #' in an unquoted value; dotenv loaders read it as the \
+                     start of a comment, but eph would keep it as part of the value. \
+                     Quote the value to keep the '#', or move the comment to its own \
+                     line",
+                    loc
+                );
+            }
+            Ok(raw)
+        }
     }
 }
 
@@ -1109,6 +1318,8 @@ fn port_key(port: &PortMapping) -> String {
 ///   exactly one port
 /// - a section declares no source (no `image`/`dockerfile`/`compose`/`run`)
 /// - a property is incompatible with its service source
+/// - the file declares an `env-file=` import: a bare string has no directory
+///   to resolve the path against, so imports need [`parse_layers`]
 ///
 /// # Examples
 ///
@@ -1139,7 +1350,11 @@ fn port_key(port: &PortMapping) -> String {
 /// assert!(eph::parser::parse("[redis]\nport=6379\n").is_err());
 /// ```
 pub fn parse(input: &str) -> Result<EphFile> {
-    Document::lex(input, None)?.build()
+    let doc = Document::lex(input, None)?;
+    expand_env_files(doc, &mut |_: &str| {
+        bail!("env files need a workspace directory to resolve paths against")
+    })?
+    .build()
 }
 
 /// One named configuration file in a layered workspace configuration.
@@ -1164,15 +1379,22 @@ pub struct Layer<'a> {
 /// `volume=` and the lifecycle hooks it replaces every base occurrence. New keys
 /// and sections are appended in the overriding layer's order.
 ///
-/// The first layer must also be valid on its own, so an override can never
-/// mask an error in the base. Diagnostics name the layer each offending value
-/// came from.
+/// Each layer's `env-file=` imports are read through `read_env_file`, which
+/// receives the path exactly as written. Every imported file becomes a layer
+/// directly beneath the layer that imports it, so the full precedence order
+/// (lowest first) is: the base's imports, the base, the first override's
+/// imports, the first override, and so on.
+///
+/// The first layer, with its imports, must also be valid on its own, so an
+/// override can never mask an error in the base. Diagnostics name the layer
+/// each offending value came from.
 ///
 /// # Errors
 ///
-/// Returns an error if any layer is malformed, if the first layer is invalid
-/// on its own, or if the merged result breaks any rule listed under [`parse`].
-/// Returns an error for an empty `layers`.
+/// Returns an error if any layer or imported file is malformed or cannot be
+/// read, if the first layer is invalid on its own, or if the merged result
+/// breaks any rule listed under [`parse`]. Returns an error for an empty
+/// `layers`.
 ///
 /// # Examples
 ///
@@ -1180,40 +1402,50 @@ pub struct Layer<'a> {
 /// use eph::parser::{Layer, parse_layers};
 ///
 /// # fn main() -> anyhow::Result<()> {
-/// let eph = parse_layers(&[
-///     Layer { name: ".eph", contents: "[db]\nimage=postgres:16\nport=5432\n" },
-///     Layer { name: ".eph.local", contents: "[db]\nport=6543\n" },
-/// ])?;
+/// let eph = parse_layers(
+///     &[
+///         Layer { name: ".eph", contents: "env-file=.env\n[db]\nimage=postgres:16\nport=5432\n" },
+///         Layer { name: ".eph.local", contents: "[db]\nport=6543\n" },
+///     ],
+///     &mut |path: &str| {
+///         assert_eq!(path, ".env");
+///         Ok("APP_ENV=development\n".to_string())
+///     },
+/// )?;
 /// assert_eq!(eph.services["db"].ports[0].container_port(), Some(6543));
+/// assert_eq!(eph.env_vars[0].name, "APP_ENV");
 /// # Ok(())
 /// # }
 /// ```
-pub fn parse_layers(layers: &[Layer<'_>]) -> Result<EphFile> {
-    // The base file is committed and the overrides are per-checkout, so the
-    // base has to stand on its own: otherwise an override that happens to set
-    // the same key would hide an error (say, a duplicated `image=`) that every
-    // checkout without that override still hits.
-    if let [base, overrides @ ..] = layers
-        && !overrides.is_empty()
-    {
-        Document::lex(base.contents, Some(base.name))?
-            .build()
-            .with_context(|| {
-                format!(
-                    "{base} must be valid on its own, because other checkouts and \
-                     CI load it without {local}: fix it in {base}, and use {local} \
-                     only to override values that already work",
-                    base = base.name,
-                    local = overrides[0].name
-                )
-            })?;
-    }
-
+pub fn parse_layers(
+    layers: &[Layer<'_>],
+    read_env_file: &mut EnvFileReader<'_>,
+) -> Result<EphFile> {
     let mut merged: Option<Document> = None;
     for layer in layers {
-        let doc = Document::lex(layer.contents, Some(layer.name))?;
+        let doc = expand_env_files(
+            Document::lex(layer.contents, Some(layer.name))?,
+            read_env_file,
+        )?;
         merged = Some(match merged {
             Some(base) => base.merge(doc),
+            // The base file is committed and the overrides are per-checkout, so
+            // the base has to stand on its own: otherwise an override that
+            // happens to set the same key would hide an error (say, a
+            // duplicated `image=`) that every checkout without that override
+            // still hits.
+            None if layers.len() > 1 => {
+                doc.clone().build().with_context(|| {
+                    format!(
+                        "{base} must be valid on its own, because other checkouts and \
+                         CI load it without {local}: fix it in {base}, and use {local} \
+                         only to override values that already work",
+                        base = layer.name,
+                        local = layers[1].name
+                    )
+                })?;
+                doc
+            }
             None => doc,
         });
     }
@@ -1925,6 +2157,14 @@ fn parse_service_property(
             bail!(
                 "'roles_order' at {} must be declared at top level, above the \
                  first section, not inside service '{}'",
+                loc,
+                service.name
+            );
+        }
+        ENV_FILE => {
+            bail!(
+                "'env-file' at {} must be declared above the first section or in \
+                 an [env] section, not inside service '{}'",
                 loc,
                 service.name
             );
@@ -3151,16 +3391,24 @@ port.api=5000
 
     /// Parse a base `.eph` with a `.eph.local` merged over it.
     fn layered(base: &str, local: &str) -> Result<EphFile> {
-        parse_layers(&[
-            Layer {
-                name: ".eph",
-                contents: base,
-            },
-            Layer {
-                name: ".eph.local",
-                contents: local,
-            },
-        ])
+        parse_layers(
+            &[
+                Layer {
+                    name: ".eph",
+                    contents: base,
+                },
+                Layer {
+                    name: ".eph.local",
+                    contents: local,
+                },
+            ],
+            &mut no_env_files,
+        )
+    }
+
+    /// An env file reader for tests that import nothing.
+    fn no_env_files(path: &str) -> Result<String> {
+        panic!("unexpected env file read: {path}")
     }
 
     fn layered_err(base: &str, local: &str) -> String {
@@ -3177,13 +3425,16 @@ port.api=5000
     #[test]
     fn a_base_layer_alone_parses_like_a_single_file() {
         let base = "A=1\n[db]\nimage=postgres:16\nport=5432\npost-start=migrate\n[env]\nB=2\n";
-        let only_base = parse_layers(&[Layer {
-            name: ".eph",
-            contents: base,
-        }])
+        let only_base = parse_layers(
+            &[Layer {
+                name: ".eph",
+                contents: base,
+            }],
+            &mut no_env_files,
+        )
         .unwrap();
         assert_eq!(only_base, parse(base).unwrap());
-        assert!(parse_layers(&[]).is_err());
+        assert!(parse_layers(&[], &mut no_env_files).is_err());
     }
 
     #[test]
@@ -3408,5 +3659,323 @@ port.api=5000
             msg.contains("unknown service property 'bogus' at line 3 of .eph "),
             "got: {msg}"
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // env-file= imports
+    // ------------------------------------------------------------------------
+
+    /// Parse `layers` (named `.eph`, `.eph.local`, ...) with `files` as the
+    /// env files on disk, keyed by the path as written.
+    fn with_env_files(layers: &[(&str, &str)], files: &[(&str, &str)]) -> Result<EphFile> {
+        let layers: Vec<Layer<'_>> = layers
+            .iter()
+            .map(|&(name, contents)| Layer { name, contents })
+            .collect();
+        parse_layers(&layers, &mut |path: &str| {
+            files
+                .iter()
+                .find(|(name, _)| *name == path)
+                .map(|(_, contents)| (*contents).to_string())
+                .with_context(|| format!("no such file: {path}"))
+        })
+    }
+
+    fn base_with_env_files(base: &str, files: &[(&str, &str)]) -> Result<EphFile> {
+        with_env_files(&[(".eph", base)], files)
+    }
+
+    fn env_file_err(base: &str, files: &[(&str, &str)]) -> String {
+        format!("{:#}", base_with_env_files(base, files).unwrap_err())
+    }
+
+    /// The error for importing one `.env` holding `contents`.
+    fn dotenv_err(contents: &str) -> String {
+        env_file_err("env-file=.env\n", &[(".env", contents)])
+    }
+
+    #[test]
+    fn env_file_imports_variables_beneath_the_importing_file() {
+        let eph = base_with_env_files(
+            "env-file=.env\nAPP_ENV=development\n",
+            &[(".env", "# app settings\nSECRET=s3cret\n\nLOG_LEVEL=info\n")],
+        )
+        .unwrap();
+        assert_eq!(
+            env_pairs(&eph),
+            [
+                ("SECRET", "s3cret"),
+                ("LOG_LEVEL", "info"),
+                ("APP_ENV", "development")
+            ]
+        );
+        assert_eq!(
+            eph.env_files,
+            [EnvFileImport {
+                path: ".env".to_string(),
+                declared_in: Some(".eph".to_string()),
+                line: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn the_importing_file_wins_and_later_imports_win_over_earlier_ones() {
+        let eph = base_with_env_files(
+            "env-file=.env\nenv-file=config/dev.env\n\
+             [db]\nimage=postgres:16\nport=5432\n\
+             [env]\nDATABASE_URL=postgres://localhost:${db.port}/app\n",
+            &[
+                (
+                    ".env",
+                    "DATABASE_URL=postgres://localhost:5432/dev\nLOG_LEVEL=info\nA=1\n",
+                ),
+                ("config/dev.env", "LOG_LEVEL=debug\n"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            env_pairs(&eph),
+            [
+                ("DATABASE_URL", "postgres://localhost:${db.port}/app"),
+                ("LOG_LEVEL", "debug"),
+                ("A", "1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_layer_sits_above_its_own_imports() {
+        // Precedence, lowest first: .env, .eph, .env.local, .eph.local.
+        let eph = with_env_files(
+            &[
+                (".eph", "env-file=.env\nA=eph\nB=eph\nC=eph\n"),
+                (".eph.local", "env-file=.env.local\nC=local\n"),
+            ],
+            &[
+                (".env", "A=dotenv\nB=dotenv\nC=dotenv\nD=dotenv\n"),
+                (".env.local", "B=dotenv-local\nC=dotenv-local\n"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            env_pairs(&eph),
+            [
+                ("A", "eph"),
+                ("B", "dotenv-local"),
+                ("C", "local"),
+                ("D", "dotenv")
+            ]
+        );
+        let declared: Vec<(&str, Option<&str>)> = eph
+            .env_files
+            .iter()
+            .map(|i| (i.path.as_str(), i.declared_in.as_deref()))
+            .collect();
+        assert_eq!(
+            declared,
+            [(".env", Some(".eph")), (".env.local", Some(".eph.local"))]
+        );
+    }
+
+    #[test]
+    fn env_file_may_be_declared_in_an_env_section() {
+        let eph = base_with_env_files(
+            "[db]\nimage=postgres:16\nport=5432\n[env]\nenv-file=.env\n",
+            &[(".env", "A=1\n")],
+        )
+        .unwrap();
+        assert_eq!(env_pairs(&eph), [("A", "1")]);
+    }
+
+    #[test]
+    fn env_file_inside_a_service_section_is_rejected() {
+        let msg = env_file_err("[db]\nimage=postgres:16\nenv-file=.env\n", &[]);
+        assert!(
+            msg.contains("'env-file' at line 3 of .eph must be declared above the first section"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn env_file_needs_a_workspace_to_resolve_against() {
+        let msg = format!("{:#}", parse("env-file=.env\n").unwrap_err());
+        assert!(msg.contains("cannot read env file '.env'"), "got: {msg}");
+        assert!(msg.contains("workspace directory"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_missing_or_empty_env_file_path_is_an_error() {
+        let msg = env_file_err("A=1\nenv-file=.env\n", &[]);
+        assert!(
+            msg.contains("line 2 of .eph: cannot read env file '.env'"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("no such file: .env"), "got: {msg}");
+
+        let msg = env_file_err("env-file=\n", &[]);
+        assert!(
+            msg.contains(
+                "empty `env-file=`; give the path of a .env file, relative to the directory"
+            ),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn duplicates_within_one_env_file_are_errors_even_when_overridden() {
+        let msg = env_file_err("env-file=.env\nA=eph\n", &[(".env", "A=1\nB=2\nA=3\n")]);
+        assert!(
+            msg.contains("duplicate environment variable 'A' at line 3 of .env (first defined at line 1 of .env)"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn duplicates_across_env_files_resolve_by_order() {
+        let eph = base_with_env_files(
+            "env-file=a.env\nenv-file=b.env\n",
+            &[("a.env", "A=a\n"), ("b.env", "A=b\n")],
+        )
+        .unwrap();
+        assert_eq!(env_pairs(&eph), [("A", "b")]);
+    }
+
+    #[test]
+    fn env_files_hold_only_variables() {
+        let msg = dotenv_err("A=1\n[db]\nimage=postgres:16\n");
+        assert!(
+            msg.contains(
+                "line 2 of .env: env files hold only variables, but found the section header [db];"
+            ),
+            "got: {msg}"
+        );
+        let msg = dotenv_err("env-file=other.env\n");
+        assert!(
+            msg.contains(
+                "env files cannot import other env files; declare every `env-file=` in .eph"
+            ),
+            "got: {msg}"
+        );
+        let msg = dotenv_err("JUST_A_NAME\n");
+        assert!(
+            msg.contains("invalid syntax at line 1 of .env: expected KEY=VALUE"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn env_file_names_follow_top_level_variable_rules() {
+        let msg = dotenv_err("BAD-NAME=1\n");
+        assert!(
+            msg.contains("invalid environment variable name 'BAD-NAME' at line 1 of .env"),
+            "got: {msg}"
+        );
+        let msg = dotenv_err("EPH_WORKSPACE=x\n");
+        assert!(msg.contains("EPH_* names are managed by eph"), "got: {msg}");
+    }
+
+    #[test]
+    fn env_files_accept_an_export_prefix() {
+        let eph = base_with_env_files(
+            "env-file=.env\n",
+            &[(".env", "export A=1\nexport\tB=2\nexporter=3\n")],
+        )
+        .unwrap();
+        assert_eq!(env_pairs(&eph), [("A", "1"), ("B", "2"), ("exporter", "3")]);
+    }
+
+    #[test]
+    fn env_file_values_dotenv_loaders_read_the_same_way_are_accepted() {
+        let eph = base_with_env_files(
+            "env-file=.env\n",
+            &[(
+                ".env",
+                "SPACED=\"  padded  \"\nSINGLE='C:\\path'\nEMPTY=\nCOLOR=#fff\nURL=http://x/#top\nHASH=\"a # b\"\nDOLLAR=pa$$word\n",
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            env_pairs(&eph),
+            [
+                ("SPACED", "  padded  "),
+                ("SINGLE", "C:\\path"),
+                ("EMPTY", ""),
+                ("COLOR", "#fff"),
+                ("URL", "http://x/#top"),
+                ("HASH", "a # b"),
+                ("DOLLAR", "pa$$word"),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_file_values_dotenv_loaders_read_differently_are_rejected() {
+        for (contents, expected) in [
+            (
+                "A=\"multi\nline\"\n",
+                "double quote opening this value is not closed",
+            ),
+            (
+                "A='x' # note\n",
+                "single quote opening this value is not closed",
+            ),
+            (
+                "A=\"a\" and \"b\"\n",
+                "double quote opening this value is not closed",
+            ),
+            ("A=\"line\\nbreak\"\n", "backslash in a double-quoted value"),
+            ("A=value # note\n", "' #' in an unquoted value"),
+            ("A=value\t# note\n", "' #' in an unquoted value"),
+        ] {
+            let msg = dotenv_err(contents);
+            assert!(msg.contains("line 1 of .env"), "{contents:?} got: {msg}");
+            assert!(msg.contains(expected), "{contents:?} got: {msg}");
+        }
+    }
+
+    #[test]
+    fn env_file_values_use_eph_interpolation() {
+        let eph = base_with_env_files(
+            "env-file=.env\n[db]\nimage=postgres:16\nport=5432\n",
+            &[(".env", "DATABASE_URL=postgres://localhost:${db.port}/app\n")],
+        )
+        .unwrap();
+        assert_eq!(
+            env_pairs(&eph),
+            [("DATABASE_URL", "postgres://localhost:${db.port}/app")]
+        );
+
+        let msg = dotenv_err("HOME_DIR=${HOME}/app\n");
+        assert!(
+            msg.contains("invalid interpolation '${HOME}'"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("line 1 of .env"), "got: {msg}");
+        assert!(
+            msg.contains("does not expand references to other variables"),
+            "got: {msg}"
+        );
+
+        let msg = dotenv_err("URL=${nope.port}\n");
+        assert!(msg.contains("nope"), "got: {msg}");
+    }
+
+    #[test]
+    fn the_base_and_its_imports_must_be_valid_without_overrides() {
+        // The local layer defines the service the base's env file refers to,
+        // but a checkout without the override would fail, so this is an error.
+        let msg = format!(
+            "{:#}",
+            with_env_files(
+                &[
+                    (".eph", "env-file=.env\n"),
+                    (".eph.local", "[db]\nimage=postgres:16\nport=5432\n"),
+                ],
+                &[(".env", "URL=${db.port}\n")],
+            )
+            .unwrap_err()
+        );
+        assert!(msg.contains(".eph must be valid on its own"), "got: {msg}");
     }
 }

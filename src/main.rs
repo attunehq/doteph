@@ -1404,14 +1404,45 @@ fn should_colorize() -> bool {
     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
+/// The env files that the configuration layer at `layer` imports, in order.
+fn imports_of<'a>(
+    eph: &'a EphFile,
+    layer: &'a Path,
+) -> impl Iterator<Item = &'a eph::parser::EnvFileImport> {
+    let name = layer.file_name().map(|name| name.to_string_lossy());
+    eph.env_files
+        .iter()
+        .filter(move |import| import.declared_in.as_deref() == name.as_deref())
+}
+
+/// Where an `env-file=` line was declared, e.g. `line 1 of .eph`.
+fn import_location(import: &eph::parser::EnvFileImport) -> String {
+    match &import.declared_in {
+        Some(file) => format!("line {} of {file}", import.line),
+        None => format!("line {}", import.line),
+    }
+}
+
 async fn cmd_check() -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
 
-    println!("Valid .eph file: {}", workspace.eph_file_path().display());
-    // The base file is listed above; name each override merged over it.
-    for layer in workspace.config_layers().iter().skip(1) {
-        println!("Override: {}", layer.display());
+    // Every file that went into the result, lowest precedence first: each
+    // layer's imported env files sit directly beneath it.
+    for (index, layer) in workspace.config_layers().iter().enumerate() {
+        for import in imports_of(&eph, layer) {
+            println!(
+                "Env file: {} (env-file= at {})",
+                workspace.env_file_path(&import.path).display(),
+                import_location(import)
+            );
+        }
+        let label = if index == 0 {
+            "Valid .eph file"
+        } else {
+            "Override"
+        };
+        println!("{label}: {}", layer.display());
     }
     println!();
     println!("Environment variables: {}", eph.env_vars.len());
@@ -1454,8 +1485,23 @@ async fn cmd_info() -> Result<()> {
     println!("Container prefix: {}", workspace.container_prefix());
     println!(".eph file: {}", workspace.eph_file_path().display());
     println!("Config layers (later layers take precedence):");
+    // Imported env files are only known once the configuration parses; `info`
+    // still reports the rest of the workspace when it does not.
+    let eph = workspace.load_config().ok();
     for layer in workspace.config_layers() {
+        for import in eph.iter().flat_map(|eph| imports_of(eph, &layer)) {
+            println!(
+                "  {} (env-file= at {})",
+                workspace.env_file_path(&import.path).display(),
+                import_location(import)
+            );
+        }
         println!("  {}", layer.display());
+    }
+    if eph.is_none() {
+        println!(
+            "  (imported env files not shown: the configuration does not parse; run `eph check`)"
+        );
     }
     println!("State directory: {}", workspace.state_dir()?.display());
 

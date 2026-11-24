@@ -175,6 +175,16 @@ service section, meaning it for the shell, is the single most common mistake
 when generating a `.eph` file: `eph check` rejects it and names both fixes
 (`env.KEY=` for the service, `[env]` for the shell).
 
+**Reuse an existing `.env` with `env-file=.env`** (top of file or in `[env]`,
+repeatable, path relative to `.eph`) instead of copying its variables. The
+`.eph`'s own variables win over the imported ones, so put a
+`DATABASE_URL=...${postgres.port}...` in `.eph` even when `.env` has a fixed
+one. Import a gitignored file (`.env.local`) from `.eph.local`, never from
+`.eph`: a missing file is an error. eph rejects `.env` lines that dotenv
+loaders read differently (an unquoted ` #`, multi-line values, backslashes
+in double quotes, `${OTHER_VAR}`); fix the line rather than working around it.
+See [Importing a `.env` file](eph-file.md#importing-a-env-file-env-file).
+
 ### Service sources (exactly one per section; a second one is a parse error)
 
 | Key | Meaning |
