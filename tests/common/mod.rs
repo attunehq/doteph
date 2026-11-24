@@ -28,10 +28,12 @@ use tokio::time::sleep;
 
 /// A test workspace: a temporary directory containing a `.eph` file.
 ///
-/// Dropping the workspace makes a best-effort `eph down` so containers do not
-/// outlive a panicking test. Tests that create volumes, built images, or
-/// compose projects should additionally call [`TestWorkspace::clean`] (and tidy
-/// any images) on the happy path, since `down` only stops containers.
+/// Dropping the workspace makes a best-effort `eph clean --skip-hooks`, so a
+/// finished or panicking test leaves no containers, volumes, or state
+/// directory in the developer's real eph state root. `down` alone stopped
+/// containers but kept them and the state directory, which accumulated as
+/// "missing workspace" entries in `eph system prune`. Tests that build images
+/// should still tidy those themselves; `clean` does not remove images.
 pub struct TestWorkspace {
     dir: TempDir,
 }
@@ -112,10 +114,11 @@ impl TestWorkspace {
 
 impl Drop for TestWorkspace {
     fn drop(&mut self) {
-        // Best effort cleanup: stop any services that might still be running.
+        // Best effort cleanup: remove services, volumes, and eph state. Hooks
+        // are skipped because teardown must not depend on test fixtures.
         let eph_binary = env!("CARGO_BIN_EXE_eph");
         let _ = std::process::Command::new(eph_binary)
-            .args(["down"])
+            .args(["clean", "--skip-hooks"])
             .current_dir(self.dir.path())
             .output();
     }
