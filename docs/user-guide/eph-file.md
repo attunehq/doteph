@@ -38,6 +38,9 @@ There are exactly two kinds of content:
 - **Service sections**: a `[name]` header followed by `property=value` lines.
   These define what `eph up` starts.
 
+Top-level variables can also come from an existing `.env` file through an
+[`env-file=`](#importing-a-env-file-env-file) line.
+
 ## Syntax rules
 
 - One directive per line.
@@ -161,6 +164,72 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
 A misspelled `[env]` (`[envs]`, `[vars]`, `[variables]`, `[environment]`) is
 rejected with a hint pointing at `[env]` rather than being treated as an
 unknown, unclassified service.
+
+### Importing a `.env` file: `env-file=`
+
+If the project already keeps settings in a `.env` file that the app loads on
+its own, import it rather than copying its variables into `.eph`:
+
+```ini
+env-file=.env
+
+[postgres]
+image=postgres:16-alpine
+port=5432
+
+[env]
+DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
+```
+
+Everything that receives top-level variables gets the imported ones too:
+`eph env`, `eph run`, lifecycle hooks, and `run=` services.
+
+- `env-file=` goes where top-level variables go: above the first section or in
+  an `[env]` section. It may repeat to import several files.
+- The path is relative to the directory holding `.eph`, whatever directory you
+  run eph from.
+- The file must exist. A missing file is an error naming the `env-file=` line
+  and the path it resolved to. A gitignored file (`.env.local`, a secrets file)
+  does not exist on a fresh clone or in CI, so import it from
+  [`.eph.local`](#local-overrides-ephlocal) rather than the committed `.eph`.
+- `env-file` is not a legal variable name, so it never collides with a
+  variable. An eph release older than this feature rejects the line instead of
+  silently ignoring the file.
+
+**Precedence.** An imported file is a layer beneath the file that imports it.
+The importing file's own variables win over its imports, and a later
+`env-file=` wins over an earlier one. That lets a committed `.env` keep
+`DATABASE_URL=postgres://localhost:5432/dev` for people who do not use eph,
+while `.eph`'s `DATABASE_URL` with the assigned port wins for those who do.
+Together with `.eph.local`, the full order, lowest precedence first, is:
+
+1. the env files `.eph` imports, in order;
+2. `.eph`;
+3. the env files `.eph.local` imports, in order;
+4. `.eph.local`.
+
+Declaring the same variable twice *within* one file, including within one env
+file, is still an error, because dotenv loaders disagree about which
+occurrence wins.
+
+**What an env file may contain.** The same lines as the top-of-file block of a
+`.eph`: `KEY=VALUE` variables with the same name rules, quoting, and
+`${service.property}` interpolation, plus comments and blank lines. A leading
+`export ` is accepted, since many `.env` files use it. Sections and nested
+`env-file=` lines are errors.
+
+An env file usually has a second reader, the app's own dotenv library, and
+the two must agree on every value. eph's value rules are simpler than any
+dotenv dialect, so where a loader would read a line differently, eph rejects
+it instead of silently disagreeing:
+
+| Rejected in an env file | Why | Write instead |
+|-------------------------|-----|---------------|
+| `KEY=value # note` | Loaders strip ` # note` as a comment; eph would keep it | the comment on its own line, or `KEY="value # note"` |
+| `KEY="first` ... `last"` | Multi-line values are not supported | one line per value |
+| `KEY="value" # note` | Text after the closing quote | the comment on its own line |
+| `KEY="C:\path"` | Loaders disagree on escapes such as `\n` in double quotes | `KEY='C:\path'` (single quotes are literal) |
+| `KEY=${OTHER}/sub` | Some loaders expand other variables; eph interpolates only `${service.property}` | the full value, or `$${` for a literal `${` |
 
 ## Service sections
 
@@ -744,14 +813,18 @@ adds a `volume=`, adds the `mailpit` service, and replaces `LOG_LEVEL`.
   roles are started.
 - **`[roles_order]` edges match by role**, and a top-level `roles_order=` is
   replaced as a whole. The two forms still cannot be mixed, even across files.
+- **`env-file=` imports are never replaced.** Each file's imports apply
+  directly beneath that file, so `.eph.local` can add its own (see
+  [the precedence order](#importing-a-env-file-env-file)).
 
 There is no way to delete a key or a service from `.eph.local`; it can only
 replace and add.
 
 ### Validation and precedence
 
-`.eph` must be valid on its own, because it is what every other checkout
-(and CI) loads without your override: `.eph.local` cannot hide an error in it.
+`.eph`, with the env files it imports, must be valid on its own, because it is
+what every other checkout (and CI) loads without your override: `.eph.local`
+cannot hide an error in it.
 That includes a fresh git worktree of your own repo, since an ignored file is
 not copied into new worktrees. So `.eph` cannot hold a placeholder that only
 `.eph.local` completes, such as a service with no source or a value that is
@@ -773,8 +846,9 @@ and `run=` at line 2 of .eph.local; set exactly one of image/dockerfile/compose/
 `.eph.local` is read only from the directory that holds the discovered `.eph`.
 On its own it does not make a directory a workspace, and an `.eph.local` in a
 subdirectory is ignored. When both files exist, `.eph.local` takes precedence.
-`eph info` lists the layers it loaded, base first, and `eph check` names the
-override it merged.
+`eph info` lists the layers it loaded, base first, with each imported env file
+listed just above the file that imports it, and `eph check` names the override
+and env files it merged.
 
 ## Complete example
 

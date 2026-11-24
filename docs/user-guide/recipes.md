@@ -25,6 +25,12 @@ live in [Running Your App](run-your-app.md).
 | `command: server /data` | `command=server /data` |
 | `healthcheck: { test: [...] }` | `healthcheck=...` (one command, no shell for image services) |
 
+Compose's `env_file:` feeds one container. eph's top-level
+[`env-file=`](eph-file.md#importing-a-env-file-env-file) is a different thing:
+it imports a `.env` into the variables `eph env`, `eph run`, hooks, and `run=`
+services see. An image service's container still gets only its `env.KEY=`
+lines.
+
 Worked example. This Compose file:
 
 ```yaml
@@ -308,6 +314,10 @@ accordingly:
   `.eph`, and add `.eph.local` to `.gitignore`. eph merges it over the
   committed file, so the shared `.eph` stays complete and secret-free. See
   [Local overrides](eph-file.md#local-overrides-ephlocal).
+- If the secrets already live in a gitignored `.env.local` or similar, import
+  it from `.eph.local` with `env-file=.env.local` rather than from `.eph`: a
+  fresh clone or CI has no such file, and an import that is missing is an
+  error. See [Importing a `.env` file](eph-file.md#importing-a-env-file-env-file).
 - Never commit a `.eph` or `.eph.local` file containing real secrets.
 
 ## Keeping data vs. starting fresh

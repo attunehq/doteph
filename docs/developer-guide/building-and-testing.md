@@ -61,7 +61,8 @@ Three layers, plus a heavyweight fourth:
   section and top-level variable placement, duplicate sections/properties/
   names, service and port name validation, quote stripping, interpolation
   (including the `$${` escape and unknown-service validation), `.eph.local`
-  layer merging and its file-aware diagnostics, and shell escaping. Run with `make test-unit` (`cargo test --lib`).
+  layer merging and its file-aware diagnostics, `env-file=` imports and their
+  precedence, and shell escaping. Run with `make test-unit` (`cargo test --lib`).
 - **Doctests**: the public-API examples in `///` docs are compiled and run,
   so they cannot drift from the code. Included in `cargo test`.
 - **Integration tests** (`tests/integration.rs`, with helpers in

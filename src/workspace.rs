@@ -233,6 +233,13 @@ impl Workspace {
         config_layers(&self.path)
     }
 
+    /// Where an `env-file=` path, as written, lives on disk. See
+    /// [`env_file_path`].
+    #[must_use]
+    pub fn env_file_path(&self, written: &str) -> PathBuf {
+        env_file_path(&self.path, written)
+    }
+
     /// Load the workspace's effective configuration. See [`load_config`].
     ///
     /// # Errors
@@ -351,14 +358,15 @@ pub fn config_layers(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Load the effective configuration of the workspace at `dir`: the base `.eph`
-/// with every override in [`config_layers`] merged over it (see
-/// [`parser::parse_layers`]). Every command that reads workspace
-/// configuration goes through here, so they all see the same merged file.
+/// with every override in [`config_layers`] merged over it, each layer above
+/// the env files it imports (see [`parser::parse_layers`]). Every command that
+/// reads workspace configuration goes through here, so they all see the same
+/// merged file.
 ///
 /// # Errors
 ///
-/// Returns an error if a layer cannot be read (including a missing base
-/// `.eph`) or the merged result does not parse.
+/// Returns an error if a layer or an imported env file cannot be read
+/// (including a missing base `.eph`) or the merged result does not parse.
 pub fn load_config(dir: &Path) -> Result<EphFile> {
     let paths = config_layers(dir);
     let mut files = Vec::with_capacity(paths.len());
@@ -375,7 +383,11 @@ pub fn load_config(dir: &Path) -> Result<EphFile> {
         .iter()
         .map(|(name, contents)| Layer { name, contents })
         .collect();
-    parser::parse_layers(&layers).with_context(|| {
+    let mut read_env_file = |written: &str| {
+        let path = env_file_path(dir, written);
+        std::fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))
+    };
+    parser::parse_layers(&layers, &mut read_env_file).with_context(|| {
         // "failed to parse /repo/.eph" or "... /repo/.eph merged with .eph.local";
         // the inner error names the layer at fault.
         let mut message = format!("failed to parse {}", paths[0].display());
@@ -385,6 +397,14 @@ pub fn load_config(dir: &Path) -> Result<EphFile> {
         }
         message
     })
+}
+
+/// Where an `env-file=` path, as written in the configuration, lives on disk:
+/// relative paths resolve against the workspace directory (the one holding
+/// `.eph`), never the caller's working directory.
+#[must_use]
+pub fn env_file_path(dir: &Path, written: &str) -> PathBuf {
+    dir.join(written)
 }
 
 /// Compute a unique ID for a workspace based on its path

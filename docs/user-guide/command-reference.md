@@ -580,10 +580,12 @@ eph check
 ```
 
 ```
+Env file: /home/you/projects/myapp/.env (env-file= at line 1 of .eph)
 Valid .eph file: /home/you/projects/myapp/.eph
 Override: /home/you/projects/myapp/.eph.local
 
-Environment variables: 2
+Environment variables: 3
+  SENTRY_DSN
   DATABASE_URL
   REDIS_URL
 
@@ -592,7 +594,10 @@ Services: 2
   redis (image: redis:7-alpine)
 ```
 
-The `Override:` line appears only when a `.eph.local` was merged.
+Files are listed lowest precedence first. The `Override:` line appears only
+when a `.eph.local` was merged, and an `Env file:` line appears for each
+[`env-file=`](eph-file.md#importing-a-env-file-env-file) import, just above the
+file that imports it.
 
 ## `eph info`
 
@@ -609,14 +614,19 @@ Short ID: a1b2c3d4e5f60718
 Container prefix: eph-a1b2c3d4e5f60718
 .eph file: /home/you/projects/myapp/.eph
 Config layers (later layers take precedence):
+  /home/you/projects/myapp/.env (env-file= at line 1 of .eph)
   /home/you/projects/myapp/.eph
   /home/you/projects/myapp/.eph.local
 State directory: /home/you/.local/share/eph/a1b2c3d4e5f60718
 ```
 
 `Config layers` lists the configuration files every command merges, lowest
-precedence first: always `.eph`, then `.eph.local` when it exists. `eph info`
-only lists them; run `eph check` to validate the merged result.
+precedence first: always `.eph`, then `.eph.local` when it exists, each preceded
+by the env files it imports with
+[`env-file=`](eph-file.md#importing-a-env-file-env-file). `eph info` does not
+validate them: if the configuration does not parse, it lists `.eph` and
+`.eph.local` without their imports and says so. Run `eph check` to validate the
+merged result.
 
 Use the container prefix and short ID to find this workspace's resources with
 the `docker` CLI. The state directory's parent (the `eph` above the short ID)

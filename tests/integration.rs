@@ -15,6 +15,8 @@ use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
 mod common;
+#[path = "integration/env_file.rs"]
+mod env_file;
 #[path = "integration/eph_local.rs"]
 mod eph_local;
 #[path = "integration/system_prune_force.rs"]
