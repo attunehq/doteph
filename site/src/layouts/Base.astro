@@ -27,6 +27,7 @@ const canonical = new URL(Astro.url.pathname, Astro.site).href.replace(/\/$/, ""
     <title>{title}</title>
     <meta name="description" content={description} />
     <link rel="canonical" href={canonical} />
+    <link rel="alternate" type="text/plain" title="llms.txt" href={withBase("/llms.txt")} />
 
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="eph" />

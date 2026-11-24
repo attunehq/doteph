@@ -34,6 +34,9 @@ use watch::Watch;
 #[command(name = "eph")]
 #[command(about = "Ephemeral services per workspace - dotenv for services")]
 #[command(version = env!("EPH_VERSION"))]
+#[command(after_help = "\
+Guide: https://attunehq.github.io/doteph/guide
+Agents: https://attunehq.github.io/doteph/llms.txt (every guide page as Markdown)")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

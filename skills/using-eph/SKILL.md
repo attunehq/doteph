@@ -523,3 +523,16 @@ return, so they run as normal commands.
 4. Treat `.eph` as possibly holding dev credentials, and `.eph.local` as
    possibly holding real ones: do not print either to logs or commit one with
    real secrets.
+
+## Full documentation
+
+This skill covers the common path. For anything it does not answer, fetch the
+user guide as Markdown instead of guessing:
+
+- https://attunehq.github.io/doteph/llms.txt: an index of every chapter, each
+  linked to its raw `.md` URL.
+- https://attunehq.github.io/doteph/llms-full.txt: the whole guide in one file.
+- https://attunehq.github.io/doteph/guide/for-agents.md: the terse quick
+  reference for agents and scripts.
+
+Any guide page's Markdown is its URL without the trailing slash, plus `.md`.
