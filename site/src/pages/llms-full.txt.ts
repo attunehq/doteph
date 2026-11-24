@@ -1,5 +1,5 @@
 import type { APIRoute } from "astro";
-import { loadGuide, rawSlugFor } from "../lib/guide";
+import { loadGuide, routeFor } from "../lib/guide";
 
 // llms-full.txt: the entire user guide concatenated in reading order, so an
 // agent can ingest the whole thing in one request. Each section is prefixed
@@ -10,8 +10,7 @@ export const GET: APIRoute = async () => {
   const entries = await loadGuide();
 
   const sections = entries.map((e) => {
-    const url =
-      rawSlugFor(e) === "index" ? `${SITE}/guide` : `${SITE}/guide/${rawSlugFor(e)}`;
+    const url = `${SITE}${routeFor(e)}`;
     return `<!-- ${url} -->\n\n${(e.body ?? "").trim()}\n`;
   });
 

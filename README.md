@@ -119,7 +119,9 @@ same pages are readable in-repo:
 - **[For Agents and Scripts](docs/user-guide/for-agents.md)**: a terse quick
   reference for AI coding agents and automation. Run `eph skills install` to
   drop that guidance into a repo as a skill your agent discovers
-  automatically.
+  automatically. Agents fetching docs over the web can start at
+  [`llms.txt`](https://attunehq.github.io/doteph/llms.txt), which links every
+  guide page as raw Markdown.
 - **[Developer Guide](docs/developer-guide/README.md)**: architecture,
   building and testing, and a tour of the internals, for working on `eph`
   itself.

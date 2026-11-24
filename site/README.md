@@ -56,12 +56,24 @@ frontmatter shape and `order` values are load-bearing.
 
 ## Agent / LLM surface
 
-- `src/pages/guide/[slug].md.ts` serves every page's raw Markdown at a
-  predictable `.md` URL (e.g. `/guide/concepts.md`): the representation
-  agents probe for and the text the "Copy page" button copies.
+- Every guide page's raw Markdown lives at its page route plus `.md`
+  (`/guide.md`, `/guide/concepts.md`): the representation agents probe for
+  and the text the "Copy page" button copies. `markdownPathFor` in
+  `src/lib/guide.ts` is the one place that rule is encoded;
+  `src/pages/guide.md.ts` serves the index and `src/pages/guide/[slug].md.ts`
+  serves the chapters (plus `/guide/index.md`, an alias kept for links
+  published before `/guide.md` existed).
+- GitHub Pages serves each page from a directory, so it 301s `/guide/concepts`
+  to `/guide/concepts/`. The rule therefore reads "drop the trailing slash, add
+  `.md`", and that is how `llms.txt` states it. Keep the two in sync if the
+  output format or routing changes.
 - `src/pages/llms.txt.ts` and `src/pages/llms-full.txt.ts` generate
-  [`/llms.txt`](https://llmstxt.org) (a curated index) and `/llms-full.txt`
-  (the whole guide concatenated for a single fetch).
+  [`/llms.txt`](https://llmstxt.org) (a curated index that also states the
+  `.md` rule) and `/llms-full.txt` (the whole guide concatenated for a single
+  fetch). Every page, landing included, links `llms.txt` with
+  `<link rel="alternate">`, and the guide pages also link their own `.md`.
+- Outside the site, the shipped `using-eph` skill (`skills/using-eph`) and the
+  top-level `eph --help` both point agents at `llms.txt`.
 
 ## The base path
 
