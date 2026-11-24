@@ -139,9 +139,12 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
   key (`port.http`, `env.DEBUG` are distinct keys), top-level variables by name
   (above the first section or in `[env]`, same namespace). An override key
   replaces the base value; for repeatable keys (`volume=`, hooks) it replaces
-  the whole base list. New keys and sections append. Only the merged result is
-  validated, so setting `run=` locally on an `image=` service is a duplicate
-  source error; errors name the file (`line 3 of .eph.local`). `eph info` lists
+  the whole base list. New keys and sections append. `.eph` must be valid on
+  its own (fresh worktrees and CI load it without `.eph.local`), so it cannot
+  hold a placeholder that only `.eph.local` completes: give it a working value
+  and override it. The merged result is validated too, so setting `run=`
+  locally on an `image=` service is a duplicate source error; errors name the
+  file (`line 3 of .eph.local`). `eph info` lists
   the loaded layers. Put machine-specific or secret values there instead of
   editing a committed `.eph`, and do not commit or print it.
 - `volume=name:/path` is a per-workspace named volume; `healthcheck` for an image

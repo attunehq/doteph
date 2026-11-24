@@ -752,6 +752,13 @@ replace and add.
 
 `.eph` must be valid on its own, because it is what every other checkout
 (and CI) loads without your override: `.eph.local` cannot hide an error in it.
+That includes a fresh git worktree of your own repo, since an ignored file is
+not copied into new worktrees. So `.eph` cannot hold a placeholder that only
+`.eph.local` completes, such as a service with no source or a value that is
+only legal once overridden. Give `.eph` a working default and override it
+locally; for a value every developer must supply, such as a personal API key,
+commit a harmless default (or an empty value) and have the service fail with a
+clear message when it is missing.
 The merged result is then validated with every rule on this page. An override
 may replace a value, but it cannot leave an illegal state behind: setting
 `run=` in `.eph.local` for a service whose `.eph` declares `image=` gives that
