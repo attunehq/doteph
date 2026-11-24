@@ -1200,8 +1200,11 @@ pub fn parse_layers(layers: &[Layer<'_>]) -> Result<EphFile> {
             .build()
             .with_context(|| {
                 format!(
-                    "{} must be valid on its own, without per-checkout overrides",
-                    base.name
+                    "{base} must be valid on its own, because other checkouts and \
+                     CI load it without {local}: fix it in {base}, and use {local} \
+                     only to override values that already work",
+                    base = base.name,
+                    local = overrides[0].name
                 )
             })?;
     }
@@ -3193,9 +3196,10 @@ port.api=5000
     }
 
     /// The example from the feature request: keep, replace, add, add a
-    /// section, and replace a variable. The base alone is invalid (`port=auto`
-    /// on an image service), which shows that only the merged result is
-    /// validated.
+    /// section, and replace a variable. The request's base used `port=auto` on
+    /// an image service, which is invalid on its own and so rejected (see
+    /// `an_override_cannot_mask_an_error_in_the_base`); this base uses a
+    /// working port that the local layer replaces.
     #[test]
     fn local_layer_replaces_adds_and_appends() {
         let base = "[postgres]\nimage=postgres:16-alpine\nport=5433\n\n[env]\nLOG_LEVEL=info\n";
@@ -3387,6 +3391,7 @@ port.api=5000
             "[db]\nimage=postgres:17\n",
         );
         assert!(msg.contains(".eph must be valid on its own"), "got: {msg}");
+        assert!(msg.contains("load it without .eph.local"), "got: {msg}");
         assert!(msg.contains("line 3 of .eph"), "got: {msg}");
 
         let msg = layered_err("A=1\nA=2\n[db]\nimage=postgres:16\n", "A=3\n");
