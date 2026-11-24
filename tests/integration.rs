@@ -3463,6 +3463,10 @@ async fn dev_signal_during_foreground_readiness_kills_the_process_tree() {
 /// The cancellation guard captures the shell wrapper immediately, while the
 /// durable backend identity is captured after readiness so a later `exec` of
 /// the real app remains visible to status and teardown.
+///
+/// It also stops `eph dev` the instant `status` shows the app running, the
+/// earliest a preview server can. That lands at the very end of startup, where
+/// `eph dev` once had no signal listener and silently dropped the SIGTERM.
 #[cfg(unix)]
 #[tokio::test]
 async fn dev_tracks_foreground_identity_after_shell_exec() {
@@ -3512,6 +3516,63 @@ async fn dev_tracks_foreground_identity_after_shell_exec() {
     assert!(
         after.contains("No services running"),
         "teardown should stop the exec'd foreground process: {after}"
+    );
+}
+
+/// A stop signal that arrives while a `--watch` restart is tearing the stack
+/// down ends the session instead of being lost. The slow pre-stop hook holds
+/// eph in that teardown, so SIGTERM deterministically lands mid-restart; eph
+/// must not bring the stack back up, and must exit cleanly with it torn down.
+#[cfg(unix)]
+#[tokio::test]
+async fn dev_watch_stop_signal_during_restart_ends_the_session() {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    let ws = TestWorkspace::new("[web]\nrun=sleep 600\npre-stop=touch stopping; sleep 3\n");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_eph"))
+        .args(["dev", "--watch", "trigger"])
+        .current_dir(ws.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("failed to spawn eph dev");
+
+    let running = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let status = ws.eph_ok(&["status"]).await;
+            if status.contains("web") && !status.contains("web (stopped)") {
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .is_ok();
+    assert!(running, "eph dev never brought web up");
+
+    ws.write_file("trigger", "change");
+    assert!(
+        wait_for_file(&ws.path().join("stopping")).await,
+        "the watched change never started a restart"
+    );
+
+    let dev_pid = child.id().expect("dev child has a pid") as libc::pid_t;
+    // SAFETY: kill takes plain integers and has no memory-safety preconditions.
+    unsafe {
+        libc::kill(dev_pid, libc::SIGTERM);
+    }
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait())
+        .await
+        .expect("a stop during a watch restart should end eph dev")
+        .expect("failed to wait for eph dev");
+    assert!(status.success(), "a signalled eph dev should exit cleanly");
+    let after = ws.eph_ok(&["status"]).await;
+    assert!(
+        after.contains("No services running"),
+        "a stop during a restart should leave the stack down: {after}"
     );
 }
 

@@ -434,8 +434,10 @@ Behavior:
   applicable phase.
 - On stop (the preview server's stop, or Ctrl-C), only the services `eph dev`
   started itself are torn down; services that were already running when it
-  began (a prewarmed tier) are left up. A hard kill (`SIGKILL`) cannot run
-  teardown; recover with `eph down`.
+  began (a prewarmed tier) are left up. A stop is honored whenever it
+  arrives, including during startup or a `--watch` restart; a stop during a
+  restart tears the stack down instead of bringing it back up. A hard kill
+  (`SIGKILL`) cannot run teardown; recover with `eph down`.
 - If the app exits on its own, `eph dev` exits non-zero and leaves the backing
   services up, except in watch mode, where it reports the exit and waits for
   the next file change to restart.

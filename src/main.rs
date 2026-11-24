@@ -704,17 +704,21 @@ async fn cmd_dev(
         Some(Watch::new(&workspace_root, &watch)?)
     };
 
+    // Listen for stop signals once, for the rest of the session, before anything
+    // is started. A signal that arrives while eph is busy elsewhere (finishing
+    // startup, or tearing down for a watch restart) is held here and acted on at
+    // the next check instead of being lost; see [`ShutdownSignals`].
+    let mut shutdown = ShutdownSignals::new()?;
+
     // Restart loop: each pass brings the whole stack up, then blocks until it is
     // stopped, the app exits, or (when watching) a file changes. Without a
     // watcher the loop runs exactly once, matching the original single-shot `eph
     // dev` behavior.
     let mut first = true;
     loop {
-        // Register the shutdown listener while bring-up is still running. A
-        // preview server can stop eph as soon as `status` exposes the foreground
-        // service, which is just before this loop would otherwise begin waiting
-        // for signals. Closing that window prevents SIGTERM from taking the
-        // process's default non-zero exit path after a successful startup.
+        // Bring-up races the stop signals, so a stop during startup (including
+        // one held from a watch restart's teardown) abandons it and tears down.
+        // `biased` checks for a held signal first, before starting new work.
         let started = {
             let bring_up = dev_bring_up(
                 &mut manager,
@@ -726,8 +730,9 @@ async fn cmd_dev(
             );
             tokio::pin!(bring_up);
             tokio::select! {
+                biased;
+                () = shutdown.recv() => None,
                 result = &mut bring_up => Some(result?),
-                () = wait_for_shutdown() => None,
             }
         };
         let Some((mut child, gate)) = started else {
@@ -742,7 +747,8 @@ async fn cmd_dev(
         // file changing. `child.wait` reaps the process, so its exit is observed
         // reliably (no zombie races). The watch arm is inert without `--watch`.
         let stop = tokio::select! {
-            () = wait_for_shutdown() => DevStop::Signal,
+            biased;
+            () = shutdown.recv() => DevStop::Signal,
             result = child.wait() => DevStop::AppExited(result),
             changed = next_change(&mut watcher), if watcher.is_some() => DevStop::FileChanged(changed),
         };
@@ -785,7 +791,8 @@ async fn cmd_dev(
                 eprintln!();
                 eprintln!("dev server '{foreground}' {how}; waiting for a change to restart");
                 tokio::select! {
-                    () = wait_for_shutdown() => {
+                    biased;
+                    () = shutdown.recv() => {
                         final_teardown(&mut manager, &eph, clean, &brought_up, skip_hooks).await?;
                         return Ok(ExitCode::SUCCESS);
                     }
@@ -1073,37 +1080,74 @@ fn select_foreground_service(eph: &EphFile, requested: Option<&str>) -> Result<S
     }
 }
 
-/// Block until a shutdown signal arrives.
+/// The stop signals `eph dev` honors, listened for once for the whole session.
 ///
-/// A Claude Desktop preview server stops the dev command by signaling it; this
-/// catches the platform's stop signals so `eph dev` can tear the stack down
-/// before exiting. On Unix that is SIGINT (Ctrl-C) and SIGTERM; on Windows it is
+/// A Claude Desktop preview server stops the dev command by signaling it; these
+/// catch the platform's stop signals so `eph dev` can tear the stack down before
+/// exiting. On Unix that is SIGINT (Ctrl-C) and SIGTERM; on Windows it is
 /// Ctrl-C, console close, and system shutdown. A hard kill (SIGKILL /
 /// `TerminateProcess`) cannot be caught, so teardown is skipped and the stack is
 /// left up, recoverable with `eph down`.
+///
+/// The listeners must outlive every stage of the session. Once tokio installs
+/// its handler the OS default (terminate) no longer applies, and tokio drops a
+/// signal that arrives while no listener exists. Creating a listener per stage
+/// therefore swallowed a stop that landed between stages, such as just after
+/// startup (when `eph status` already shows the app running) or during a
+/// `--watch` restart's teardown, and `eph dev` kept running. A listener that
+/// lives for the session holds such a signal until [`recv`](Self::recv) next runs.
 #[cfg(unix)]
-async fn wait_for_shutdown() {
-    use tokio::signal::unix::{SignalKind, signal};
-    // The handlers only fail to install on an unsupported platform or fd
-    // exhaustion, both fatal for a foreground server, so surface them as panics.
-    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    let mut interrupt = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = interrupt.recv() => {}
+struct ShutdownSignals {
+    term: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            term: signal(SignalKind::terminate()).context("failed to listen for SIGTERM")?,
+            interrupt: signal(SignalKind::interrupt()).context("failed to listen for SIGINT")?,
+        })
+    }
+
+    /// Wait for the next stop signal, including one that arrived since the last
+    /// call. Cancel-safe, so it can sit in a `tokio::select!` arm.
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.term.recv() => {}
+            _ = self.interrupt.recv() => {}
+        }
     }
 }
 
 #[cfg(windows)]
-async fn wait_for_shutdown() {
-    use tokio::signal::windows::{ctrl_c, ctrl_close, ctrl_shutdown};
-    let mut interrupt = ctrl_c().expect("install Ctrl-C handler");
-    let mut close = ctrl_close().expect("install console-close handler");
-    let mut shutdown = ctrl_shutdown().expect("install shutdown handler");
-    tokio::select! {
-        _ = interrupt.recv() => {}
-        _ = close.recv() => {}
-        _ = shutdown.recv() => {}
+struct ShutdownSignals {
+    interrupt: tokio::signal::windows::CtrlC,
+    close: tokio::signal::windows::CtrlClose,
+    shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+#[cfg(windows)]
+impl ShutdownSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::windows::{ctrl_c, ctrl_close, ctrl_shutdown};
+        Ok(Self {
+            interrupt: ctrl_c().context("failed to listen for Ctrl-C")?,
+            close: ctrl_close().context("failed to listen for console close")?,
+            shutdown: ctrl_shutdown().context("failed to listen for system shutdown")?,
+        })
+    }
+
+    /// Wait for the next stop signal, including one that arrived since the last
+    /// call. Cancel-safe, so it can sit in a `tokio::select!` arm.
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.close.recv() => {}
+            _ = self.shutdown.recv() => {}
+        }
     }
 }
 
