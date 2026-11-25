@@ -14,7 +14,8 @@ src/
   watch.rs       binary-side watcher for eph dev --watch
   lib.rs         public library surface
   parser.rs      .eph parser, checked types, roles, interpolation
-  workspace.rs   workspace discovery, IDs, names, state paths
+  workspace.rs   workspace discovery, config layers, IDs, names, state paths
+  platform.rs    Docker-style host platform for platform override files
   hooks.rs       persisted teardown hooks, environments, command execution
   service.rs     lifecycle engine, Docker adapter, persisted state
   docker.rs      daemon connection following DOCKER_HOST and docker contexts
@@ -28,6 +29,7 @@ tests/
   integration.rs CLI and live lifecycle coverage
   integration/eph_local.rs .eph.local merging across commands
   integration/env_file.rs  env-file= imports across commands
+  integration/platform_overrides.rs host platform layers across commands
   integration/system_prune_hooks.rs focused prune-hook scenarios
   stress.rs      ignored heavyweight concurrency and backend-change cases
 ```
@@ -80,9 +82,12 @@ single file:
 an error, since there is no directory to resolve it against);
 `parser::parse_layers` lexes and expands named layers and merges them first.
 `workspace::load_config` is the one place that decides which files are layers
-(`.eph`, then `.eph.local` if it exists; a platform override would slot in
-between) and where `env-file=` paths resolve (`workspace::env_file_path`,
-relative to the workspace directory). Every command calls it.
+(`.eph`, then each of the host's platform overrides from
+`platform::HostPlatform`, then `.eph.local`, keeping only those that exist) and
+where `env-file=` paths resolve (`workspace::env_file_path`, relative to the
+workspace directory). Every command calls it. Each `parser::Layer` says whether
+it is per-checkout; when one is present, the committed layers are first built
+without it so `.eph.local` cannot mask an error in them.
 
 Boundary checks include:
 

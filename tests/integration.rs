@@ -19,6 +19,8 @@ mod common;
 mod env_file;
 #[path = "integration/eph_local.rs"]
 mod eph_local;
+#[path = "integration/platform_overrides.rs"]
+mod platform_overrides;
 #[path = "integration/system_prune_force.rs"]
 mod system_prune_force;
 #[path = "integration/system_prune_hooks.rs"]

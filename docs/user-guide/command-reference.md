@@ -571,6 +571,7 @@ eph logs -n 50 postgres       # last 50 lines
 ## `eph check`
 
 Parse and validate the `.eph` file, with any
+[platform overrides](eph-file.md#platform-overrides) and
 [`.eph.local`](eph-file.md#local-overrides-ephlocal) override merged over it,
 without touching Docker. Reports the environment variables and services in the
 merged result, or a parse error naming the file and line at fault.
@@ -594,8 +595,9 @@ Services: 2
   redis (image: redis:7-alpine)
 ```
 
-Files are listed lowest precedence first. The `Override:` line appears only
-when a `.eph.local` was merged, and an `Env file:` line appears for each
+Files are listed lowest precedence first. There is one `Override:` line for
+each platform override or `.eph.local` that was merged, and none when there are
+no overrides. An `Env file:` line appears for each
 [`env-file=`](eph-file.md#importing-a-env-file-env-file) import, just above the
 file that imports it.
 
@@ -613,20 +615,24 @@ Workspace ID: a1b2c3d4e5f60718293a...  (full SHA-256)
 Short ID: a1b2c3d4e5f60718
 Container prefix: eph-a1b2c3d4e5f60718
 .eph file: /home/you/projects/myapp/.eph
+Host platform: linux/amd64
 Config layers (later layers take precedence):
   /home/you/projects/myapp/.env (env-file= at line 1 of .eph)
   /home/you/projects/myapp/.eph
+  /home/you/projects/myapp/.eph.linux
   /home/you/projects/myapp/.eph.local
 State directory: /home/you/.local/share/eph/a1b2c3d4e5f60718
 ```
 
-`Config layers` lists the configuration files every command merges, lowest
-precedence first: always `.eph`, then `.eph.local` when it exists, each preceded
-by the env files it imports with
+`Host platform` is the Docker-style platform (`os/arch[/variant]`) that picks
+the [platform overrides](eph-file.md#platform-overrides). `Config layers` lists
+the configuration files every command merges, lowest precedence first: always
+`.eph`, then each of this host's platform overrides and `.eph.local` that
+exists, each preceded by the env files it imports with
 [`env-file=`](eph-file.md#importing-a-env-file-env-file). `eph info` does not
-validate them: if the configuration does not parse, it lists `.eph` and
-`.eph.local` without their imports and says so. Run `eph check` to validate the
-merged result.
+validate them: if the configuration does not parse, it lists the configuration
+files without their imports and says so. Run `eph check` to validate the merged
+result.
 
 Use the container prefix and short ID to find this workspace's resources with
 the `docker` CLI. The state directory's parent (the `eph` above the short ID)

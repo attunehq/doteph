@@ -14,7 +14,8 @@ pieces fit together. For where each decision lives in the code, see
   ls` and the workspace table both commands print. Nothing in these files is
   public API.
 - `src/lib.rs`: the library crate (`eph`) that holds all reusable logic, split
-  into modules: `parser`, `workspace`, `service`, `env`, `skills`, `update`
+  into modules: `parser`, `workspace`, `platform` (the Docker-style host
+  platform that picks platform override files), `service`, `env`, `skills`, `update`
   (the self-updater that pulls, verifies, and swaps in a GitHub release),
   `prune`, `git` (read-only branch merge detection for prune and `system
   ls`), the crate-internal `hooks` (teardown snapshots, environments, and

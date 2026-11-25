@@ -1364,6 +1364,9 @@ pub struct Layer<'a> {
     pub name: &'a str,
     /// The file's contents.
     pub contents: &'a str,
+    /// Whether this layer belongs to one checkout (`.eph.local`) rather than
+    /// being committed with the project (`.eph` and the platform overrides).
+    pub per_checkout: bool,
 }
 
 /// Parse a stack of `.eph` layers, lowest precedence first, into one
@@ -1385,16 +1388,17 @@ pub struct Layer<'a> {
 /// (lowest first) is: the base's imports, the base, the first override's
 /// imports, the first override, and so on.
 ///
-/// The first layer, with its imports, must also be valid on its own, so an
-/// override can never mask an error in the base. Diagnostics name the layer
-/// each offending value came from.
+/// When there are per-checkout layers, the committed layers, with their
+/// imports, must also be valid merged without them, so a per-checkout override
+/// can never mask an error that every other checkout still hits. Diagnostics
+/// name the layer each offending value came from.
 ///
 /// # Errors
 ///
 /// Returns an error if any layer or imported file is malformed or cannot be
-/// read, if the first layer is invalid on its own, or if the merged result
-/// breaks any rule listed under [`parse`]. Returns an error for an empty
-/// `layers`.
+/// read, if the committed layers are invalid without the per-checkout ones, or
+/// if the merged result breaks any rule listed under [`parse`]. Returns an
+/// error for an empty `layers`.
 ///
 /// # Examples
 ///
@@ -1404,8 +1408,8 @@ pub struct Layer<'a> {
 /// # fn main() -> anyhow::Result<()> {
 /// let eph = parse_layers(
 ///     &[
-///         Layer { name: ".eph", contents: "env-file=.env\n[db]\nimage=postgres:16\nport=5432\n" },
-///         Layer { name: ".eph.local", contents: "[db]\nport=6543\n" },
+///         Layer { name: ".eph", contents: "env-file=.env\n[db]\nimage=postgres:16\nport=5432\n", per_checkout: false },
+///         Layer { name: ".eph.local", contents: "[db]\nport=6543\n", per_checkout: true },
 ///     ],
 ///     &mut |path: &str| {
 ///         assert_eq!(path, ".env");
@@ -1421,35 +1425,53 @@ pub fn parse_layers(
     layers: &[Layer<'_>],
     read_env_file: &mut EnvFileReader<'_>,
 ) -> Result<EphFile> {
-    let mut merged: Option<Document> = None;
-    for layer in layers {
-        let doc = expand_env_files(
-            Document::lex(layer.contents, Some(layer.name))?,
-            read_env_file,
-        )?;
-        merged = Some(match merged {
-            Some(base) => base.merge(doc),
-            // The base file is committed and the overrides are per-checkout, so
-            // the base has to stand on its own: otherwise an override that
-            // happens to set the same key would hide an error (say, a
-            // duplicated `image=`) that every checkout without that override
-            // still hits.
-            None if layers.len() > 1 => {
-                doc.clone().build().with_context(|| {
-                    format!(
-                        "{base} must be valid on its own, because other checkouts and \
-                         CI load it without {local}: fix it in {base}, and use {local} \
-                         only to override values that already work",
-                        base = layer.name,
-                        local = layers[1].name
-                    )
-                })?;
-                doc
-            }
-            None => doc,
-        });
+    // Lex and expand each layer once; both merges below reuse the result.
+    let docs = layers
+        .iter()
+        .map(|layer| {
+            let doc = Document::lex(layer.contents, Some(layer.name))?;
+            Ok((layer, expand_env_files(doc, read_env_file)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Committed layers are what every checkout (and CI) loads, so they have to
+    // stand on their own: otherwise a per-checkout override that happens to set
+    // the same key would hide an error (say, a duplicated `image=`) that every
+    // checkout without that override still hits.
+    if layers.iter().any(|layer| layer.per_checkout) {
+        let (committed, local): (Vec<_>, Vec<_>) =
+            docs.iter().partition(|(layer, _)| !layer.per_checkout);
+        merge_documents(committed.iter().map(|(_, doc)| doc.clone()))?
+            .build()
+            .with_context(|| {
+                format!(
+                    "{stack} must be valid on its own, because other checkouts and CI \
+                     load it without {local}: fix it in {fix}, and use {local} only to \
+                     override values that already work",
+                    stack = layer_names(&committed, " merged with "),
+                    fix = layer_names(&committed, " or "),
+                    local = layer_names(&local, " and "),
+                )
+            })?;
     }
-    merged.context("no configuration layers to parse")?.build()
+    merge_documents(docs.into_iter().map(|(_, doc)| doc))?.build()
+}
+
+/// Merge lexed layers in order, lowest precedence first, without validating
+/// the result.
+fn merge_documents(docs: impl IntoIterator<Item = Document>) -> Result<Document> {
+    docs.into_iter()
+        .reduce(Document::merge)
+        .context("no configuration layers to parse")
+}
+
+/// The names of `layers`, joined with `separator`, for diagnostics.
+fn layer_names(layers: &[&(&Layer<'_>, Document)], separator: &str) -> String {
+    layers
+        .iter()
+        .map(|(layer, _)| layer.name)
+        .collect::<Vec<_>>()
+        .join(separator)
 }
 
 /// Parse a non-empty comma-separated role list without discarding typo-shaped
@@ -3396,10 +3418,12 @@ port.api=5000
                 Layer {
                     name: ".eph",
                     contents: base,
+                    per_checkout: false,
                 },
                 Layer {
                     name: ".eph.local",
                     contents: local,
+                    per_checkout: true,
                 },
             ],
             &mut no_env_files,
@@ -3429,6 +3453,7 @@ port.api=5000
             &[Layer {
                 name: ".eph",
                 contents: base,
+                per_checkout: false,
             }],
             &mut no_env_files,
         )
@@ -3670,7 +3695,11 @@ port.api=5000
     fn with_env_files(layers: &[(&str, &str)], files: &[(&str, &str)]) -> Result<EphFile> {
         let layers: Vec<Layer<'_>> = layers
             .iter()
-            .map(|&(name, contents)| Layer { name, contents })
+            .map(|&(name, contents)| Layer {
+                name,
+                contents,
+                per_checkout: name == ".eph.local",
+            })
             .collect();
         parse_layers(&layers, &mut |path: &str| {
             files
@@ -3977,5 +4006,190 @@ port.api=5000
             .unwrap_err()
         );
         assert!(msg.contains(".eph must be valid on its own"), "got: {msg}");
+    }
+
+    // ------------------------------------------------------------------------
+    // Platform overrides (.eph.<os>[.<arch>[.<variant>]])
+    // ------------------------------------------------------------------------
+
+    /// Parse committed layers `(name, contents)` in order, plus an optional
+    /// `.eph.local` last.
+    fn stacked(committed: &[(&'static str, &str)], local: Option<&str>) -> Result<EphFile> {
+        let mut layers: Vec<Layer<'_>> = committed
+            .iter()
+            .map(|&(name, contents)| Layer {
+                name,
+                contents,
+                per_checkout: false,
+            })
+            .collect();
+        if let Some(contents) = local {
+            layers.push(Layer {
+                name: ".eph.local",
+                contents,
+                per_checkout: true,
+            });
+        }
+        parse_layers(&layers, &mut no_env_files)
+    }
+
+    /// Each layer sets a value for every key at or below its own level, so the
+    /// winner of each key shows that precedence increases from base to OS,
+    /// architecture, variant, and local.
+    #[test]
+    fn precedence_increases_from_base_to_os_arch_variant_and_local() {
+        let eph = stacked(
+            &[
+                (".eph", "A=base\nB=base\nC=base\nD=base\nE=base\n"),
+                (".eph.linux", "B=os\nC=os\nD=os\nE=os\n"),
+                (".eph.linux.arm64", "C=arch\nD=arch\nE=arch\n"),
+                (".eph.linux.arm64.v8", "D=variant\nE=variant\n"),
+            ],
+            Some("E=local\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            env_pairs(&eph),
+            vec![
+                ("A", "base"),
+                ("B", "os"),
+                ("C", "arch"),
+                ("D", "variant"),
+                ("E", "local")
+            ]
+        );
+    }
+
+    /// The kinds of change a platform layer makes: replace a host command,
+    /// extend a section, add a section, and replace a repeatable key wholesale.
+    #[test]
+    fn platform_layers_replace_extend_and_add() {
+        let eph = stacked(
+            &[
+                (
+                    ".eph",
+                    "[api]\nrun=./serve.sh\nport=auto\npre-start=./gen.sh\npre-start=./seed.sh\n\n\
+                     [db]\nimage=postgres:16\nvolume=./a:/a\nvolume=./b:/b\n",
+                ),
+                (
+                    ".eph.windows",
+                    "[api]\nrun=serve.cmd\npre-start=gen.cmd\nenv.SHELL_KIND=cmd\n\n\
+                     [db]\nvolume=.\\c:/c\n",
+                ),
+                (".eph.windows.amd64", "[cache]\nimage=redis:7\nport=6379\n"),
+            ],
+            None,
+        )
+        .unwrap();
+        let api = &eph.services["api"];
+        assert_eq!(api.source, ServiceSource::Command("serve.cmd".into()));
+        assert_eq!(api.pre_start, vec!["gen.cmd"]);
+        assert_eq!(api.env.get("SHELL_KIND").map(String::as_str), Some("cmd"));
+        assert_eq!(eph.services["db"].volumes, vec![".\\c:/c"]);
+        assert_eq!(
+            eph.services.keys().collect::<Vec<_>>(),
+            vec!["api", "db", "cache"]
+        );
+    }
+
+    /// Platform layers are committed, so they merge before validation: the
+    /// base may leave a value for the platform files to fill in.
+    #[test]
+    fn platform_layers_are_validated_only_after_merging() {
+        let base = "[api]\nport=8080\n";
+        assert!(parse(base).is_err());
+        let eph = stacked(
+            &[(".eph", base), (".eph.linux", "[api]\nrun=./serve.sh\n")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            eph.services["api"].source,
+            ServiceSource::Command("./serve.sh".into())
+        );
+        // With a .eph.local on top, the committed stack must still stand on
+        // its own, and here it does.
+        stacked(
+            &[(".eph", base), (".eph.linux", "[api]\nrun=./serve.sh\n")],
+            Some("[api]\nport=9090\n"),
+        )
+        .unwrap();
+    }
+
+    /// `.eph.local` cannot mask an error in the committed stack, and the
+    /// message names every committed layer.
+    #[test]
+    fn a_local_override_cannot_mask_an_error_in_the_platform_stack() {
+        let msg = format!(
+            "{:#}",
+            stacked(
+                &[
+                    (".eph", "[api]\nport=8080\n"),
+                    (".eph.linux", "[api]\nrun=a\nrun=b\n"),
+                ],
+                Some("[api]\nrun=c\n"),
+            )
+            .unwrap_err()
+        );
+        assert!(
+            msg.contains(".eph merged with .eph.linux must be valid on its own"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("of .eph.linux"), "got: {msg}");
+    }
+
+    /// A conflict that spans layers cites each layer by name.
+    #[test]
+    fn cross_layer_errors_name_each_platform_layer() {
+        let msg = format!(
+            "{:#}",
+            stacked(
+                &[
+                    (".eph", "[db]\nimage=postgres:16\n"),
+                    (".eph.linux", "[web]\nrun=serve\n"),
+                    (".eph.linux.amd64", "[db]\nrun=./db.sh\n"),
+                ],
+                None,
+            )
+            .unwrap_err()
+        );
+        assert!(msg.contains("line 2 of .eph"), "got: {msg}");
+        assert!(msg.contains("line 2 of .eph.linux.amd64"), "got: {msg}");
+        let msg = format!(
+            "{:#}",
+            stacked(
+                &[
+                    (".eph", "[db]\nimage=postgres:16\n"),
+                    (".eph.windows", "[db]\nbogus=1\n"),
+                ],
+                None,
+            )
+            .unwrap_err()
+        );
+        assert!(
+            msg.contains("unknown service property 'bogus' at line 2 of .eph.windows"),
+            "got: {msg}"
+        );
+    }
+
+    /// A platform layer's `env-file=` imports sit directly beneath it, so they
+    /// win over `.eph` and its imports but lose to the platform file itself.
+    #[test]
+    fn platform_layers_import_env_files_beneath_themselves() {
+        let eph = with_env_files(
+            &[
+                (".eph", "env-file=.env\nA=eph\nB=eph\n"),
+                (".eph.linux", "env-file=linux.env\nB=linux\n"),
+            ],
+            &[
+                (".env", "A=dotenv\nC=dotenv\n"),
+                ("linux.env", "A=linux-env\nB=linux-env\nC=linux-env\n"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            env_pairs(&eph),
+            [("A", "linux-env"), ("C", "linux-env"), ("B", "linux")]
+        );
     }
 }

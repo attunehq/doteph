@@ -25,9 +25,11 @@ If no `.eph` file is found in the current directory or any parent, the command
 fails with `no .eph file found`.
 
 A `.eph.local` file next to the `.eph` is merged over it as a per-checkout
-override (see [Local overrides](eph-file.md#local-overrides-ephlocal)). It does
-not count when searching: a directory with only `.eph.local` is not a
-workspace.
+override (see [Local overrides](eph-file.md#local-overrides-ephlocal)), and
+committed platform overrides such as `.eph.windows` or `.eph.linux.arm64` are
+merged under it on matching hosts (see
+[Platform overrides](eph-file.md#platform-overrides)). Neither counts when
+searching: a directory with only `.eph.local` is not a workspace.
 
 All relative paths and shell commands in your `.eph` file (volumes,
 `dockerfile=`, `compose=`, `run=`, health checks, and lifecycle hooks) resolve

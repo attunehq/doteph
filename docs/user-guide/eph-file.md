@@ -6,7 +6,8 @@ order: 3
 
 # The `.eph` File
 
-The `.eph` file is the entire configuration for a workspace (plus an optional,
+The `.eph` file is the entire configuration for a workspace (plus optional
+[platform overrides](#platform-overrides) such as `.eph.windows` and an optional,
 uncommitted [`.eph.local`](#local-overrides-ephlocal) override). It extends `.env`
 syntax with INI-style `[sections]` for services; a plain `.env` file is already
 a valid `.eph` file, and you add services on top. This page is the complete
@@ -201,12 +202,15 @@ The importing file's own variables win over its imports, and a later
 `env-file=` wins over an earlier one. That lets a committed `.env` keep
 `DATABASE_URL=postgres://localhost:5432/dev` for people who do not use eph,
 while `.eph`'s `DATABASE_URL` with the assigned port wins for those who do.
-Together with `.eph.local`, the full order, lowest precedence first, is:
+Together with [platform overrides](#platform-overrides) and `.eph.local`, the
+full order, lowest precedence first, is:
 
 1. the env files `.eph` imports, in order;
 2. `.eph`;
-3. the env files `.eph.local` imports, in order;
-4. `.eph.local`.
+3. for each of this host's platform overrides, the env files it imports, then
+   the override itself;
+4. the env files `.eph.local` imports, in order;
+5. `.eph.local`.
 
 Declaring the same variable twice *within* one file, including within one env
 file, is still an error, because dotenv loaders disagree about which
@@ -824,7 +828,9 @@ replace and add.
 
 `.eph`, with the env files it imports, must be valid on its own, because it is
 what every other checkout (and CI) loads without your override: `.eph.local`
-cannot hide an error in it.
+cannot hide an error in it. (With [platform overrides](#platform-overrides),
+the rule covers the committed files together: `.eph` merged with this host's
+platform files, and their imports, must be valid without `.eph.local`.)
 That includes a fresh git worktree of your own repo, since an ignored file is
 not copied into new worktrees. So `.eph` cannot hold a placeholder that only
 `.eph.local` completes, such as a service with no source or a value that is
@@ -849,6 +855,83 @@ subdirectory is ignored. When both files exist, `.eph.local` takes precedence.
 `eph info` lists the layers it loaded, base first, with each imported env file
 listed just above the file that imports it, and `eph check` names the override
 and env files it merged.
+
+## Platform overrides
+
+A shared `.eph` sometimes needs different host commands, paths, or settings on
+Windows, Linux, and macOS, or on different CPU architectures. Rather than
+keeping full copies per platform, commit the differences in optional platform
+override files next to the `.eph`. eph merges the ones for the host it is
+running on, with the same [merge rules](#merge-rules) as `.eph.local`, before
+validating, interpolating, or planning anything.
+
+The file names follow Docker's platform components, `os[/arch[/variant]]`, with
+each `/` written as `.`, and use Docker's names: `darwin` for macOS, `amd64`
+for x86-64, `arm64` for 64-bit ARM.
+
+| Host | Files eph loads, in order |
+| --- | --- |
+| Linux, x86-64 | `.eph.linux`, `.eph.linux.amd64` |
+| Linux, 64-bit ARM | `.eph.linux`, `.eph.linux.arm64`, `.eph.linux.arm64.v8` |
+| macOS, Apple silicon | `.eph.darwin`, `.eph.darwin.arm64`, `.eph.darwin.arm64.v8` |
+| macOS, Intel | `.eph.darwin`, `.eph.darwin.amd64` |
+| Windows, x86-64 | `.eph.windows`, `.eph.windows.amd64` |
+
+Every level is optional; a missing file is skipped. An OS-wide file holds what
+all of that OS's machines share, and narrower files hold what differs by
+architecture. A variant file is loaded only when eph knows the variant for
+certain: `arm64` is always `v8` (Docker normalizes it the same way), and eph does
+not guess one for `amd64`. `eph info` prints the detected platform as `Host
+platform: linux/arm64/v8`.
+
+The platform describes the machine running eph, as eph was built for it (an
+x86-64 eph under Rosetta on an Apple silicon Mac reports `darwin/amd64`). It does
+not come from the Docker daemon, and it does not choose the platform of any
+container image; to pin an image's platform, use the image's own tag or digest.
+
+Committed `.eph`:
+
+```ini
+[api]
+run=./scripts/serve.sh
+port=auto
+
+[postgres]
+image=postgres:16-alpine
+port=5432
+```
+
+Committed `.eph.windows`:
+
+```ini
+[api]
+run=scripts\serve.cmd
+```
+
+On Windows, `api` runs `scripts\serve.cmd`; everywhere else it runs
+`./scripts/serve.sh`.
+
+### Precedence
+
+From lowest to highest, later files win:
+
+1. `.eph`
+2. `.eph.<os>`
+3. `.eph.<os>.<arch>`
+4. `.eph.<os>.<arch>.<variant>`, when the variant is known
+5. `.eph.local`
+
+Platform overrides are committed with the project, so unlike `.eph.local` they
+are merged *before* the stack is validated: `.eph` may leave something for them
+to fill in, such as a service whose `run=` differs per OS and so lives only in
+the platform files. Validation then runs on the merged result for the host. A
+`.eph` that only works with a platform file fails on any platform without one,
+so give every platform you support its file, or keep a working default in
+`.eph`.
+
+Like `.eph.local`, platform files are read only from the directory that holds
+the discovered `.eph`, and on their own they do not make a directory a
+workspace.
 
 ## Complete example
 

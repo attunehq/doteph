@@ -1487,6 +1487,7 @@ async fn cmd_info() -> Result<()> {
     println!("Short ID: {}", workspace.short_id);
     println!("Container prefix: {}", workspace.container_prefix());
     println!(".eph file: {}", workspace.eph_file_path().display());
+    println!("Host platform: {}", eph::platform::HostPlatform::current());
     println!("Config layers (later layers take precedence):");
     // Imported env files are only known once the configuration parses; `info`
     // still reports the rest of the workspace when it does not.

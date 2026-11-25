@@ -2,7 +2,8 @@
 //!
 //! This library holds the reusable logic behind the `eph` CLI: parsing `.eph`
 //! files ([`parser`]), resolving a workspace from the filesystem
-//! ([`workspace`]), managing Docker-backed services ([`service`]), pruning stale
+//! ([`workspace`]) and the host platform its overrides are chosen for
+//! ([`platform`]), managing Docker-backed services ([`service`]), pruning stale
 //! cross-workspace resources ([`prune`]), rendering resolved environment
 //! variables for shell `eval` ([`mod@env`]), installing bundled agent skills into
 //! a consuming repo ([`skills`]), and replacing the running binary with the
@@ -25,6 +26,7 @@ pub mod env;
 pub mod git;
 pub(crate) mod hooks;
 pub mod parser;
+pub mod platform;
 pub(crate) mod proc;
 pub mod prune;
 pub mod service;
