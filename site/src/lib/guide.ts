@@ -18,9 +18,23 @@ export function routeFor(entry: GuideEntry): string {
   return isIndex(entry) ? "/guide" : `/guide/${entry.id}`;
 }
 
-/** The path slug used for the raw-markdown endpoint (`index` for the index). */
+/**
+ * The path slug for the `/guide/<slug>.md` endpoint (`index` for the index).
+ * The index's canonical Markdown URL is `/guide.md` (see `markdownPathFor`);
+ * `/guide/index.md` stays published as an alias for links already out there.
+ */
 export function rawSlugFor(entry: GuideEntry): string {
   return isIndex(entry) ? "index" : entry.id;
+}
+
+/**
+ * The canonical raw-Markdown path for a guide entry: its page route plus
+ * `.md` (`/guide.md`, `/guide/concepts.md`). That one rule is what llms.txt
+ * tells agents, so every page must honor it. Base-path-relative, like
+ * `routeFor`.
+ */
+export function markdownPathFor(entry: GuideEntry): string {
+  return `${routeFor(entry)}.md`;
 }
 
 /** Every guide entry, ordered by frontmatter `order`. */

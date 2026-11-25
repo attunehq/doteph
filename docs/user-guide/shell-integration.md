@@ -142,7 +142,14 @@ fi
 ```
 
 Then `direnv allow`. direnv loads the variables when you `cd` in and unloads
-them when you `cd` out. If you want services started too, add `eph up` above
+them when you `cd` out.
+
+If the project also has a `.env` file, you do not need direnv's `dotenv` to
+load it alongside: import it into the `.eph` with
+[`env-file=.env`](eph-file.md#importing-a-env-file-env-file), and `eph env`
+emits both sets of variables, with `.eph`'s winning where they overlap. That
+also gives `eph run`, hooks, and `run=` services the `.env` variables, which
+an `.envrc` alone does not. If you want services started too, add `eph up` above
 the `eval`, but note that checking containers on every `cd` can be slow; most
 people prefer an explicit `eph up`.
 

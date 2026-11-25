@@ -28,6 +28,7 @@ tests/
   common/mod.rs  integration helpers
   integration.rs CLI and live lifecycle coverage
   integration/eph_local.rs .eph.local merging across commands
+  integration/env_file.rs  env-file= imports across commands
   integration/platform_overrides.rs host platform layers across commands
   integration/system_prune_hooks.rs focused prune-hook scenarios
   stress.rs      ignored heavyweight concurrency and backend-change cases
@@ -62,22 +63,31 @@ single file:
    state machine (`TopLevel`, `Env`, or a section) tracks the current header;
    a section remains active until another header appears, so a bare variable
    below a service lands in that service and is rejected later with guidance
-   to move it above the first section or into `[env]`.
-2. **Merge** (`Document::merge`) folds each override layer over the base:
+   to move it above the first section or into `[env]`. `env-file=` lines
+   are collected separately.
+2. **Expand** (`expand_env_files`) reads each `env-file=` through the
+   caller's reader (the parser never touches the filesystem), lexes the file
+   with `lex_env_file` (variables only, rejecting lines dotenv loaders would
+   read differently, and duplicates within the file), and merges the imports
+   beneath their layer in declaration order.
+3. **Merge** (`Document::merge`) folds each override layer over the base:
    sections by name, entries by key. An overriding key replaces every base
    entry for that key in place (so repeatable keys are replaced as a list);
    new keys and sections append in the override's order.
-3. **Build** (`Document::build`) applies every semantic rule below to the
+4. **Build** (`Document::build`) applies every semantic rule below to the
    merged entries and produces the `EphFile`. Errors cite each value's `Loc`,
    so a cross-layer conflict names both files.
 
-`parser::parse` is lex + build for one unnamed string; `parser::parse_layers`
-lexes named layers and merges them first. `workspace::load_config` is the one
-place that decides which files are layers (`.eph`, then each of the host's
-platform overrides from `platform::HostPlatform`, then `.eph.local`, keeping
-only those that exist) and is what every command calls. Each `parser::Layer`
-says whether it is per-checkout; when one is present, the committed layers are
-first built without it so `.eph.local` cannot mask an error in them.
+`parser::parse` is lex + build for one unnamed string (an `env-file=` there is
+an error, since there is no directory to resolve it against);
+`parser::parse_layers` lexes and expands named layers and merges them first.
+`workspace::load_config` is the one place that decides which files are layers
+(`.eph`, then each of the host's platform overrides from
+`platform::HostPlatform`, then `.eph.local`, keeping only those that exist) and
+where `env-file=` paths resolve (`workspace::env_file_path`, relative to the
+workspace directory). Every command calls it. Each `parser::Layer` says whether
+it is per-checkout; when one is present, the committed layers are first built
+without it so `.eph.local` cannot mask an error in them.
 
 Boundary checks include:
 

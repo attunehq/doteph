@@ -135,14 +135,27 @@ DATABASE_URL=postgres://dev@localhost:${postgres.port}/app
   use `env.KEY=` inside its section.
 - Environment variable names beginning with `EPH_`, in any letter case, are
   reserved for eph metadata and rejected in every environment scope.
+- **`env-file=.env` imports a `.env` file's variables** (above the first
+  section or in `[env]`, repeatable, path relative to `.eph`). Each imported
+  file sits beneath the file that imports it: the `.eph`'s own variables win,
+  later imports win over earlier ones, and the order is `.eph`'s imports,
+  `.eph`, each platform override's imports then the override, `.eph.local`'s
+  imports, `.eph.local`. A missing file is an error, so
+  import gitignored files (`.env.local`) from `.eph.local`. Imported files hold
+  only variables (optional `export ` prefix), and eph rejects lines dotenv
+  loaders read differently: an unquoted ` #`, multi-line values, backslashes in
+  double quotes, and `${OTHER_VAR}` references.
 - **`.eph.local` overrides `.eph`.** It is gitignored, may hold secrets, and is
   merged key by key before validation: sections match by name, properties by
   key (`port.http`, `env.DEBUG` are distinct keys), top-level variables by name
   (above the first section or in `[env]`, same namespace). An override key
   replaces the base value; for repeatable keys (`volume=`, hooks) it replaces
-  the whole base list. New keys and sections append. Only the merged result is
-  validated, so setting `run=` locally on an `image=` service is a duplicate
-  source error; errors name the file (`line 3 of .eph.local`). `eph info` lists
+  the whole base list. New keys and sections append. `.eph` must be valid on
+  its own (fresh worktrees and CI load it without `.eph.local`), so it cannot
+  hold a placeholder that only `.eph.local` completes: give it a working value
+  and override it. The merged result is validated too, so setting `run=`
+  locally on an `image=` service is a duplicate source error; errors name the
+  file (`line 3 of .eph.local`). `eph info` lists
   the loaded layers. Put machine-specific or secret values there instead of
   editing a committed `.eph`, and do not commit or print it.
 - **Platform overrides are committed per-OS/arch layers.** Docker platform
@@ -521,3 +534,16 @@ return, so they run as normal commands.
 4. Treat `.eph` as possibly holding dev credentials, and `.eph.local` as
    possibly holding real ones: do not print either to logs or commit one with
    real secrets.
+
+## Full documentation
+
+This skill covers the common path. For anything it does not answer, fetch the
+user guide as Markdown instead of guessing:
+
+- https://attunehq.github.io/doteph/llms.txt: an index of every chapter, each
+  linked to its raw `.md` URL.
+- https://attunehq.github.io/doteph/llms-full.txt: the whole guide in one file.
+- https://attunehq.github.io/doteph/guide/for-agents.md: the terse quick
+  reference for agents and scripts.
+
+Any guide page's Markdown is its URL without the trailing slash, plus `.md`.

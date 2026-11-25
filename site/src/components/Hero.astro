@@ -7,6 +7,11 @@ const unix =
   "curl -sSfL https://raw.githubusercontent.com/attunehq/doteph/main/scripts/install.sh | bash";
 const win =
   "irm https://raw.githubusercontent.com/attunehq/doteph/main/scripts/install.ps1 | iex";
+// Pasted into a coding agent, which installs eph and sets up the project.
+// Kept in sync with the "With a coding agent" prompt in README.md and
+// docs/user-guide/getting-started.md.
+const agent =
+  "Set up eph (https://github.com/attunehq/doteph) for this project. Read https://attunehq.github.io/doteph/guide/index.md and install eph globally. Then look at this project, write a .eph file for the services it needs so each git worktree gets its own, and run eph skills install so future agents know how to use it. Tell me what you plan to change before you change it.";
 
 // Built as HTML strings so indentation inside the <pre> is exact.
 const mapHtml = [
@@ -64,6 +69,26 @@ Run <span class="t-str">`eval "$(eph env)"`</span> to set environment variables<
 
   <div class="container">
     <div class="hero-install" data-reveal style="--reveal-delay:220ms">
+        <div class="hero-install-row">
+          <span class="hero-install-os">Paste into your coding agent</span>
+          <div class="hero-install-cmd-row">
+            <code class="hero-install-cmd hero-install-cmd--prompt" id="install-agent">{agent}</code>
+            <button
+              class="copy-btn"
+              type="button"
+              data-copy="install-agent"
+              aria-label="Copy the coding agent setup prompt"
+            >
+              <svg class="copy-ic copy-ic--clip" viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
+                <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.4"></rect>
+                <path d="M3.5 10.5H3a1.5 1.5 0 0 1-1.5-1.5V3A1.5 1.5 0 0 1 3 1.5h6A1.5 1.5 0 0 1 10.5 3v.5" stroke="currentColor" stroke-width="1.4"></path>
+              </svg>
+              <svg class="copy-ic copy-ic--check" viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
+                <path d="M3 8.4l3.2 3.2L13 4.2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"></path>
+              </svg>
+            </button>
+          </div>
+        </div>
         <div class="hero-install-row">
           <span class="hero-install-os">macOS &middot; Linux</span>
           <div class="hero-install-cmd-row">
@@ -188,6 +213,11 @@ Run <span class="t-str">`eval "$(eph env)"`</span> to set environment variables<
        viewports it scrolls rather than wrapping. */
     white-space: pre;
     overflow-x: auto;
+  }
+  /* The agent prompt is prose, not a command: wrap it instead of scrolling. */
+  .hero-install-cmd--prompt {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
   .copy-btn {
     flex: none;

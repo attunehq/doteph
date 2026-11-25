@@ -24,6 +24,18 @@ resolved connection strings into your shell with `eval "$(eph env)"`.
 
 ## Install
 
+### With a coding agent
+
+Paste this into your coding agent (Claude Code, Codex, Cursor, and so on). It
+installs `eph`, writes a `.eph` file for your project, and installs the agent
+skill, checking with you before it changes anything:
+
+```text
+Set up eph (https://github.com/attunehq/doteph) for this project. Read https://attunehq.github.io/doteph/guide/index.md and install eph globally. Then look at this project, write a .eph file for the services it needs so each git worktree gets its own, and run eph skills install so future agents know how to use it. Tell me what you plan to change before you change it.
+```
+
+### By hand
+
 Install the latest release binary (the script verifies a SHA-256 checksum
 before installing):
 
@@ -119,7 +131,9 @@ same pages are readable in-repo:
 - **[For Agents and Scripts](docs/user-guide/for-agents.md)**: a terse quick
   reference for AI coding agents and automation. Run `eph skills install` to
   drop that guidance into a repo as a skill your agent discovers
-  automatically.
+  automatically. Agents fetching docs over the web can start at
+  [`llms.txt`](https://attunehq.github.io/doteph/llms.txt), which links every
+  guide page as raw Markdown.
 - **[Developer Guide](docs/developer-guide/README.md)**: architecture,
   building and testing, and a tour of the internals, for working on `eph`
   itself.
@@ -128,8 +142,8 @@ same pages are readable in-repo:
 
 ## License
 
-`eph` is licensed under the [MIT License](LICENSE), Copyright (c) 2026
-Attune, Inc.
+`eph` is licensed under the [Apache License, Version 2.0](LICENSE),
+Copyright (c) 2026 Attune, Inc.
 
 The repository also vendors third-party Rust coding-guidance skills under
 [`.agents/skills/`](.agents/skills/) (notably the MIT-licensed

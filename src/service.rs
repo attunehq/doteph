@@ -4746,6 +4746,7 @@ mod tests {
                 .collect(),
             services: Default::default(),
             roles_order: None,
+            env_files: Vec::new(),
         }
     }
 

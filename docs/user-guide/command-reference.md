@@ -434,8 +434,10 @@ Behavior:
   applicable phase.
 - On stop (the preview server's stop, or Ctrl-C), only the services `eph dev`
   started itself are torn down; services that were already running when it
-  began (a prewarmed tier) are left up. A hard kill (`SIGKILL`) cannot run
-  teardown; recover with `eph down`.
+  began (a prewarmed tier) are left up. A stop is honored whenever it
+  arrives, including during startup or a `--watch` restart; a stop during a
+  restart tears the stack down instead of bringing it back up. A hard kill
+  (`SIGKILL`) cannot run teardown; recover with `eph down`.
 - If the app exits on its own, `eph dev` exits non-zero and leaves the backing
   services up, except in watch mode, where it reports the exit and waits for
   the next file change to restart.
@@ -579,10 +581,12 @@ eph check
 ```
 
 ```
+Env file: /home/you/projects/myapp/.env (env-file= at line 1 of .eph)
 Valid .eph file: /home/you/projects/myapp/.eph
 Override: /home/you/projects/myapp/.eph.local
 
-Environment variables: 2
+Environment variables: 3
+  SENTRY_DSN
   DATABASE_URL
   REDIS_URL
 
@@ -591,8 +595,11 @@ Services: 2
   redis (image: redis:7-alpine)
 ```
 
-There is one `Override:` line for each platform override or `.eph.local` that
-was merged, in precedence order, and none when there are no overrides.
+Files are listed lowest precedence first. There is one `Override:` line for
+each platform override or `.eph.local` that was merged, and none when there are
+no overrides. An `Env file:` line appears for each
+[`env-file=`](eph-file.md#importing-a-env-file-env-file) import, just above the
+file that imports it.
 
 ## `eph info`
 
@@ -610,6 +617,7 @@ Container prefix: eph-a1b2c3d4e5f60718
 .eph file: /home/you/projects/myapp/.eph
 Host platform: linux/amd64
 Config layers (later layers take precedence):
+  /home/you/projects/myapp/.env (env-file= at line 1 of .eph)
   /home/you/projects/myapp/.eph
   /home/you/projects/myapp/.eph.linux
   /home/you/projects/myapp/.eph.local
@@ -620,7 +628,10 @@ State directory: /home/you/.local/share/eph/a1b2c3d4e5f60718
 the [platform overrides](eph-file.md#platform-overrides). `Config layers` lists
 the configuration files every command merges, lowest precedence first: always
 `.eph`, then each of this host's platform overrides and `.eph.local` that
-exists. `eph info` only lists them; run `eph check` to validate the merged
+exists, each preceded by the env files it imports with
+[`env-file=`](eph-file.md#importing-a-env-file-env-file). `eph info` does not
+validate them: if the configuration does not parse, it lists the configuration
+files without their imports and says so. Run `eph check` to validate the merged
 result.
 
 Use the container prefix and short ID to find this workspace's resources with

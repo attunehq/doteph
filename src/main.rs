@@ -34,6 +34,9 @@ use watch::Watch;
 #[command(name = "eph")]
 #[command(about = "Ephemeral services per workspace - dotenv for services")]
 #[command(version = env!("EPH_VERSION"))]
+#[command(after_help = "\
+Guide: https://attunehq.github.io/doteph/guide
+Agents: https://attunehq.github.io/doteph/llms.txt (every guide page as Markdown)")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -704,17 +707,21 @@ async fn cmd_dev(
         Some(Watch::new(&workspace_root, &watch)?)
     };
 
+    // Listen for stop signals once, for the rest of the session, before anything
+    // is started. A signal that arrives while eph is busy elsewhere (finishing
+    // startup, or tearing down for a watch restart) is held here and acted on at
+    // the next check instead of being lost; see [`ShutdownSignals`].
+    let mut shutdown = ShutdownSignals::new()?;
+
     // Restart loop: each pass brings the whole stack up, then blocks until it is
     // stopped, the app exits, or (when watching) a file changes. Without a
     // watcher the loop runs exactly once, matching the original single-shot `eph
     // dev` behavior.
     let mut first = true;
     loop {
-        // Register the shutdown listener while bring-up is still running. A
-        // preview server can stop eph as soon as `status` exposes the foreground
-        // service, which is just before this loop would otherwise begin waiting
-        // for signals. Closing that window prevents SIGTERM from taking the
-        // process's default non-zero exit path after a successful startup.
+        // Bring-up races the stop signals, so a stop during startup (including
+        // one held from a watch restart's teardown) abandons it and tears down.
+        // `biased` checks for a held signal first, before starting new work.
         let started = {
             let bring_up = dev_bring_up(
                 &mut manager,
@@ -726,8 +733,9 @@ async fn cmd_dev(
             );
             tokio::pin!(bring_up);
             tokio::select! {
+                biased;
+                () = shutdown.recv() => None,
                 result = &mut bring_up => Some(result?),
-                () = wait_for_shutdown() => None,
             }
         };
         let Some((mut child, gate)) = started else {
@@ -742,7 +750,8 @@ async fn cmd_dev(
         // file changing. `child.wait` reaps the process, so its exit is observed
         // reliably (no zombie races). The watch arm is inert without `--watch`.
         let stop = tokio::select! {
-            () = wait_for_shutdown() => DevStop::Signal,
+            biased;
+            () = shutdown.recv() => DevStop::Signal,
             result = child.wait() => DevStop::AppExited(result),
             changed = next_change(&mut watcher), if watcher.is_some() => DevStop::FileChanged(changed),
         };
@@ -785,7 +794,8 @@ async fn cmd_dev(
                 eprintln!();
                 eprintln!("dev server '{foreground}' {how}; waiting for a change to restart");
                 tokio::select! {
-                    () = wait_for_shutdown() => {
+                    biased;
+                    () = shutdown.recv() => {
                         final_teardown(&mut manager, &eph, clean, &brought_up, skip_hooks).await?;
                         return Ok(ExitCode::SUCCESS);
                     }
@@ -1073,37 +1083,74 @@ fn select_foreground_service(eph: &EphFile, requested: Option<&str>) -> Result<S
     }
 }
 
-/// Block until a shutdown signal arrives.
+/// The stop signals `eph dev` honors, listened for once for the whole session.
 ///
-/// A Claude Desktop preview server stops the dev command by signaling it; this
-/// catches the platform's stop signals so `eph dev` can tear the stack down
-/// before exiting. On Unix that is SIGINT (Ctrl-C) and SIGTERM; on Windows it is
+/// A Claude Desktop preview server stops the dev command by signaling it; these
+/// catch the platform's stop signals so `eph dev` can tear the stack down before
+/// exiting. On Unix that is SIGINT (Ctrl-C) and SIGTERM; on Windows it is
 /// Ctrl-C, console close, and system shutdown. A hard kill (SIGKILL /
 /// `TerminateProcess`) cannot be caught, so teardown is skipped and the stack is
 /// left up, recoverable with `eph down`.
+///
+/// The listeners must outlive every stage of the session. Once tokio installs
+/// its handler the OS default (terminate) no longer applies, and tokio drops a
+/// signal that arrives while no listener exists. Creating a listener per stage
+/// therefore swallowed a stop that landed between stages, such as just after
+/// startup (when `eph status` already shows the app running) or during a
+/// `--watch` restart's teardown, and `eph dev` kept running. A listener that
+/// lives for the session holds such a signal until [`recv`](Self::recv) next runs.
 #[cfg(unix)]
-async fn wait_for_shutdown() {
-    use tokio::signal::unix::{SignalKind, signal};
-    // The handlers only fail to install on an unsupported platform or fd
-    // exhaustion, both fatal for a foreground server, so surface them as panics.
-    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-    let mut interrupt = signal(SignalKind::interrupt()).expect("install SIGINT handler");
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = interrupt.recv() => {}
+struct ShutdownSignals {
+    term: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            term: signal(SignalKind::terminate()).context("failed to listen for SIGTERM")?,
+            interrupt: signal(SignalKind::interrupt()).context("failed to listen for SIGINT")?,
+        })
+    }
+
+    /// Wait for the next stop signal, including one that arrived since the last
+    /// call. Cancel-safe, so it can sit in a `tokio::select!` arm.
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.term.recv() => {}
+            _ = self.interrupt.recv() => {}
+        }
     }
 }
 
 #[cfg(windows)]
-async fn wait_for_shutdown() {
-    use tokio::signal::windows::{ctrl_c, ctrl_close, ctrl_shutdown};
-    let mut interrupt = ctrl_c().expect("install Ctrl-C handler");
-    let mut close = ctrl_close().expect("install console-close handler");
-    let mut shutdown = ctrl_shutdown().expect("install shutdown handler");
-    tokio::select! {
-        _ = interrupt.recv() => {}
-        _ = close.recv() => {}
-        _ = shutdown.recv() => {}
+struct ShutdownSignals {
+    interrupt: tokio::signal::windows::CtrlC,
+    close: tokio::signal::windows::CtrlClose,
+    shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+#[cfg(windows)]
+impl ShutdownSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::windows::{ctrl_c, ctrl_close, ctrl_shutdown};
+        Ok(Self {
+            interrupt: ctrl_c().context("failed to listen for Ctrl-C")?,
+            close: ctrl_close().context("failed to listen for console close")?,
+            shutdown: ctrl_shutdown().context("failed to listen for system shutdown")?,
+        })
+    }
+
+    /// Wait for the next stop signal, including one that arrived since the last
+    /// call. Cancel-safe, so it can sit in a `tokio::select!` arm.
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.close.recv() => {}
+            _ = self.shutdown.recv() => {}
+        }
     }
 }
 
@@ -1360,14 +1407,45 @@ fn should_colorize() -> bool {
     std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
 
+/// The env files that the configuration layer at `layer` imports, in order.
+fn imports_of<'a>(
+    eph: &'a EphFile,
+    layer: &'a Path,
+) -> impl Iterator<Item = &'a eph::parser::EnvFileImport> {
+    let name = layer.file_name().map(|name| name.to_string_lossy());
+    eph.env_files
+        .iter()
+        .filter(move |import| import.declared_in.as_deref() == name.as_deref())
+}
+
+/// Where an `env-file=` line was declared, e.g. `line 1 of .eph`.
+fn import_location(import: &eph::parser::EnvFileImport) -> String {
+    match &import.declared_in {
+        Some(file) => format!("line {} of {file}", import.line),
+        None => format!("line {}", import.line),
+    }
+}
+
 async fn cmd_check() -> Result<()> {
     let workspace = Workspace::find_from_cwd()?;
     let eph = load_eph_file(&workspace)?;
 
-    println!("Valid .eph file: {}", workspace.eph_file_path().display());
-    // The base file is listed above; name each override merged over it.
-    for layer in workspace.config_layers().iter().skip(1) {
-        println!("Override: {}", layer.display());
+    // Every file that went into the result, lowest precedence first: each
+    // layer's imported env files sit directly beneath it.
+    for (index, layer) in workspace.config_layers().iter().enumerate() {
+        for import in imports_of(&eph, layer) {
+            println!(
+                "Env file: {} (env-file= at {})",
+                workspace.env_file_path(&import.path).display(),
+                import_location(import)
+            );
+        }
+        let label = if index == 0 {
+            "Valid .eph file"
+        } else {
+            "Override"
+        };
+        println!("{label}: {}", layer.display());
     }
     println!();
     println!("Environment variables: {}", eph.env_vars.len());
@@ -1411,8 +1489,23 @@ async fn cmd_info() -> Result<()> {
     println!(".eph file: {}", workspace.eph_file_path().display());
     println!("Host platform: {}", eph::platform::HostPlatform::current());
     println!("Config layers (later layers take precedence):");
+    // Imported env files are only known once the configuration parses; `info`
+    // still reports the rest of the workspace when it does not.
+    let eph = workspace.load_config().ok();
     for layer in workspace.config_layers() {
+        for import in eph.iter().flat_map(|eph| imports_of(eph, &layer)) {
+            println!(
+                "  {} (env-file= at {})",
+                workspace.env_file_path(&import.path).display(),
+                import_location(import)
+            );
+        }
         println!("  {}", layer.display());
+    }
+    if eph.is_none() {
+        println!(
+            "  (imported env files not shown: the configuration does not parse; run `eph check`)"
+        );
     }
     println!("State directory: {}", workspace.state_dir()?.display());
 
