@@ -9,7 +9,7 @@ description = "Ephemeral services per workspace - dotenv for services"
 license = "Apache-2.0"
 authors = ["Jessica Black <me@jessica.black>"]
 repository = "https://github.com/attunehq/doteph"
-homepage = "https://github.com/attunehq/doteph"
+homepage = "https://attunehq.github.io/doteph"
 readme = "README.md"
 # Tracks the toolchain pinned in rust-toolchain.toml, so the minimum is the
 # version CI actually tests, and cargo's MSRV-aware resolver never holds a
